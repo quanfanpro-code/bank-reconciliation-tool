@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from statistics import pstdev
 from typing import Any, Iterable, Sequence
@@ -48,6 +49,80 @@ class TableStructure:
     ambiguous: bool = False
     candidates: tuple[HeaderCandidate, ...] = field(default_factory=tuple)
     explanation: str = ""
+
+
+@dataclass(frozen=True)
+class PrecheckItem:
+    """一项可展示、可留痕的输入检查结果。"""
+
+    name: str
+    bank_result: str
+    journal_result: str
+    comparison: str
+    status: str
+    explanation: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "检查项目": self.name,
+            "银行流水结果": self.bank_result,
+            "银行日记账结果": self.journal_result,
+            "双方比较结果": self.comparison,
+            "状态": self.status,
+            "说明": self.explanation,
+        }
+
+
+@dataclass(frozen=True)
+class InputPrecheckReport:
+    """本次核对的全部输入检查结果。"""
+
+    items: tuple[PrecheckItem, ...]
+    bank_structure: TableStructure | None = None
+    journal_structure: TableStructure | None = None
+
+    @property
+    def has_blockers(self) -> bool:
+        return any(item.status == "阻止" for item in self.items)
+
+    @property
+    def has_warnings(self) -> bool:
+        return any(item.status == "提示" for item in self.items)
+
+    def blocker_message(self) -> str:
+        return "\n".join(
+            f"• {item.name}：{item.explanation}"
+            for item in self.items
+            if item.status == "阻止"
+        )
+
+    def warning_message(self) -> str:
+        return "\n".join(
+            f"• {item.name}：{item.explanation}"
+            for item in self.items
+            if item.status == "提示"
+        )
+
+    def to_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [item.as_dict() for item in self.items],
+            columns=(
+                "检查项目",
+                "银行流水结果",
+                "银行日记账结果",
+                "双方比较结果",
+                "状态",
+                "说明",
+            ),
+        )
+
+
+class InputPrecheckBlockedError(ValueError):
+    """输入存在硬错误，正式匹配不得开始。"""
+
+    def __init__(self, report: InputPrecheckReport):
+        self.report = report
+        super().__init__(report.blocker_message() or "输入预检查未通过")
 
 
 def _cell_text(value: Any) -> str:
@@ -277,4 +352,357 @@ def detect_table_structure(
         ambiguous=ambiguous,
         candidates=tuple(candidates[:5]),
         explanation=explanation,
+    )
+
+
+def _required_columns(mapping: dict[str, Any]) -> list[tuple[str, str]]:
+    required = [("date", "日期")]
+    mode = mapping.get("mode", "debit_credit")
+    if mode == "debit_credit":
+        required.extend((("debit", "借方/支出"), ("credit", "贷方/收入")))
+    elif mode == "single_amount_with_direction":
+        required.extend((("amount", "金额"), ("direction", "方向")))
+    elif mode == "signed_amount":
+        required.append(("amount", "金额"))
+    else:
+        required.append(("mode", "金额模式"))
+    return required
+
+
+def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any]) -> list[str]:
+    available = set(columns)
+    selected = []
+    problems = []
+    for key, label in _required_columns(mapping):
+        value = mapping.get(key)
+        if key == "mode" or value in (None, "", "(无)"):
+            problems.append(f"缺少{label}列")
+        elif value not in available:
+            problems.append(f"{label}列不存在：{value}")
+        elif value in selected:
+            problems.append(f"{label}列与其他必填映射重复：{value}")
+        else:
+            selected.append(value)
+    return problems
+
+
+def _structure_result(structure: TableStructure) -> str:
+    return (
+        f"第{structure.skiprows + 1}行起，{structure.header_rows}行表头；"
+        f"派生列名：{'、'.join(structure.columns)}"
+    )
+
+
+def _ambiguity_changes_mapping(
+    structure: TableStructure,
+    mapping: dict[str, Any],
+) -> bool:
+    if not structure.ambiguous:
+        return False
+    required_names = {
+        mapping.get(key)
+        for key, _label in _required_columns(mapping)
+        if key != "mode" and mapping.get(key)
+    }
+    alternatives = [
+        candidate
+        for candidate in structure.candidates
+        if (candidate.skiprows, candidate.header_rows)
+        != (structure.skiprows, structure.header_rows)
+    ]
+    return not alternatives or any(
+        not required_names.issubset(set(candidate.columns))
+        for candidate in alternatives[:2]
+    )
+
+
+def _valid_dates(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty or "date" not in frame.columns:
+        return pd.Series(dtype="datetime64[ns]")
+    return pd.to_datetime(frame["date"], errors="coerce").dropna()
+
+
+def _amount_totals(frame: pd.DataFrame) -> tuple[Decimal, Decimal] | None:
+    if frame.empty or "amount" not in frame.columns:
+        return None
+    amounts = [
+        Decimal(str(value))
+        for value in frame["amount"]
+        if pd.notna(value)
+    ]
+    if not amounts:
+        return None
+    income = sum((value for value in amounts if value > 0), Decimal("0"))
+    expense = sum((-value for value in amounts if value < 0), Decimal("0"))
+    return income, expense
+
+
+def _error_count(
+    parse_errors: Sequence[dict[str, Any]],
+    source: str,
+    error_type: str,
+) -> int:
+    return sum(
+        1
+        for error in parse_errors
+        if error.get("source_type") == source and error.get("type") == error_type
+    )
+
+
+NON_TRANSACTION_KEYWORDS = (
+    "合计",
+    "累计",
+    "小计",
+    "总计",
+    "日计",
+    "月计",
+    "年计",
+    "期初",
+    "期末",
+    "承前页",
+    "过次页",
+    "统计",
+)
+NOTE_PREFIXES = ("注：", "说明：", "备注：", "单位：", "制表：")
+
+
+def _non_transaction_mask(
+    frame: pd.DataFrame,
+    mapping: dict[str, Any],
+) -> pd.Series:
+    if frame.empty:
+        return pd.Series(False, index=frame.index)
+    empty = frame.map(lambda value: not _cell_text(value)).all(axis=1)
+    combined = frame.apply(
+        lambda row: " ".join(_cell_text(value) for value in row),
+        axis=1,
+    )
+    summary = combined.str.contains(
+        "|".join(re.escape(word) for word in NON_TRANSACTION_KEYWORDS),
+        na=False,
+    ) | combined.str.startswith(NOTE_PREFIXES)
+    column_names = {str(column).strip() for column in frame.columns}
+    repeated_header = frame.apply(
+        lambda row: sum(
+            _cell_text(value) in column_names
+            for value in row
+            if _cell_text(value)
+        )
+        >= min(2, len(column_names)),
+        axis=1,
+    )
+    date_column = mapping.get("date")
+    dates = (
+        pd.to_datetime(frame[date_column], errors="coerce")
+        if date_column in frame.columns
+        else pd.Series(pd.NaT, index=frame.index)
+    )
+    nonempty_counts = frame.map(lambda value: bool(_cell_text(value))).sum(axis=1)
+    title_or_note = (nonempty_counts == 1) & dates.isna()
+    return empty | summary | repeated_header | title_or_note
+
+
+def _auxiliary_result(
+    frame: pd.DataFrame,
+    mapping: dict[str, Any],
+) -> tuple[str, bool]:
+    selected = []
+    for column in [mapping.get("summary"), *(mapping.get("auxiliary_text_columns") or [])]:
+        if column and column not in selected:
+            selected.append(column)
+    usable = [column for column in selected if column in frame.columns]
+    if not usable:
+        return "未选择可用辅助文字列", True
+    transaction_rows = frame.loc[~_non_transaction_mask(frame, mapping)]
+    denominator = len(transaction_rows)
+    if denominator == 0:
+        return "没有可计算非空率的交易行", True
+    parts = []
+    low = False
+    for column in usable:
+        nonempty = transaction_rows[column].map(lambda value: bool(_cell_text(value))).sum()
+        rate = nonempty / denominator
+        parts.append(f"{column} {rate:.1%}")
+        low = low or rate < 0.8
+    missing = [column for column in selected if column not in frame.columns]
+    if missing:
+        parts.append(f"未找到：{'、'.join(missing)}")
+        low = True
+    return "；".join(parts), low
+
+
+def build_input_precheck(
+    *,
+    raw_bank: pd.DataFrame,
+    raw_journal: pd.DataFrame,
+    bank: pd.DataFrame,
+    journal: pd.DataFrame,
+    bank_mapping: dict[str, Any],
+    journal_mapping: dict[str, Any],
+    bank_structure: TableStructure,
+    journal_structure: TableStructure,
+    parse_errors: Sequence[dict[str, Any]] = (),
+) -> InputPrecheckReport:
+    """对已读取和标准化的双方数据执行八项统一检查。"""
+    items = []
+
+    file_blocked = raw_bank.empty or raw_journal.empty
+    items.append(
+        PrecheckItem(
+            "文件读取",
+            f"可读取，{len(raw_bank)}行" if not raw_bank.empty else "没有可核对数据",
+            f"可读取，{len(raw_journal)}行" if not raw_journal.empty else "没有可核对数据",
+            "双方均已读取" if not file_blocked else "至少一侧没有数据",
+            "阻止" if file_blocked else "通过",
+            "文件没有可核对数据，请检查表头和数据区域。" if file_blocked else "文件可正常读取。",
+        )
+    )
+
+    bank_major = _ambiguity_changes_mapping(bank_structure, bank_mapping)
+    journal_major = _ambiguity_changes_mapping(journal_structure, journal_mapping)
+    ambiguous = bank_structure.ambiguous or journal_structure.ambiguous
+    structure_status = "阻止" if bank_major or journal_major else ("提示" if ambiguous else "通过")
+    items.append(
+        PrecheckItem(
+            "表格结构",
+            _structure_result(bank_structure),
+            _structure_result(journal_structure),
+            "存在重大歧义" if bank_major or journal_major else ("存在备选结构" if ambiguous else "结构明确"),
+            structure_status,
+            (
+                "表头候选会改变必填列映射，请返回确认表头位置和层级。"
+                if structure_status == "阻止"
+                else ("检测到分数接近的表头候选，请确认当前列映射。" if ambiguous else "表头和数据区域可用。")
+            ),
+        )
+    )
+
+    bank_dates = _valid_dates(bank)
+    journal_dates = _valid_dates(journal)
+    date_blocked = bank_dates.empty or journal_dates.empty
+    bank_date_errors = _error_count(parse_errors, "bank", "日期解析失败")
+    journal_date_errors = _error_count(parse_errors, "journal", "日期解析失败")
+    if date_blocked:
+        date_status = "阻止"
+        date_explanation = "至少一侧日期全部无法解析，请检查日期列和日期格式。"
+        date_comparison = "无法比较"
+    else:
+        bank_range = (bank_dates.min(), bank_dates.max())
+        journal_range = (journal_dates.min(), journal_dates.max())
+        mismatch = bank_range != journal_range
+        date_status = "提示" if mismatch or bank_date_errors or journal_date_errors else "通过"
+        date_comparison = "范围一致" if not mismatch else "范围不完全一致"
+        date_explanation = (
+            f"少量日期或金额解析失败：银行流水日期{bank_date_errors}行，"
+            f"银行日记账日期{journal_date_errors}行。"
+            if bank_date_errors or journal_date_errors
+            else ("双方日期范围不完全一致，请确认是否属于正常未达期间。" if mismatch else "双方日期范围一致。")
+        )
+    items.append(
+        PrecheckItem(
+            "日期范围",
+            "无法形成日期范围" if bank_dates.empty else f"{bank_dates.min():%Y-%m-%d} 至 {bank_dates.max():%Y-%m-%d}",
+            "无法形成日期范围" if journal_dates.empty else f"{journal_dates.min():%Y-%m-%d} 至 {journal_dates.max():%Y-%m-%d}",
+            date_comparison,
+            date_status,
+            date_explanation,
+        )
+    )
+
+    bank_direction_errors = _error_count(parse_errors, "bank", "方向解析失败")
+    journal_direction_errors = _error_count(parse_errors, "journal", "方向解析失败")
+    direction_blocked = bool(bank_direction_errors or journal_direction_errors)
+    items.append(
+        PrecheckItem(
+            "金额方向",
+            f"银行口径；无法识别{bank_direction_errors}行",
+            f"日记账口径；无法识别{journal_direction_errors}行",
+            "贷增借减 / 借增贷减",
+            "阻止" if direction_blocked else "通过",
+            (
+                "方向列存在无法识别的值，收入和支出方向不可靠。"
+                if direction_blocked
+                else "银行流水按贷增借减，银行日记账按借增贷减。"
+            ),
+        )
+    )
+
+    bank_totals = _amount_totals(bank)
+    journal_totals = _amount_totals(journal)
+    amount_blocked = bank_totals is None or journal_totals is None
+    bank_amount_errors = _error_count(parse_errors, "bank", "金额解析失败")
+    journal_amount_errors = _error_count(parse_errors, "journal", "金额解析失败")
+    if amount_blocked:
+        amount_status = "阻止"
+        amount_comparison = "无法比较"
+        amount_explanation = "至少一侧金额全部无法解析，请检查金额列或借贷列。"
+    else:
+        income_diff = bank_totals[0] - journal_totals[0]
+        expense_diff = bank_totals[1] - journal_totals[1]
+        has_diff = income_diff != 0 or expense_diff != 0
+        amount_status = "提示" if has_diff or bank_amount_errors or journal_amount_errors else "通过"
+        amount_comparison = f"收入差额 {income_diff:.2f}；支出差额 {expense_diff:.2f}"
+        amount_explanation = (
+            f"少量日期或金额解析失败：银行流水金额{bank_amount_errors}行，"
+            f"银行日记账金额{journal_amount_errors}行。"
+            if bank_amount_errors or journal_amount_errors
+            else ("双方收入或支出合计存在差额；差额是核对对象，不直接视为输入错误。" if has_diff else "双方收入和支出合计一致。")
+        )
+    items.append(
+        PrecheckItem(
+            "金额合计",
+            "无法形成金额合计" if bank_totals is None else f"收入 {bank_totals[0]:.2f}；支出 {bank_totals[1]:.2f}",
+            "无法形成金额合计" if journal_totals is None else f"收入 {journal_totals[0]:.2f}；支出 {journal_totals[1]:.2f}",
+            amount_comparison,
+            amount_status,
+            amount_explanation,
+        )
+    )
+
+    bank_non_transactions = int(_non_transaction_mask(raw_bank, bank_mapping).sum())
+    journal_non_transactions = int(_non_transaction_mask(raw_journal, journal_mapping).sum())
+    has_non_transactions = bank_non_transactions > 0 or journal_non_transactions > 0
+    items.append(
+        PrecheckItem(
+            "非交易行",
+            f"识别并排除{bank_non_transactions}行",
+            f"识别并排除{journal_non_transactions}行",
+            f"合计{bank_non_transactions + journal_non_transactions}行",
+            "提示" if has_non_transactions else "通过",
+            "检测到合计、累计、统计、标题、重复表头、注释或空行。" if has_non_transactions else "未发现混入数据区的非交易行。",
+        )
+    )
+
+    bank_mapping_problems = _mapping_problems(bank_mapping, raw_bank.columns)
+    journal_mapping_problems = _mapping_problems(journal_mapping, raw_journal.columns)
+    mapping_blocked = bool(bank_mapping_problems or journal_mapping_problems)
+    items.append(
+        PrecheckItem(
+            "必填字段",
+            "完整" if not bank_mapping_problems else "；".join(bank_mapping_problems),
+            "完整" if not journal_mapping_problems else "；".join(journal_mapping_problems),
+            "双方完整" if not mapping_blocked else "存在缺失或无效映射",
+            "阻止" if mapping_blocked else "通过",
+            "请返回选择当前金额模式所需的必填列。" if mapping_blocked else "当前金额模式所需字段完整。",
+        )
+    )
+
+    bank_aux, bank_aux_low = _auxiliary_result(raw_bank, bank_mapping)
+    journal_aux, journal_aux_low = _auxiliary_result(raw_journal, journal_mapping)
+    aux_low = bank_aux_low or journal_aux_low
+    items.append(
+        PrecheckItem(
+            "辅助文字完整性",
+            bank_aux,
+            journal_aux,
+            "至少一侧偏低" if aux_low else "双方可用",
+            "提示" if aux_low else "通过",
+            "摘要、对方户名等辅助文字非空率低于80%，文字匹配证据可能不足。" if aux_low else "辅助文字列可用。",
+        )
+    )
+
+    return InputPrecheckReport(
+        items=tuple(items),
+        bank_structure=bank_structure,
+        journal_structure=journal_structure,
     )
