@@ -31,8 +31,6 @@ def _default_output_path(bank_path: str, journal_path: str) -> Path:
 def _blocked_report(
     name: str,
     explanation: str,
-    bank_structure: Optional[TableStructure] = None,
-    journal_structure: Optional[TableStructure] = None,
 ) -> InputPrecheckReport:
     return InputPrecheckReport(
         items=(
@@ -45,8 +43,6 @@ def _blocked_report(
                 explanation=explanation,
             ),
         ),
-        bank_structure=bank_structure,
-        journal_structure=journal_structure,
     )
 
 
@@ -141,8 +137,6 @@ def run_reconciliation(
             _blocked_report(
                 "文件读取",
                 f"文件或表头无法正常读取：{exc}",
-                bank_structure,
-                journal_structure,
             )
         ) from exc
 
@@ -180,8 +174,6 @@ def run_reconciliation(
             _blocked_report(
                 name,
                 explanation,
-                bank_structure,
-                journal_structure,
             )
         ) from exc
 
@@ -216,6 +208,8 @@ def run_reconciliation(
             and not precheck_warning_callback(precheck_report)
         ):
             raise InterruptedError("用户返回调整输入")
+    else:
+        log("输入预检查通过")
     if progress_callback:
         progress_callback(0.3)
 

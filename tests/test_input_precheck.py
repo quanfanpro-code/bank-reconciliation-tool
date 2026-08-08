@@ -69,6 +69,7 @@ def test_标题与两行合并表头生成稳定无重复列名(tmp_path):
 
     assert structure.skiprows == 1
     assert structure.header_rows == 2
+    assert structure.ambiguous is False
     assert structure.columns == [
         "日期",
         "发生额｜借方",
@@ -79,6 +80,26 @@ def test_标题与两行合并表头生成稳定无重复列名(tmp_path):
     assert len(structure.columns) == len(set(structure.columns))
     assert data.shape == (2, 5)
     assert data.iloc[0]["辅助信息｜对方户名"] == "甲公司"
+
+
+def test_两套完整表头证据接近时披露歧义(tmp_path):
+    path = tmp_path / "歧义表头.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["字段一", "字段二", "字段三", "字段四"])
+    sheet.append(["日期", "金额", "方向", "摘要"])
+    sheet.append(["2026-01-01", 100, "贷", "测试收款"])
+    sheet.append(["2026-01-02", 20, "借", "测试付款"])
+    workbook.save(path)
+
+    structure = DataLoader().detect_table_structure(path)
+
+    assert structure.ambiguous is True
+    assert len(structure.candidates) >= 2
+    assert {
+        (candidate.skiprows, candidate.header_rows)
+        for candidate in structure.candidates[:2]
+    } == {(0, 2), (1, 1)}
 
 
 def test_多行表头后的原文件行号保持可追溯(tmp_path):
@@ -122,6 +143,36 @@ def test_重复表头派生列名按出现顺序去重(tmp_path):
 
     assert structure.columns == ["日期", "金额", "金额_2", "摘要"]
     assert structure.columns == DataLoader().detect_table_structure(path).columns
+
+
+def test_结构识别和数据读取使用同一张首个工作表(tmp_path):
+    path = tmp_path / "多工作表.xlsx"
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "银行流水"
+    first.append(["银行交易明细"])
+    first.merge_cells("A1:C1")
+    first.append(["日期", "发生额", None])
+    first.append([None, "借方", "贷方"])
+    first.merge_cells("A2:A3")
+    first.merge_cells("B2:C2")
+    first.append(["2026-01-01", 0, 100])
+    second = workbook.create_sheet("说明")
+    second.append(["这不是数据表"])
+    workbook.active = 1
+    workbook.save(path)
+
+    loader = DataLoader()
+    structure = loader.detect_table_structure(path)
+    data = loader.load_file(
+        path,
+        skiprows=structure.skiprows,
+        header_rows=structure.header_rows,
+        derived_columns=structure.columns,
+    )
+
+    assert structure.columns == ["日期", "发生额｜借方", "发生额｜贷方"]
+    assert data.iloc[0]["日期"] == "2026-01-01"
 
 
 def _structure(columns, *, ambiguous=False, candidates=()):
@@ -292,6 +343,51 @@ def test_少量解析异常非交易行和低文字非空率只提示():
     assert "少量日期或金额解析失败" in report.warning_message()
 
 
+def test_无法沿用日期的空日期交易行会在预检查中提示():
+    raw = pd.DataFrame(
+        [
+            {"日期": "2026-01-01", "金额": 100, "摘要": "首笔", "对方户名": "甲"},
+            {"日期": None, "金额": 20, "摘要": "日期缺失交易", "对方户名": "乙"},
+        ]
+    )
+    report = _build_report(
+        raw,
+        raw.iloc[[0]].copy(),
+        _standardized([("2026-01-01", 100, "首笔")], "bank"),
+        _standardized([("2026-01-01", 100, "首笔")], "journal"),
+        parse_errors=[
+            {"type": "空日期行", "source_type": "bank", "row": 3}
+        ],
+    )
+
+    date_item = next(item for item in report.items if item.name == "日期范围")
+    assert date_item.status == "提示"
+    assert "银行流水日期1行" in date_item.explanation
+
+
+def test_有效日期交易摘要含合计字样不会误报为非交易行():
+    raw = pd.DataFrame(
+        [
+            {
+                "日期": "2026-01-01",
+                "金额": 100,
+                "摘要": "支付项目合计款",
+                "对方户名": "甲公司",
+            }
+        ]
+    )
+    report = _build_report(
+        raw,
+        raw,
+        _standardized([("2026-01-01", 100, "支付项目合计款")], "bank"),
+        _standardized([("2026-01-01", 100, "支付项目合计款")], "journal"),
+    )
+
+    item = next(item for item in report.items if item.name == "非交易行")
+    assert item.status == "通过"
+    assert item.bank_result == "识别并排除0行"
+
+
 def test_日期或金额全部无可用记录会阻止():
     raw = pd.DataFrame([{"日期": "错误", "金额": "错误", "摘要": "测试", "对方户名": "甲"}])
     empty = pd.DataFrame(columns=["date", "amount", "summary", "source"])
@@ -426,6 +522,7 @@ def test_普通提示回调可以返回调整且不创建报告(tmp_path):
 def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_path):
     bank_path, journal_path, mapping = _write_direction_pair(tmp_path)
     output_path = tmp_path / "核对报告.xlsx"
+    logs = []
 
     result = run_reconciliation(
         bank_path=str(bank_path),
@@ -434,6 +531,7 @@ def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_
         journal_mapping=mapping,
         matcher_config=MatcherConfig(),
         output_path=output_path,
+        logger=logs.append,
     )
 
     assert result == output_path
@@ -451,6 +549,7 @@ def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_
         "说明",
     ]
     assert table.loc[table["检查项目"] == "金额合计", "状态"].item() == "通过"
+    assert "输入预检查通过" in logs
 
 
 class _Variable:

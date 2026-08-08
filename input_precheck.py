@@ -78,8 +78,6 @@ class InputPrecheckReport:
     """本次核对的全部输入检查结果。"""
 
     items: tuple[PrecheckItem, ...]
-    bank_structure: TableStructure | None = None
-    journal_structure: TableStructure | None = None
 
     @property
     def has_blockers(self) -> bool:
@@ -185,7 +183,7 @@ def _read_preview(path: Path, max_scan_rows: int) -> tuple[pd.DataFrame, list[tu
         from openpyxl import load_workbook
 
         workbook = load_workbook(path, read_only=False, data_only=True)
-        sheet = workbook.active
+        sheet = workbook.worksheets[0]
         merges = [
             (
                 merged.min_row - 1,
@@ -280,7 +278,7 @@ def _candidate_score(
             transitions += 1
 
     raw_nonempty = raw_header.notna().sum(axis=1)
-    title_penalty = 1 if int(raw_nonempty.max()) <= 2 else 0
+    title_penalty = 1 if int(raw_nonempty.iloc[0]) <= 2 else 0
     next_header_penalty = 1 if _keyword_hits(data.iloc[0].tolist()) >= 2 else 0
     data_like_header_ratio = sum(
         _looks_numeric_or_date(value)
@@ -503,7 +501,7 @@ def _non_transaction_mask(
         lambda row: " ".join(_cell_text(value) for value in row),
         axis=1,
     )
-    summary = combined.str.contains(
+    summary_or_note = combined.str.contains(
         "|".join(re.escape(word) for word in NON_TRANSACTION_KEYWORDS),
         na=False,
     ) | combined.str.startswith(NOTE_PREFIXES)
@@ -523,6 +521,7 @@ def _non_transaction_mask(
         if date_column in frame.columns
         else pd.Series(pd.NaT, index=frame.index)
     )
+    summary = summary_or_note & dates.isna()
     nonempty_counts = frame.map(lambda value: bool(_cell_text(value))).sum(axis=1)
     title_or_note = (nonempty_counts == 1) & dates.isna()
     return empty | summary | repeated_header | title_or_note
@@ -606,8 +605,14 @@ def build_input_precheck(
     bank_dates = _valid_dates(bank)
     journal_dates = _valid_dates(journal)
     date_blocked = bank_dates.empty or journal_dates.empty
-    bank_date_errors = _error_count(parse_errors, "bank", "日期解析失败")
-    journal_date_errors = _error_count(parse_errors, "journal", "日期解析失败")
+    bank_date_errors = sum(
+        _error_count(parse_errors, "bank", error_type)
+        for error_type in ("日期解析失败", "空日期行")
+    )
+    journal_date_errors = sum(
+        _error_count(parse_errors, "journal", error_type)
+        for error_type in ("日期解析失败", "空日期行")
+    )
     if date_blocked:
         date_status = "阻止"
         date_explanation = "至少一侧日期全部无法解析，请检查日期列和日期格式。"
@@ -727,8 +732,4 @@ def build_input_precheck(
         )
     )
 
-    return InputPrecheckReport(
-        items=tuple(items),
-        bank_structure=bank_structure,
-        journal_structure=journal_structure,
-    )
+    return InputPrecheckReport(items=tuple(items))
