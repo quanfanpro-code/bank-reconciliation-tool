@@ -1,7 +1,7 @@
 # 银行流水核对输入预检查优化——需求文档
 
-日期：2026-08-08  
-工作流：requirement-workflow 六阶段（阶段 1 产出）  
+日期：2026-08-08
+工作流：requirement-workflow 六阶段（阶段 1 产出）
 项目：`C:\Users\27651\Desktop\bank-reconciliation-tool`
 
 ## 一、背景与问题
