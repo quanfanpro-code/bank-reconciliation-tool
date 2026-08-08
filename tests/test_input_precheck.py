@@ -9,6 +9,7 @@ import input_precheck
 from application import run_reconciliation
 from data_loader import DataLoader
 from data_structures import MatcherConfig
+import gui
 
 
 def _build_merged_header_workbook(tmp_path: Path) -> Path:
@@ -450,3 +451,138 @@ def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_
         "说明",
     ]
     assert table.loc[table["检查项目"] == "金额合计", "状态"].item() == "通过"
+
+
+class _Variable:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+def test_gui_自动检测同时采用表头位置层级和派生列名(tmp_path):
+    path = _build_merged_header_workbook(tmp_path)
+    loaded = []
+
+    class _FakeApp:
+        bank_path = _Variable(str(path))
+        journal_path = _Variable()
+        bank_skip = _Variable("0")
+        journal_skip = _Variable("0")
+        bank_header_rows = _Variable("1")
+        journal_header_rows = _Variable("1")
+        loader = DataLoader()
+
+        def log(self, _message):
+            return None
+
+        def load_columns(self, *args):
+            loaded.append(args)
+
+    app = _FakeApp()
+    gui.ReconciliationApp.auto_detect(app, "bank")
+
+    assert app.bank_skip.get() == "1"
+    assert app.bank_header_rows.get() == "2"
+    assert loaded == [
+        (
+            str(path),
+            "bank",
+            1,
+            2,
+            [
+                "日期",
+                "发生额｜借方",
+                "发生额｜贷方",
+                "辅助信息｜摘要",
+                "辅助信息｜对方户名",
+            ],
+        )
+    ]
+
+
+def test_gui_运行时把表头层级和普通提示回调交给统一入口(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run_reconciliation(**kwargs):
+        captured.update(kwargs)
+        return tmp_path / "报告.xlsx"
+
+    monkeypatch.setattr(gui, "run_reconciliation", fake_run_reconciliation)
+
+    class _FakeApp:
+        matcher = None
+
+        def log(self, _message):
+            return None
+
+        def _set_progress(self, _value):
+            return None
+
+        def _set_stop_enabled(self, _enabled):
+            return None
+
+        def _set_start_enabled(self, _enabled):
+            return None
+
+        def _confirm_precheck_warnings(self, _report):
+            return True
+
+    state = {
+        "bank_path": "银行.xlsx",
+        "journal_path": "日记账.xlsx",
+        "bank_mapping": {},
+        "journal_mapping": {},
+        "config": MatcherConfig(),
+        "llm_config": None,
+        "bank_skip": 1,
+        "journal_skip": 2,
+        "bank_header_rows": 2,
+        "journal_header_rows": 1,
+        "date_format": "auto",
+    }
+
+    app = _FakeApp()
+    gui.ReconciliationApp.run_process(app, state)
+
+    assert captured["bank_header_rows"] == 2
+    assert captured["journal_header_rows"] == 1
+    callback = captured["precheck_warning_callback"]
+    assert callback.__self__ is app
+
+
+def test_gui_普通提示在主线程集中确认(monkeypatch):
+    raw = pd.DataFrame(
+        [{"日期": "2026-01-01", "金额": 100, "摘要": "", "对方户名": ""}]
+    )
+    report = _build_report(
+        raw,
+        raw,
+        _standardized([("2026-01-01", 100, "")], "bank"),
+        _standardized([("2026-01-01", 90, "")], "journal"),
+    )
+    shown = []
+
+    def fake_askokcancel(title, message, **_kwargs):
+        shown.append((title, message))
+        return True
+
+    monkeypatch.setattr(gui.messagebox, "askokcancel", fake_askokcancel)
+
+    class _FakeApp:
+        def after(self, _delay, callback):
+            callback()
+
+    decision = gui.ReconciliationApp._confirm_precheck_warnings(
+        _FakeApp(),
+        report,
+    )
+
+    assert decision is True
+    assert shown[0][0] == "输入预检查提示"
+    assert "继续核对" in shown[0][1]
+    assert "返回调整" in shown[0][1]

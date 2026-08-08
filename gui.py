@@ -18,6 +18,7 @@ import pandas as pd
 
 from data_structures import MatcherConfig
 from data_loader import DataLoader, ParseErrorCollector
+from input_precheck import InputPrecheckBlockedError, InputPrecheckReport
 from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
@@ -1258,19 +1259,35 @@ class ReconciliationApp(ctk.CTk):
         self.journal_path = ctk.StringVar()
         self.bank_skip = ctk.StringVar(value="0")
         self.journal_skip = ctk.StringVar(value="0")
+        self.bank_header_rows = ctk.StringVar(value="1")
+        self.journal_header_rows = ctk.StringVar(value="1")
 
         # 银行流行
-        self._build_file_row(card, 1, "银行流水:", self.bank_path, self.bank_skip,
+        self._build_file_row(
+            card, 1, "银行流水:", self.bank_path, self.bank_skip,
+            self.bank_header_rows,
                              lambda: self.browse("bank"), lambda: self.auto_detect("bank"))
 
         # 日记账行
-        self._build_file_row(card, 2, "日记账:", self.journal_path, self.journal_skip,
+        self._build_file_row(
+            card, 2, "日记账:", self.journal_path, self.journal_skip,
+            self.journal_header_rows,
                              lambda: self.browse("journal"), lambda: self.auto_detect("journal"))
 
         # 配置列自适应
         card.grid_columnconfigure(1, weight=1)
 
-    def _build_file_row(self, card, row, label, path_var, skip_var, browse_cmd, detect_cmd):
+    def _build_file_row(
+        self,
+        card,
+        row,
+        label,
+        path_var,
+        skip_var,
+        header_rows_var,
+        browse_cmd,
+        detect_cmd,
+    ):
         ctk.CTkLabel(card, text=label, width=70, anchor="w").grid(
             row=row, column=0, sticky="w", padx=(PAD_CARD[0], 4), pady=3
         )
@@ -1289,11 +1306,17 @@ class ReconciliationApp(ctk.CTk):
         ctk.CTkEntry(card, textvariable=skip_var, width=45).grid(
             row=row, column=4, padx=2, pady=3
         )
+        ctk.CTkLabel(card, text="表头行数:", width=64, anchor="e").grid(
+            row=row, column=5, sticky="e", padx=(6, 0), pady=3
+        )
+        ctk.CTkEntry(card, textvariable=header_rows_var, width=38).grid(
+            row=row, column=6, padx=2, pady=3
+        )
         ctk.CTkButton(
             card, text="自动检测", width=72,
             fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
             command=detect_cmd
-        ).grid(row=row, column=5, padx=(2, PAD_CARD[0]), pady=3)
+        ).grid(row=row, column=7, padx=(2, PAD_CARD[0]), pady=3)
 
     def _build_config_card(self, parent):
         card, _ = _make_card(parent, "审计策略", row=0, column=1)
@@ -1844,6 +1867,14 @@ class ReconciliationApp(ctk.CTk):
             "journal_path": self.journal_path.get().strip(),
             "bank_skip": self._safe_int(self.bank_skip.get(), 0),
             "journal_skip": self._safe_int(self.journal_skip.get(), 0),
+            "bank_header_rows": self._safe_int(
+                self.bank_header_rows.get(),
+                1,
+            ),
+            "journal_header_rows": self._safe_int(
+                self.journal_header_rows.get(),
+                1,
+            ),
             "date_format": fmt_map.get(self.date_fmt_var.get(), "auto"),
             "bank_mapping": bank_mapping,
             "journal_mapping": journal_mapping,
@@ -1867,24 +1898,61 @@ class ReconciliationApp(ctk.CTk):
         path = filedialog.askopenfilename(filetypes=[("Excel/CSV", "*.xlsx *.xls *.csv")])
         if path:
             (self.bank_path if target == "bank" else self.journal_path).set(path)
-            self.load_columns(path, target)
+            self.auto_detect(target)
 
     def auto_detect(self, target):
         path = (self.bank_path if target == "bank" else self.journal_path).get()
         if not path:
             return
-        row = self.loader.find_header_row(path)
-        (self.bank_skip if target == "bank" else self.journal_skip).set(str(row))
-        self.log(f"已自动检测 {target} 表头行: {row}")
-        self.load_columns(path, target, row)
-
-    def load_columns(self, path, target, skiprows=0):
-        threading.Thread(target=self._load_columns_thread,
-                         args=(path, target, skiprows), daemon=True).start()
-
-    def _load_columns_thread(self, path, target, skiprows):
         try:
-            df = self.loader.load_file(path, skiprows=int(skiprows))
+            structure = self.loader.detect_table_structure(path)
+        except Exception as exc:
+            self.log(f"自动分析表格结构失败: {exc}")
+            return
+        (self.bank_skip if target == "bank" else self.journal_skip).set(
+            str(structure.skiprows)
+        )
+        (
+            self.bank_header_rows
+            if target == "bank"
+            else self.journal_header_rows
+        ).set(str(structure.header_rows))
+        label = "银行流水" if target == "bank" else "银行日记账"
+        self.log(f"{label}{structure.explanation}")
+        self.load_columns(
+            path,
+            target,
+            structure.skiprows,
+            structure.header_rows,
+            structure.columns,
+        )
+
+    def load_columns(
+        self,
+        path,
+        target,
+        skiprows=0,
+        header_rows=1,
+        derived_columns=None,
+    ):
+        threading.Thread(target=self._load_columns_thread,
+                         args=(path, target, skiprows, header_rows, derived_columns), daemon=True).start()
+
+    def _load_columns_thread(
+        self,
+        path,
+        target,
+        skiprows,
+        header_rows,
+        derived_columns,
+    ):
+        try:
+            df = self.loader.load_file(
+                path,
+                skiprows=int(skiprows),
+                header_rows=int(header_rows),
+                derived_columns=derived_columns,
+            )
             cols = df.columns.tolist()
             self.log(f"已加载列信息: {cols}")
             self.after(
@@ -1957,6 +2025,14 @@ class ReconciliationApp(ctk.CTk):
             messagebox.showerror("参数错误", str(exc))
             self.log(str(exc))
             return
+        if (
+            run_state["bank_header_rows"] < 1
+            or run_state["journal_header_rows"] < 1
+        ):
+            message = "❌ 表头行数必须大于等于1"
+            messagebox.showerror("参数错误", message)
+            self.log(message)
+            return
         for path_value, label in (
             (run_state["bank_path"], "银行流水"),
             (run_state["journal_path"], "日记账"),
@@ -1987,6 +2063,28 @@ class ReconciliationApp(ctk.CTk):
             self.log("正在停止任务...")
             self._set_stop_enabled(False)
 
+    def _confirm_precheck_warnings(
+        self,
+        report: InputPrecheckReport,
+    ) -> bool:
+        """在主线程一次展示普通提示，并等待用户选择。"""
+        completed = threading.Event()
+        decision = {"continue": False}
+
+        def ask_user():
+            decision["continue"] = messagebox.askokcancel(
+                "输入预检查提示",
+                report.warning_message()
+                + "\n\n选择“确定”继续核对；选择“取消”返回调整。",
+                icon="warning",
+                parent=self,
+            )
+            completed.set()
+
+        self.after(0, ask_user)
+        completed.wait()
+        return decision["continue"]
+
     def run_process(self, run_state):
         try:
             self.log("开始处理...")
@@ -2000,6 +2098,8 @@ class ReconciliationApp(ctk.CTk):
                 logger=self.log,
                 bank_skiprows=run_state["bank_skip"],
                 journal_skiprows=run_state["journal_skip"],
+                bank_header_rows=run_state["bank_header_rows"],
+                journal_header_rows=run_state["journal_header_rows"],
                 date_format=run_state["date_format"],
                 progress_callback=self._set_progress,
                 matcher_ready=lambda matcher: setattr(
@@ -2007,12 +2107,25 @@ class ReconciliationApp(ctk.CTk):
                     "matcher",
                     matcher,
                 ),
+                precheck_warning_callback=self._confirm_precheck_warnings,
             )
             self.log(f"\n{'=' * 50}")
             self.log(f"✅ 核对完成！报告已保存至: {output_path}")
             self.log(f"{'=' * 50}")
-        except InterruptedError:
-            self.log("任务已取消")
+        except InputPrecheckBlockedError as exc:
+            message = str(exc)
+            self.log(f"输入预检查未通过：{message}")
+            self.after(
+                0,
+                lambda: messagebox.showerror(
+                    "输入预检查未通过",
+                    message,
+                    parent=self,
+                ),
+            )
+            self._set_progress(0)
+        except InterruptedError as exc:
+            self.log(str(exc) or "任务已取消")
             self._set_progress(0)
         except Exception as exc:
             self.log(f"错误: {exc}")
