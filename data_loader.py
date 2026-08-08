@@ -16,6 +16,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 from precision_engine import PrecisionEngine
+from input_precheck import TableStructure, detect_table_structure
 from utils import (
     parse_date,
     clean_amount,
@@ -359,7 +360,13 @@ class DataLoader:
         self.logger = logger
         self.error_collector = error_collector
 
-    def load_file(self, file_path: str, skiprows: int = 0) -> pd.DataFrame:
+    def load_file(
+        self,
+        file_path: str,
+        skiprows: int = 0,
+        header_rows: int = 1,
+        derived_columns: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
         """
         读取 Excel 或 CSV 文件，返回 DataFrame
         """
@@ -373,14 +380,31 @@ class DataLoader:
         # 编码列表（按优先级）
         encodings = ['utf-8-sig', 'gbk', 'latin1']
         
+        if header_rows < 1:
+            raise ValueError("表头行数必须大于等于 1")
+
+        read_without_header = derived_columns is not None or header_rows > 1
+        effective_skiprows = skiprows + header_rows if read_without_header else skiprows
+
         if ext in ['.xlsx', '.xls']:
             # Excel不支持分块读取，直接读取
-            df = pd.read_excel(file_path, dtype=object, skiprows=skiprows)
+            df = pd.read_excel(
+                file_path,
+                dtype=object,
+                skiprows=effective_skiprows,
+                header=None if read_without_header else 0,
+            )
         elif ext == '.csv':
             loaded = False
             for encoding in encodings:
                 try:
-                    df = pd.read_csv(file_path, encoding=encoding, dtype=object, skiprows=skiprows)
+                    df = pd.read_csv(
+                        file_path,
+                        encoding=encoding,
+                        dtype=object,
+                        skiprows=effective_skiprows,
+                        header=None if read_without_header else 0,
+                    )
                     loaded = True
                     break
                 except UnicodeDecodeError:
@@ -389,51 +413,36 @@ class DataLoader:
                 raise UnicodeDecodeError("无法解码CSV文件，尝试了多种编码", b'', 0, 1, 'all encodings failed')
         else:
             raise ValueError("不支持的文件格式")
+
+        if derived_columns is not None:
+            if len(df.columns) != len(derived_columns):
+                raise ValueError(
+                    "派生列名数量与实际数据列数不一致："
+                    f"{len(derived_columns)} != {len(df.columns)}"
+                )
+            df.columns = list(derived_columns)
             
         return df
+
+    def detect_table_structure(self, file_path: str | Path) -> TableStructure:
+        """识别表头范围、派生列名和结构歧义。"""
+        structure = detect_table_structure(file_path)
+        if self.logger:
+            self.logger(f"自动检测表格结构：{structure.explanation}")
+        return structure
 
     def find_header_row(self, file_path: str, max_scan_rows: int = 10) -> int:
         """
         自动检测表头行位置
         """
-        path_obj = Path(file_path)
-        if not path_obj.exists():
-            return 0
-        
-        ext = path_obj.suffix.lower()
-        header_keywords = ['日期', 'Date', 'date', '摘要', 'Summary', 'summary', '金额', 'Amount', 'amount', 
-                          '借方', 'Debit', 'debit', '贷方', 'Credit', 'credit', '余额', 'Balance', 'balance']
-        
         try:
-            if ext in ['.xlsx', '.xls']:
-                # 一次性读取前 N 行，避免逐行重开文件
-                df_scan = pd.read_excel(file_path, dtype=object, header=None, nrows=max_scan_rows)
-                for i in range(len(df_scan)):
-                    row_values = df_scan.iloc[i].astype(str).values
-                    keyword_count = sum(1 for val in row_values if any(kw in val for kw in header_keywords))
-                    if keyword_count >= 2:
-                        if self.logger:
-                            self.logger(f"自动检测到表头在第 {i + 1} 行")
-                        return i
-            elif ext == '.csv':
-                encodings = ['utf-8-sig', 'gbk', 'latin1']
-                for encoding in encodings:
-                    try:
-                        df_scan = pd.read_csv(file_path, encoding=encoding, dtype=object, header=None, nrows=max_scan_rows)
-                        for i in range(len(df_scan)):
-                            row_values = df_scan.iloc[i].astype(str).values
-                            keyword_count = sum(1 for val in row_values if any(kw in val for kw in header_keywords))
-                            if keyword_count >= 2:
-                                if self.logger:
-                                    self.logger(f"自动检测到表头在第 {i + 1} 行")
-                                return i
-                        break
-                    except UnicodeDecodeError:
-                        continue
+            return detect_table_structure(
+                file_path,
+                max_scan_rows=max_scan_rows,
+            ).skiprows
         except Exception as e:
             if self.logger:
                 self.logger(f"自动检测表头行时出错: {str(e)}")
-        
         return 0
 
     def _process_amount_column(self, data: pd.DataFrame, col_name: Optional[str], 
