@@ -14,6 +14,23 @@ import pandas as pd
 
 
 SUPPORTED_SUFFIXES = {".xlsx", ".xls", ".csv"}
+SUMMARY_ROW_KEYWORDS = (
+    "本日合计", "本日累计", "本日发生额", "本日余额", "本日结存", "本日小计",
+    "本旬合计", "本旬累计", "本旬发生额", "本旬余额", "本旬结存", "本旬小计",
+    "本月合计", "本月累计", "本月发生额", "本月余额", "本月结存", "本月小计",
+    "本季合计", "本季累计", "本季发生额", "本季余额", "本季结存", "本季小计",
+    "本年合计", "本年累计", "本年发生额", "本年余额", "本年结存", "本年小计",
+    "本期合计", "本期累计", "本期发生额", "本期余额", "本期结存", "本期小计",
+    "日计", "月计", "季计", "年计", "期计", "日结", "月结", "季结", "年结",
+    "合计", "累计", "总计", "小计", "大计", "发生额", "余额", "结存",
+    "本页合计", "本页累计", "本页小计", "过次页", "承前页",
+    "期初余额", "期末余额", "期初结存", "期末结存",
+    "年初余额", "年末余额", "年初结存", "年末结存",
+    "月初余额", "月末余额", "月初结存", "月末结存",
+    "结转下年", "结转下期", "结转下月", "上年结转", "上期结转", "上月结转",
+    "上年结余", "上期结余", "承前余额", "结转余额",
+    "当前合计", "当前累计", "当前余额",
+)
 HEADER_KEYWORD_GROUPS = (
     ("日期", "date", "交易时间", "记账时间"),
     ("金额", "amount", "发生额"),
@@ -501,7 +518,7 @@ def _non_transaction_mask(
         lambda row: " ".join(_cell_text(value) for value in row),
         axis=1,
     )
-    summary_or_note = combined.str.contains(
+    generic_summary_or_note = combined.str.contains(
         "|".join(re.escape(word) for word in NON_TRANSACTION_KEYWORDS),
         na=False,
     ) | combined.str.startswith(NOTE_PREFIXES)
@@ -521,7 +538,13 @@ def _non_transaction_mask(
         if date_column in frame.columns
         else pd.Series(pd.NaT, index=frame.index)
     )
-    summary = summary_or_note & dates.isna()
+    summary_column = mapping.get("summary")
+    explicit_summary = (
+        frame[summary_column].map(_cell_text).isin(SUMMARY_ROW_KEYWORDS)
+        if summary_column in frame.columns
+        else pd.Series(False, index=frame.index)
+    )
+    summary = explicit_summary | (generic_summary_or_note & dates.isna())
     nonempty_counts = frame.map(lambda value: bool(_cell_text(value))).sum(axis=1)
     title_or_note = (nonempty_counts == 1) & dates.isna()
     return empty | summary | repeated_header | title_or_note
@@ -586,18 +609,38 @@ def build_input_precheck(
     bank_major = _ambiguity_changes_mapping(bank_structure, bank_mapping)
     journal_major = _ambiguity_changes_mapping(journal_structure, journal_mapping)
     ambiguous = bank_structure.ambiguous or journal_structure.ambiguous
-    structure_status = "阻止" if bank_major or journal_major else ("提示" if ambiguous else "通过")
+    user_override = any(
+        structure.explanation.startswith("采用用户设置")
+        for structure in (bank_structure, journal_structure)
+    )
+    structure_status = (
+        "阻止"
+        if bank_major or journal_major
+        else ("提示" if ambiguous or user_override else "通过")
+    )
     items.append(
         PrecheckItem(
             "表格结构",
             _structure_result(bank_structure),
             _structure_result(journal_structure),
-            "存在重大歧义" if bank_major or journal_major else ("存在备选结构" if ambiguous else "结构明确"),
+            (
+                "存在重大歧义"
+                if bank_major or journal_major
+                else (
+                    "采用用户设置"
+                    if user_override
+                    else ("存在备选结构" if ambiguous else "结构明确")
+                )
+            ),
             structure_status,
             (
                 "表头候选会改变必填列映射，请返回确认表头位置和层级。"
                 if structure_status == "阻止"
-                else ("检测到分数接近的表头候选，请确认当前列映射。" if ambiguous else "表头和数据区域可用。")
+                else (
+                    "当前采用用户设置的表头范围，与程序首选候选不同；列映射仍然有效。"
+                    if user_override
+                    else ("检测到分数接近的表头候选，请确认当前列映射。" if ambiguous else "表头和数据区域可用。")
+                )
             ),
         )
     )

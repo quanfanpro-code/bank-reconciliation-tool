@@ -274,6 +274,34 @@ def test_日期范围与收支合计分别比较且只提示():
     assert amount_item.comparison == "收入差额 20.00；支出差额 10.00"
 
 
+def test_用户表头设置不同于首选但映射有效时只提示():
+    raw = pd.DataFrame(
+        [{"日期": "2026-01-01", "金额": 100, "摘要": "测试", "对方户名": "甲"}]
+    )
+    adopted = input_precheck.TableStructure(
+        skiprows=1,
+        header_rows=1,
+        columns=list(raw.columns),
+        score=10,
+        ambiguous=False,
+        explanation="采用用户设置：第2行起、共1行表头",
+    )
+
+    report = _build_report(
+        raw,
+        raw,
+        _standardized([("2026-01-01", 100, "测试")], "bank"),
+        _standardized([("2026-01-01", 100, "测试")], "journal"),
+        bank_structure=adopted,
+        journal_structure=adopted,
+    )
+
+    item = next(item for item in report.items if item.name == "表格结构")
+    assert report.has_blockers is False
+    assert item.status == "提示"
+    assert "用户设置" in item.explanation
+
+
 def test_无效方向与必填列缺失会阻止运行():
     raw = pd.DataFrame(
         [{"日期": "2026-01-01", "金额": 100, "摘要": "测试", "对方户名": "甲"}]
@@ -386,6 +414,26 @@ def test_有效日期交易摘要含合计字样不会误报为非交易行():
     item = next(item for item in report.items if item.name == "非交易行")
     assert item.status == "通过"
     assert item.bank_result == "识别并排除0行"
+
+
+def test_带有效日期的明确合计行也不会进入正式交易():
+    frame = pd.DataFrame(
+        [
+            {"日期": "2026-01-31", "金额": 100, "摘要": "正常收款"},
+            {"日期": "2026-01-31", "金额": 100, "摘要": "本期合计"},
+        ]
+    )
+    mapping = {
+        "date": "日期",
+        "amount": "金额",
+        "summary": "摘要",
+        "auxiliary_text_columns": ["摘要"],
+        "mode": "signed_amount",
+    }
+
+    standardized = DataLoader().standardize_data(frame, mapping, "bank")
+
+    assert standardized["summary"].tolist() == ["正常收款"]
 
 
 def test_日期或金额全部无可用记录会阻止():

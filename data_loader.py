@@ -16,7 +16,11 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 from precision_engine import PrecisionEngine
-from input_precheck import TableStructure, detect_table_structure
+from input_precheck import (
+    SUMMARY_ROW_KEYWORDS as PRECHECK_SUMMARY_ROW_KEYWORDS,
+    TableStructure,
+    detect_table_structure,
+)
 from utils import (
     parse_date,
     clean_amount,
@@ -568,37 +572,7 @@ class DataLoader:
     # 汇总行关键词（精确匹配，这些行不参与计算）
     # 涵盖：各种账簿软件导出时自动生成的汇总行
     # 通过词根排列组合生成：时间词 + 动作词
-    SUMMARY_ROW_KEYWORDS = [
-        # === 本日 ===
-        '本日合计', '本日累计', '本日发生额', '本日余额', '本日结存', '本日小计',
-        # === 本旬 ===
-        '本旬合计', '本旬累计', '本旬发生额', '本旬余额', '本旬结存', '本旬小计',
-        # === 本月 ===
-        '本月合计', '本月累计', '本月发生额', '本月余额', '本月结存', '本月小计',
-        # === 本季 ===
-        '本季合计', '本季累计', '本季发生额', '本季余额', '本季结存', '本季小计',
-        # === 本年 ===
-        '本年合计', '本年累计', '本年发生额', '本年余额', '本年结存', '本年小计',
-        # === 本期 ===
-        '本期合计', '本期累计', '本期发生额', '本期余额', '本期结存', '本期小计',
-        # === 日/月/季/年/期 + 计 ===
-        '日计', '月计', '季计', '年计', '期计',
-        # === 日/月/季/年 + 结 ===
-        '日结', '月结', '季结', '年结',
-        # === 通用汇总 ===
-        '合计', '累计', '总计', '小计', '大计', '发生额', '余额', '结存',
-        # === 页面相关 ===
-        '本页合计', '本页累计', '本页小计', '过次页', '承前页',
-        # === 期初/期末 ===
-        '期初余额', '期末余额', '期初结存', '期末结存',
-        '年初余额', '年末余额', '年初结存', '年末结存',
-        '月初余额', '月末余额', '月初结存', '月末结存',
-        # === 结转 ===
-        '结转下年', '结转下期', '结转下月', '上年结转', '上期结转', '上月结转',
-        '上年结余', '上期结余', '承前余额', '结转余额',
-        # === 软件自动生成 ===
-        '当前合计', '当前累计', '当前余额'
-    ]
+    SUMMARY_ROW_KEYWORDS = PRECHECK_SUMMARY_ROW_KEYWORDS
     
     def standardize_data(
         self,
@@ -641,8 +615,7 @@ class DataLoader:
         data['original_idx'] = data['__source_row__']
         data['original_file_row'] = data['__file_row__']
         
-        # 1.5 在ffill之前，先过滤掉汇总行（本期合计、本年累计等）
-        # 识别条件：日期为空 且 凭证号为空 且 摘要精确匹配关键词
+        # 1.5 在ffill之前，先过滤掉明确的汇总行（本期合计、本年累计等）
         date_col = mapping.get('date')
         voucher_col = mapping.get('voucher')
         summary_col = mapping.get('summary')
@@ -652,12 +625,6 @@ class DataLoader:
             summary_text = data[summary_col].astype(str).str.strip()
             is_summary_keyword = summary_text.isin(self.SUMMARY_ROW_KEYWORDS)
             
-            # 日期为空（包括空字符串、nan、None）
-            date_is_empty = data[date_col].isna() if (date_col and date_col in data.columns) else pd.Series([True] * len(data))
-            if date_col and date_col in data.columns:
-                date_str = data[date_col].astype(str).str.strip()
-                date_is_empty = date_is_empty | (date_str == '') | (date_str.str.lower() == 'nan')
-            
             # 凭证号为空（如果有的话）
             voucher_is_empty = pd.Series([True] * len(data))
             if voucher_col and voucher_col in data.columns:
@@ -665,8 +632,8 @@ class DataLoader:
                 voucher_str = data[voucher_col].astype(str).str.strip()
                 voucher_is_empty = voucher_is_empty | (voucher_str == '') | (voucher_str.str.lower() == 'nan')
             
-            # 三个条件同时满足才是汇总行
-            is_summary_row = is_summary_keyword & date_is_empty & voucher_is_empty
+            # 明确的汇总标签即使带日期也不是交易；凭证号非空时保守保留。
+            is_summary_row = is_summary_keyword & voucher_is_empty
             
             if is_summary_row.any():
                 filtered_count = is_summary_row.sum()
