@@ -2,10 +2,13 @@ from pathlib import Path
 from decimal import Decimal
 
 import pandas as pd
+import pytest
 from openpyxl import Workbook
 
 import input_precheck
+from application import run_reconciliation
 from data_loader import DataLoader
+from data_structures import MatcherConfig
 
 
 def _build_merged_header_workbook(tmp_path: Path) -> Path:
@@ -75,6 +78,36 @@ def test_标题与两行合并表头生成稳定无重复列名(tmp_path):
     assert len(structure.columns) == len(set(structure.columns))
     assert data.shape == (2, 5)
     assert data.iloc[0]["辅助信息｜对方户名"] == "甲公司"
+
+
+def test_多行表头后的原文件行号保持可追溯(tmp_path):
+    path = _build_merged_header_workbook(tmp_path)
+    loader = DataLoader()
+    structure = loader.detect_table_structure(path)
+    data = loader.load_file(
+        path,
+        skiprows=structure.skiprows,
+        header_rows=structure.header_rows,
+        derived_columns=structure.columns,
+    )
+    mapping = {
+        "date": "日期",
+        "debit": "发生额｜借方",
+        "credit": "发生额｜贷方",
+        "summary": "辅助信息｜摘要",
+        "auxiliary_text_columns": ["辅助信息｜摘要", "辅助信息｜对方户名"],
+        "mode": "debit_credit",
+    }
+
+    standardized = loader.standardize_data(
+        data,
+        mapping,
+        "bank",
+        skiprows_offset=structure.skiprows,
+        header_rows=structure.header_rows,
+    )
+
+    assert standardized["original_file_row"].tolist() == [4, 5]
 
 
 def test_重复表头派生列名按出现顺序去重(tmp_path):
@@ -300,3 +333,120 @@ def test_检查结果可直接转换为固定列报告表():
         "必填字段",
         "辅助文字完整性",
     ]
+
+
+def _write_direction_pair(
+    tmp_path,
+    *,
+    bank_amount=100,
+    journal_amount=100,
+    bank_direction="贷",
+    journal_direction="借",
+):
+    bank_path = tmp_path / "银行流水.xlsx"
+    journal_path = tmp_path / "银行日记账.xlsx"
+    pd.DataFrame(
+        [
+            {
+                "日期": "2026-01-01",
+                "金额": bank_amount,
+                "方向": bank_direction,
+                "摘要": "测试收款",
+            }
+        ]
+    ).to_excel(bank_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "日期": "2026-01-01",
+                "金额": journal_amount,
+                "方向": journal_direction,
+                "摘要": "测试收款",
+            }
+        ]
+    ).to_excel(journal_path, index=False)
+    mapping = {
+        "date": "日期",
+        "amount": "金额",
+        "direction": "方向",
+        "summary": "摘要",
+        "auxiliary_text_columns": ["摘要"],
+        "mode": "single_amount_with_direction",
+    }
+    return bank_path, journal_path, mapping
+
+
+def test_无界面入口遇到无效方向会阻止且不创建报告(tmp_path):
+    bank_path, journal_path, mapping = _write_direction_pair(
+        tmp_path,
+        bank_direction="未知方向",
+    )
+    output_path = tmp_path / "不应生成.xlsx"
+
+    with pytest.raises(input_precheck.InputPrecheckBlockedError) as exc_info:
+        run_reconciliation(
+            bank_path=str(bank_path),
+            journal_path=str(journal_path),
+            bank_mapping=mapping,
+            journal_mapping=mapping,
+            matcher_config=MatcherConfig(),
+            output_path=output_path,
+        )
+
+    assert "方向" in str(exc_info.value)
+    assert not output_path.exists()
+
+
+def test_普通提示回调可以返回调整且不创建报告(tmp_path):
+    bank_path, journal_path, mapping = _write_direction_pair(
+        tmp_path,
+        bank_amount=100,
+        journal_amount=90,
+    )
+    output_path = tmp_path / "用户已返回调整.xlsx"
+    received = []
+
+    with pytest.raises(InterruptedError, match="返回调整"):
+        run_reconciliation(
+            bank_path=str(bank_path),
+            journal_path=str(journal_path),
+            bank_mapping=mapping,
+            journal_mapping=mapping,
+            matcher_config=MatcherConfig(),
+            output_path=output_path,
+            precheck_warning_callback=lambda report: received.append(report) or False,
+        )
+
+    assert len(received) == 1
+    assert received[0].has_warnings is True
+    assert not output_path.exists()
+
+
+def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_path):
+    bank_path, journal_path, mapping = _write_direction_pair(tmp_path)
+    output_path = tmp_path / "核对报告.xlsx"
+
+    result = run_reconciliation(
+        bank_path=str(bank_path),
+        journal_path=str(journal_path),
+        bank_mapping=mapping,
+        journal_mapping=mapping,
+        matcher_config=MatcherConfig(),
+        output_path=output_path,
+    )
+
+    assert result == output_path
+    assert "输入预检查" in pd.ExcelFile(output_path).sheet_names
+    table = pd.read_excel(output_path, sheet_name="输入预检查")
+    business_columns = [
+        column for column in table.columns if not str(column).startswith("Unnamed:")
+    ]
+    assert business_columns == [
+        "检查项目",
+        "银行流水结果",
+        "银行日记账结果",
+        "双方比较结果",
+        "状态",
+        "说明",
+    ]
+    assert table.loc[table["检查项目"] == "金额合计", "状态"].item() == "通过"

@@ -282,6 +282,11 @@ def _candidate_score(
     raw_nonempty = raw_header.notna().sum(axis=1)
     title_penalty = 1 if int(raw_nonempty.max()) <= 2 else 0
     next_header_penalty = 1 if _keyword_hits(data.iloc[0].tolist()) >= 2 else 0
+    data_like_header_ratio = sum(
+        _looks_numeric_or_date(value)
+        for value in header.iloc[-1]
+        if _cell_text(value)
+    ) / width
     stability = 1 - min(pstdev(densities), 1) if len(densities) > 1 else 1
     score = (
         keywords * 1.5
@@ -291,6 +296,7 @@ def _candidate_score(
         + stability
         - title_penalty * 4
         - next_header_penalty * 2
+        - data_like_header_ratio * 5
         - (depth - 1) * 0.1
     )
     evidence = (
@@ -298,6 +304,7 @@ def _candidate_score(
         f"列覆盖率{coverage:.0%}",
         f"数据区稳定度{stability:.0%}",
         f"类型转换列{transitions}个",
+        f"表头数据型占比{data_like_header_ratio:.0%}",
     )
     return HeaderCandidate(start, depth, round(score, 4), tuple(columns), evidence)
 
@@ -352,6 +359,25 @@ def detect_table_structure(
         ambiguous=ambiguous,
         candidates=tuple(candidates[:5]),
         explanation=explanation,
+    )
+
+
+def derive_header_columns(
+    file_path: str | Path,
+    skiprows: int,
+    header_rows: int,
+) -> list[str]:
+    """按用户采用的表头范围派生稳定列名。"""
+    if skiprows < 0 or header_rows < 1:
+        raise ValueError("跳过行数不得小于0，表头行数必须大于等于1")
+    path = Path(file_path)
+    preview, merges = _read_preview(path, skiprows + header_rows)
+    preview = preview.dropna(axis=1, how="all")
+    if len(preview) < skiprows + header_rows:
+        raise ValueError("指定的表头范围超出文件内容")
+    expanded = _expand_merges(preview, merges)
+    return flatten_header_rows(
+        expanded.iloc[skiprows:skiprows + header_rows].values.tolist()
     )
 
 

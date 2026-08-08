@@ -21,6 +21,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from precision_engine import PrecisionEngine
 from data_structures import InitialBalanceWarning, MatcherConfig
 from data_loader import ParseErrorCollector
+from input_precheck import InputPrecheckReport
 from matcher import Matcher
 from utils import round_decimal, clean_excel_string
 from balance import BalanceRecalculator, BalanceReconciler
@@ -70,9 +71,10 @@ class Reporter:
     def __init__(self, matcher: Matcher, raw_bank: Optional[pd.DataFrame] = None,
                  raw_journal: Optional[pd.DataFrame] = None,
                  bank_mapping: Optional[Dict[str, Any]] = None,
-                 journal_mapping: Optional[Dict[str, Any]] = None,
-                 logger: Optional[Callable[[str], None]] = None,
-                 error_collector: Optional[ParseErrorCollector] = None):
+                  journal_mapping: Optional[Dict[str, Any]] = None,
+                  logger: Optional[Callable[[str], None]] = None,
+                  error_collector: Optional[ParseErrorCollector] = None,
+                  precheck_report: Optional[InputPrecheckReport] = None):
         self.matcher = matcher
         self.raw_bank = raw_bank
         self.raw_journal = raw_journal
@@ -81,6 +83,7 @@ class Reporter:
         self.logger = logger
         self.initial_balance_warning: Optional[InitialBalanceWarning] = None
         self.error_collector = error_collector
+        self.precheck_report = precheck_report
 
     @staticmethod
     def _get_ordered_columns(df: pd.DataFrame, date_col: str = 'date') -> List[str]:
@@ -2230,6 +2233,8 @@ class Reporter:
                 date_format,
             ),
         }
+        if self.precheck_report is not None:
+            tables["输入预检查"] = self.precheck_report.to_dataframe()
         tables.update(
             self._build_balance_tables(
                 bank_has_balance=bank_has_balance,

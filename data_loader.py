@@ -606,7 +606,8 @@ class DataLoader:
         mapping: Dict[str, Any],
         source_type: str,
         date_format: str = "auto",
-        skiprows_offset: int = 0
+        skiprows_offset: int = 0,
+        header_rows: int = 1,
     ) -> pd.DataFrame:
         """
         将 DataFrame 标准化为统一格式。
@@ -619,7 +620,12 @@ class DataLoader:
             # pd.read_excel(skiprows=N) 跳过 N 行，第 N+1 行成为表头，
             # 第 N+2 行是第一条数据（DataFrame index 0）。
             # 因此文件行号 = index + skiprows + 2（+1 转为1起始，+1 补偿表头行）
-            working_df['__file_row__'] = working_df.index + int(skiprows_offset) + 2
+            working_df['__file_row__'] = (
+                working_df.index
+                + int(skiprows_offset)
+                + int(header_rows)
+                + 1
+            )
 
         # 0. 针对日记账自动执行数据清洗（跳过标题行、过滤汇总行）
         if source_type == 'journal':
