@@ -758,6 +758,7 @@ class Reporter:
             "tolerance_date": "日期容差",
             "amount_difference": "明显微小金额差异",
             "batch_aggregation": "批量聚合",
+            "continuous_summary_group": "连续摘要整组",
             "combination_dfs": "组合求和",
             "daily_total": "日总额",
             "monthly_total": "月总额",

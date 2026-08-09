@@ -1557,12 +1557,16 @@ class Matcher:
         source: pd.DataFrame,
         target: pd.DataFrame,
     ) -> None:
-        if source.empty or target.empty:
+        if (
+            source.empty
+            or target.empty
+            or "original_idx" not in source.columns
+        ):
             return
 
         target_by_summary: Dict[str, List[int]] = {}
         for target_index, target_row in target.iterrows():
-            summary = normalize_summary(target_row["summary"])
+            summary = normalize_summary(target_row.get("summary", ""))
             if summary:
                 target_by_summary.setdefault(summary, []).append(int(target_index))
 
@@ -1609,8 +1613,13 @@ class Matcher:
         run_summary = ""
         previous_row: Optional[int] = None
         for source_index, row in source.sort_values("original_idx").iterrows():
-            summary = normalize_summary(row["summary"])
-            original_row = int(row["original_idx"])
+            summary = normalize_summary(row.get("summary", ""))
+            source_row = pd.to_numeric(row.get("original_idx"), errors="coerce")
+            if pd.isna(source_row):
+                add_run(run, run_summary)
+                run, run_summary, previous_row = [], "", None
+                continue
+            original_row = int(source_row)
             if (
                 run
                 and summary
