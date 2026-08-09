@@ -1,4 +1,3 @@
-import uuid
 import threading
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -191,16 +190,6 @@ class MatcherConfig:
     clearly_trivial_threshold: Decimal = Decimal("5000.00")
     auto_confirm_score: int = 70
     batch_min_count: int = 10
-
-@dataclass
-class MatchResult:
-    """匹配结果类"""
-    bank_idxs: List[int]
-    journal_idxs: List[int]
-    match_type: str
-    confidence: str
-    match_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
 
 class WorkerExceptionLogger:
     """Worker异常记录器 - 用于记录并行匹配过程中的异常"""

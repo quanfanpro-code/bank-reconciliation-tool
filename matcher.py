@@ -3,14 +3,12 @@
 # ==========================================
 # 包含：
 #   - 算法函数（DFS、折半枚举、贪心等）
-#   - 倒排索引（NgramTokenizer、InvertedIndex）
-#   - 并行处理函数
+#   - 并行 DFS 处理函数
 #   - 核心匹配引擎（Matcher 类）
 
 import gc
 import os
 import re
-import uuid
 import random
 import bisect
 import secrets
@@ -36,7 +34,7 @@ except ImportError:
 from precision_engine import PrecisionEngine
 from data_structures import (
     DifferencePoolResult, LLMDecisionRecord, MatcherConfig,
-    MatchResult, MatchCandidate,
+    MatchCandidate,
     ProcessingStatus,
     WorkerExceptionLogger,
     DFS_CONFIDENCE_HIGH_THRESHOLD, DFS_CONFIDENCE_MEDIUM_THRESHOLD,
@@ -57,9 +55,6 @@ from matching_policy import (
     score_candidate,
     score_text_fields,
 )
-from utils import calculate_similarity
-
-
 # ==========================================
 # 辅助函数
 # ==========================================
@@ -519,251 +514,6 @@ def _randomized_greedy(window_amounts: List[int], window_dates: List[pd.Timestam
     return None
 
 
-# ==========================================
-# 倒排索引
-# ==========================================
-
-class NgramTokenizer:
-    """N-gram分词器
-    
-    将文本分割为固定长度的字符片段（n-gram），
-    用于构建倒排索引加速字符串匹配。
-    """
-    
-    def __init__(self, n: int = 2):
-        """
-        初始化分词器
-        
-        :param n: gram长度，默认为2（双字gram）
-        """
-        self.n = n
-    
-    def tokenize(self, text: str) -> List[str]:
-        """
-        将文本分割为n-gram列表
-        
-        :param text: 输入文本
-        :return: n-gram列表
-        
-        示例：
-            tokenize("收到货款", n=2) -> ["收到", "到货", "货款"]
-        """
-        if not text or len(text) < self.n:
-            return []
-        return [text[i:i+self.n] for i in range(len(text) - self.n + 1)]
-
-
-class InvertedIndex:
-    """倒排索引
-    
-    用于加速字符串匹配的倒排索引结构。
-    通过n-gram建立文档ID的快速查找表。
-    """
-    
-    def __init__(self, tokenizer: Optional[NgramTokenizer] = None):
-        """
-        初始化倒排索引
-        
-        :param tokenizer: 分词器实例，默认使用2-gram分词器
-        """
-        self.tokenizer = tokenizer or NgramTokenizer(n=2)
-        self._index: Dict[str, Set[int]] = {}
-        self._doc_count = 0
-    
-    def build(self, documents: Dict[int, str]) -> None:
-        """
-        构建倒排索引
-        
-        :param documents: 文档字典 {文档ID: 文本内容}
-        """
-        self._index.clear()
-        self._doc_count = len(documents)
-        
-        for doc_id, text in documents.items():
-            if pd.isna(text) or not text:
-                continue
-            text = str(text)
-            for gram in self.tokenizer.tokenize(text):
-                if gram not in self._index:
-                    self._index[gram] = set()
-                self._index[gram].add(doc_id)
-    
-    def query(self, text: str) -> Set[int]:
-        """
-        查询与文本有gram交集的文档ID集合
-        
-        :param text: 查询文本
-        :return: 有gram交集的文档ID集合
-        """
-        if not text:
-            return set()
-        
-        grams = self.tokenizer.tokenize(text)
-        if not grams:
-            return set()
-        
-        result = set()
-        for gram in grams:
-            if gram in self._index:
-                result |= self._index[gram]
-        
-        return result
-    
-    def get_candidates(self, text: str, min_overlap: int = 1) -> Set[int]:
-        """
-        获取与文本有至少min_overlap个gram交集的文档ID集合
-        
-        :param text: 查询文本
-        :param min_overlap: 最小gram重叠数
-        :return: 满足条件的文档ID集合
-        """
-        if not text:
-            return set()
-        
-        grams = self.tokenizer.tokenize(text)
-        if not grams:
-            return set()
-        
-        overlap_count: Dict[int, int] = {}
-        for gram in grams:
-            if gram in self._index:
-                for doc_id in self._index[gram]:
-                    overlap_count[doc_id] = overlap_count.get(doc_id, 0) + 1
-        
-        return {doc_id for doc_id, count in overlap_count.items() if count >= min_overlap}
-    
-    def to_dict(self) -> Dict[str, List[int]]:
-        """
-        将索引转换为可pickle的字典格式（用于多进程传递）
-        
-        :return: {gram: [doc_ids]} 格式的字典
-        """
-        return {gram: list(doc_ids) for gram, doc_ids in self._index.items()}
-    
-    @classmethod
-    def from_dict(cls, index_dict: Dict[str, List[int]], tokenizer: Optional[NgramTokenizer] = None) -> 'InvertedIndex':
-        """
-        从字典格式重建索引
-        
-        :param index_dict: {gram: [doc_ids]} 格式的字典
-        :param tokenizer: 分词器实例
-        :return: InvertedIndex实例
-        """
-        instance = cls(tokenizer)
-        instance._index = {gram: set(doc_ids) for gram, doc_ids in index_dict.items()}
-        instance._doc_count = len(set(doc_id for doc_ids in index_dict.values() for doc_id in doc_ids))
-        return instance
-
-
-# ==========================================
-# 并行处理函数
-# ==========================================
-
-def _process_exact_match_key(args: Tuple) -> List[Tuple[int, int, str]]:
-    """处理单个精确匹配key（带倒排索引加速）"""
-    key, b_idxs, j_idxs, bank_summaries, journal_summaries, threshold, high_threshold, journal_index_dict = args
-    results = []
-
-    if len(b_idxs) == 1 and len(j_idxs) == 1:
-        results.append((b_idxs[0], j_idxs[0], '高'))
-        return results
-
-    tokenizer = NgramTokenizer(n=2)
-    
-    matched_b = set()
-    matched_j = set()
-
-    for b_idx in b_idxs:
-        if b_idx in matched_b: continue
-        b_summary = bank_summaries.get(b_idx, '')
-        best_j_idx = None
-        best_similarity = 0.0
-        
-        b_grams = set(tokenizer.tokenize(b_summary))
-        candidate_j_idxs = set()
-        
-        if b_grams and journal_index_dict:
-            for gram in b_grams:
-                if gram in journal_index_dict:
-                    candidate_j_idxs.update(journal_index_dict[gram])
-        else:
-            candidate_j_idxs = set(j_idxs)
-        
-        candidate_j_idxs = candidate_j_idxs & set(j_idxs)
-
-        for j_idx in candidate_j_idxs:
-            if j_idx in matched_j: continue
-            j_summary = journal_summaries.get(j_idx, '')
-            similarity = calculate_similarity(b_summary, j_summary)
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_j_idx = j_idx
-
-        if best_j_idx is not None and best_similarity > threshold:
-            confidence = '高' if best_similarity > high_threshold else '中'
-            results.append((b_idx, best_j_idx, confidence))
-            matched_b.add(b_idx)
-            matched_j.add(best_j_idx)
-
-    return results
-
-# 容差匹配的 worker 全局变量
-_worker_b_groups: Optional[Dict[Any, Any]] = None
-
-def _init_tolerance_worker(b_groups: Dict) -> None:
-    global _worker_b_groups
-    _worker_b_groups = b_groups
-
-def _process_tolerance_match(args: Tuple) -> Optional[Tuple[int, int, str, int, float]]:
-    """处理单个日期容差匹配"""
-    global _worker_b_groups
-    j_idx, j_amount_li, j_date, j_summary, tolerance_days, threshold = args
-    b_groups = _worker_b_groups
-    if b_groups is None:
-        return None
-
-    if j_amount_li not in b_groups:
-        return None
-
-    group = b_groups[j_amount_li]
-    dates = group['dates']
-    indexes = group['indexes']
-
-    tolerance = timedelta(days=tolerance_days)
-    date_min = pd.Timestamp(j_date) - tolerance
-    date_max = pd.Timestamp(j_date) + tolerance
-
-    left_pos = bisect.bisect_left(dates, date_min)
-    right_pos = bisect.bisect_right(dates, date_max)
-
-    candidates = []
-    for idx_pos in range(left_pos, right_pos):
-        b_idx = indexes[idx_pos]
-        b_date = dates[idx_pos]
-        diff = abs(b_date - pd.Timestamp(j_date))
-        if diff <= tolerance:
-            candidates.append((b_idx, diff))
-
-    if not candidates:
-        return None
-
-    best_idx, best_diff = min(candidates, key=lambda x: x[1])
-
-    b_summary = group['summaries'].get(best_idx, '')
-    similarity = calculate_similarity(j_summary, b_summary)
-    if len(candidates) >= 2 and similarity < threshold:
-        return None
-
-    if best_diff <= timedelta(days=1):
-        confidence = '高'
-    elif best_diff <= timedelta(days=3):
-        confidence = '中'
-    else:
-        confidence = '低'
-
-    return (best_idx, j_idx, confidence, best_diff.days, similarity)
-
-
 def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[int], str]]:
     """处理单个 source 的 DFS 匹配"""
     source_idx, source_date, target_val, targets_data, config = args
@@ -989,17 +739,6 @@ class Matcher:
         self._collecting_candidates = False
         self.stopping = False
         
-        self._journal_index: Optional[InvertedIndex] = None
-        self._build_journal_index()
-    
-    def _build_journal_index(self) -> None:
-        """构建日记账倒排索引"""
-        summaries = {}
-        for idx, row in self.journal.iterrows():
-            summaries[idx] = str(row['summary']) if pd.notna(row['summary']) else ''
-        self._journal_index = InvertedIndex()
-        self._journal_index.build(summaries)
-    
     def _get_memory_usage_gb(self) -> float:
         if PSUTIL_AVAILABLE:
             try:
@@ -1514,56 +1253,10 @@ class Matcher:
         if not self._collecting_candidates:
             self._commit_selected_candidates()
 
-    def _mark_matched(self, bank_idxs: List[int], journal_idxs: List[int], 
-                      match_type: str, confidence: str = '高',
-                      match_stage: str = '',
-                      amount_diff: Any = None,
-                      date_diff_days: int = 0,
-                      summary_similarity: float = 0.0,
-                      is_rule_matched: bool = False,
-                      is_tolerance_matched: bool = False,
-                      combo_count: int = 0,
-                      is_aggregation_matched: bool = False) -> None:
-        match_id = str(uuid.uuid4())
-        if bank_idxs:
-            self.bank.loc[bank_idxs, 'matched'] = True
-            self.bank.loc[bank_idxs, 'match_id'] = match_id
-            self.bank.loc[bank_idxs, 'match_type'] = match_type
-            self.bank.loc[bank_idxs, 'confidence'] = confidence
-        if journal_idxs:
-            self.journal.loc[journal_idxs, 'matched'] = True
-            self.journal.loc[journal_idxs, 'match_id'] = match_id
-            self.journal.loc[journal_idxs, 'match_type'] = match_type
-            self.journal.loc[journal_idxs, 'confidence'] = confidence
-        self.matches.append({
-            'id': match_id, 'type': match_type, 'confidence': confidence,
-            'bank_idxs': bank_idxs, 'journal_idxs': journal_idxs,
-            'match_stage': match_stage, 'amount_diff': amount_diff,
-            'date_diff_days': date_diff_days, 'summary_similarity': summary_similarity,
-            'is_rule_matched': is_rule_matched, 'is_tolerance_matched': is_tolerance_matched,
-            'combo_count': combo_count, 'is_aggregation_matched': is_aggregation_matched
-        })
-    
-    def _calculate_similarity(self, str1: str, str2: str) -> float:
-        return calculate_similarity(str1, str2)
-
     @staticmethod
     def _confidence_sort_key(confidence: str) -> int:
         order = {'高': 0, '中': 1, '低': 2}
         return order.get(confidence, 99)
-
-    @staticmethod
-    def _get_sign_profile(amounts: List[Any]) -> Tuple[Any, Any, int, int, int]:
-        positive = [amt for amt in amounts if amt > 0]
-        negative = [amt for amt in amounts if amt < 0]
-        zero_count = sum(1 for amt in amounts if amt == 0)
-        return (
-            sum(positive) if positive else 0,
-            sum(negative) if negative else 0,
-            len(positive),
-            len(negative),
-            zero_count,
-        )
 
     def _total_structure_matches(self, bank_amounts: List[Any], journal_amounts: List[Any]) -> bool:
         """收入和支出分别一致即可，笔数与金额分布只作为评分证据。"""
@@ -1577,236 +1270,6 @@ class Matcher:
             if re.search(pat, summary, re.IGNORECASE):
                 return True
         return False
-
-    def _apply_strong_rules(self) -> None:
-        strong_rules = self.MATCHING_RULES.get('strong_rules', {})
-        assert self._journal_index is not None
-        for rule_name, keywords in strong_rules.items():
-            pat = "|".join(map(re.escape, keywords))
-            b_mask = ~self.bank['matched'] & self.bank['summary'].str.contains(pat, na=False, regex=True)
-            bank_records = self.bank[b_mask]
-            
-            keyword_candidates: Set[int] = set()
-            for keyword in keywords:
-                keyword_candidates.update(self._journal_index.query(keyword))
-            j_mask = ~self.journal['matched'] & self.journal.index.isin(keyword_candidates)
-            journal_records = self.journal[j_mask]
-            
-            if bank_records.empty or journal_records.empty:
-                continue
-            
-            for amt in bank_records['amount_decimal'].unique():
-                b_candidates = bank_records[bank_records['amount_decimal'] == amt]
-                j_candidates = journal_records[journal_records['amount_decimal'] == amt]
-                if b_candidates.empty or j_candidates.empty:
-                    continue
-                
-                for date_offset in DATE_OFFSET_PRIORITIES:
-                    for b_idx, b_row in b_candidates.iterrows():
-                        if self.bank.loc[b_idx, 'matched']:
-                            continue
-                        
-                        b_summary = str(b_row['summary'])
-                        if self._check_negative_rules(b_summary):
-                            continue
-                        
-                        b_date = b_row['date']
-                        date_min = b_date - timedelta(days=date_offset)
-                        date_max = b_date + timedelta(days=date_offset)
-                        
-                        j_date_mask = ((~self.journal.loc[j_candidates.index, 'matched']) & 
-                                       (j_candidates['date'] >= date_min) & 
-                                       (j_candidates['date'] <= date_max))
-                        j_window = j_candidates[j_date_mask]
-
-                        if j_window.empty:
-                            continue
-                        
-                        j_window_filtered = j_window[~j_window['summary'].apply(
-                            lambda s: self._check_negative_rules(str(s)) if pd.notna(s) else False)]
-                        
-                        if j_window_filtered.empty:
-                            continue
-                        
-                        if len(j_window_filtered) > 1:
-                            b_summary_lower = b_summary.lower()
-                            best_similarity = -1.0
-                            best_j_idx = None
-                            for j_idx, j_row in j_window_filtered.iterrows():
-                                j_summary = str(j_row['summary']).lower()
-                                similarity = self._calculate_similarity(b_summary_lower, j_summary)
-                                if similarity > best_similarity:
-                                    best_similarity = similarity
-                                    best_j_idx = j_idx
-                            if best_similarity < self.config.similarity_threshold:
-                                continue
-                        else:
-                            best_j_idx = j_window_filtered.index[0]
-                        
-                        if best_j_idx is not None:
-                            if self.journal.loc[best_j_idx, 'matched']:
-                                continue
-                            confidence = '高' if date_offset == 0 else ('中' if date_offset == 1 else '低')
-                            b_amt = self.bank.loc[b_idx, 'amount_decimal']
-                            j_amt = self.journal.loc[best_j_idx, 'amount_decimal']
-                            b_date = self.bank.loc[b_idx, 'date']
-                            j_date = self.journal.loc[best_j_idx, 'date']
-                            b_summary = str(self.bank.loc[b_idx, 'summary'])
-                            j_summary = str(self.journal.loc[best_j_idx, 'summary'])
-                            self._mark_matched([b_idx], [best_j_idx], f'强规则_{rule_name}', confidence,
-                                match_stage='白名单',
-                                amount_diff=abs(b_amt - j_amt),
-                                date_diff_days=abs((b_date - j_date).days),
-                                summary_similarity=self._calculate_similarity(b_summary.lower(), j_summary.lower()),
-                                is_rule_matched=True)
-
-    def _apply_positive_rules(self) -> None:
-        positive_rules = self.MATCHING_RULES.get('positive_rules', {})
-        assert self._journal_index is not None
-        for rule_name, keywords in positive_rules.items():
-            pat = "|".join(map(re.escape, keywords))
-            b_mask = ~self.bank['matched'] & self.bank['summary'].str.contains(pat, na=False, regex=True)
-            bank_records = self.bank[b_mask]
-            
-            keyword_candidates: Set[int] = set()
-            for keyword in keywords:
-                keyword_candidates.update(self._journal_index.query(keyword))
-            j_mask = ~self.journal['matched'] & self.journal.index.isin(keyword_candidates)
-            journal_records = self.journal[j_mask]
-            
-            if bank_records.empty or journal_records.empty:
-                continue
-            
-            for amt in bank_records['amount_decimal'].unique():
-                b_candidates = bank_records[bank_records['amount_decimal'] == amt]
-                j_candidates = journal_records[journal_records['amount_decimal'] == amt]
-                if b_candidates.empty or j_candidates.empty:
-                    continue
-                
-                for date_offset in DATE_OFFSET_PRIORITIES:
-                    for b_idx, b_row in b_candidates.iterrows():
-                        if self.bank.loc[b_idx, 'matched']:
-                            continue
-                        
-                        b_summary = str(b_row['summary'])
-                        if self._check_negative_rules(b_summary):
-                            continue
-                        
-                        b_date = b_row['date']
-                        date_min = b_date - timedelta(days=date_offset)
-                        date_max = b_date + timedelta(days=date_offset)
-                        
-                        j_date_mask = ((~self.journal.loc[j_candidates.index, 'matched']) & 
-                                       (j_candidates['date'] >= date_min) & 
-                                       (j_candidates['date'] <= date_max))
-                        j_window = j_candidates[j_date_mask]
-
-                        if j_window.empty:
-                            continue
-                        
-                        j_window_filtered = j_window[~j_window['summary'].apply(
-                            lambda s: self._check_negative_rules(str(s)) if pd.notna(s) else False)]
-                        
-                        if j_window_filtered.empty:
-                            continue
-                        
-                        if len(j_window_filtered) > 1:
-                            b_summary_lower = b_summary.lower()
-                            best_similarity = -1.0
-                            best_j_idx = None
-                            for j_idx, j_row in j_window_filtered.iterrows():
-                                j_summary = str(j_row['summary']).lower()
-                                similarity = self._calculate_similarity(b_summary_lower, j_summary)
-                                if similarity > best_similarity:
-                                    best_similarity = similarity
-                                    best_j_idx = j_idx
-                            if best_similarity < self.config.similarity_threshold:
-                                continue
-                        else:
-                            best_j_idx = j_window_filtered.index[0]
-                        
-                        if best_j_idx is not None:
-                            if self.journal.loc[best_j_idx, 'matched']:
-                                continue
-                            confidence = '高' if date_offset == 0 else ('中' if date_offset <= 2 else '低')
-                            b_amt = self.bank.loc[b_idx, 'amount_decimal']
-                            j_amt = self.journal.loc[best_j_idx, 'amount_decimal']
-                            b_date = self.bank.loc[b_idx, 'date']
-                            j_date = self.journal.loc[best_j_idx, 'date']
-                            b_summary = str(self.bank.loc[b_idx, 'summary'])
-                            j_summary = str(self.journal.loc[best_j_idx, 'summary'])
-                            self._mark_matched([b_idx], [best_j_idx], f'正规则_{rule_name}', confidence,
-                                match_stage='白名单',
-                                amount_diff=abs(b_amt - j_amt),
-                                date_diff_days=abs((b_date - j_date).days),
-                                summary_similarity=self._calculate_similarity(b_summary.lower(), j_summary.lower()),
-                                is_rule_matched=True)
-
-    def _apply_weak_rules(self) -> None:
-        weak_rules = self.MATCHING_RULES.get('weak_rules', {})
-        assert self._journal_index is not None
-        for rule_name, keywords in weak_rules.items():
-            pat = "|".join(map(re.escape, keywords))
-            b_mask = ~self.bank['matched'] & self.bank['summary'].str.contains(pat, na=False, regex=True)
-            bank_records = self.bank[b_mask]
-            
-            # 使用倒排索引优化候选筛选
-            keyword_candidates: Set[int] = set()
-            for keyword in keywords:
-                keyword_candidates.update(self._journal_index.query(keyword))
-            j_mask = ~self.journal['matched'] & self.journal.index.isin(keyword_candidates)
-            journal_records = self.journal[j_mask]
-            
-            if bank_records.empty or journal_records.empty:
-                continue
-            
-            for amt in bank_records['amount_decimal'].unique():
-                b_candidates = bank_records[bank_records['amount_decimal'] == amt]
-                j_candidates = journal_records[journal_records['amount_decimal'] == amt]
-                if b_candidates.empty or j_candidates.empty:
-                    continue
-                
-                for date_offset in [0, 1]:
-                    for b_idx, b_row in b_candidates.iterrows():
-                        if self.bank.loc[b_idx, 'matched']:
-                            continue
-                        
-                        b_summary = str(b_row['summary'])
-                        if self._check_negative_rules(b_summary):
-                            continue
-                        
-                        b_date = b_row['date']
-                        date_min = b_date - timedelta(days=date_offset)
-                        date_max = b_date + timedelta(days=date_offset)
-                        
-                        j_date_mask = ((~self.journal.loc[j_candidates.index, 'matched']) & 
-                                       (j_candidates['date'] >= date_min) & 
-                                       (j_candidates['date'] <= date_max))
-                        j_window = j_candidates[j_date_mask]
-
-                        if j_window.empty:
-                            continue
-                        
-                        j_window_filtered = j_window[~j_window['summary'].apply(
-                            lambda s: self._check_negative_rules(str(s)) if pd.notna(s) else False)]
-                        
-                        if len(j_window_filtered) == 1:
-                            best_j_idx = j_window_filtered.index[0]
-                            if self.journal.loc[best_j_idx, 'matched']:
-                                continue
-                            confidence = '中' if date_offset == 0 else '低'
-                            b_amt = self.bank.loc[b_idx, 'amount_decimal']
-                            j_amt = self.journal.loc[best_j_idx, 'amount_decimal']
-                            b_date = self.bank.loc[b_idx, 'date']
-                            j_date = self.journal.loc[best_j_idx, 'date']
-                            b_summary = str(self.bank.loc[b_idx, 'summary'])
-                            j_summary = str(self.journal.loc[best_j_idx, 'summary'])
-                            self._mark_matched([b_idx], [best_j_idx], f'弱规则_{rule_name}', confidence,
-                                match_stage='白名单',
-                                amount_diff=abs(b_amt - j_amt),
-                                date_diff_days=abs((b_date - j_date).days),
-                                summary_similarity=self._calculate_similarity(b_summary.lower(), j_summary.lower()),
-                                is_rule_matched=True)
 
     def _rule_search_text(self, frame: pd.DataFrame, index: int) -> str:
         fields = self._row_text_fields(frame, index)

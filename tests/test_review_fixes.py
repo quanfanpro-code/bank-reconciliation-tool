@@ -270,9 +270,10 @@ def test_匹配明细按日期金额排序可复现(tmp_path):
         "balance": [None] * n,
     })
     matcher = Matcher(bank, journal, MatcherConfig())
-    # 故意乱序标记匹配（01-08 最先，01-01 最后）
+    # 故意倒序登记候选，验证最终报告仍按日期稳定排序。
     for i in reversed(range(n)):
-        matcher._mark_matched([bank.index[i]], [journal.index[i]], "exact_1to1", "高")
+        matcher._add_candidate([bank.index[i]], [journal.index[i]], "exact_1to1", "精确")
+    matcher._commit_selected_candidates()
 
     reporter = Reporter(matcher)
     out = tmp_path / "r.xlsx"

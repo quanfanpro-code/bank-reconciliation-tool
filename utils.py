@@ -1,14 +1,13 @@
 """
 银行流水核对工具 - 工具函数模块
 
-包含：预编译正则、常量、日期解析、哈希、金额清洗、摘要标准化、相似度计算等工具函数。
+包含：预编译正则、常量、日期解析、哈希、金额清洗、摘要标准化等工具函数。
 """
 
 import re
 import functools
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from difflib import SequenceMatcher
 from typing import Any, Optional
 
 import pandas as pd
@@ -50,14 +49,6 @@ NOISE_WORDS = [
 # Excel日期序列号范围
 EXCEL_DATE_MIN = 1
 EXCEL_DATE_MAX = 100000  # 支持到2173年（约274年范围）
-
-# 尝试引入RapidFuzz，如果不可用则回退到difflib
-try:
-    from rapidfuzz import fuzz, process
-    RAPIDFUZZ_AVAILABLE = True
-except ImportError:
-    RAPIDFUZZ_AVAILABLE = False
-
 
 def parse_date(date_val: Any, date_format: str = "auto") -> Optional[pd.Timestamp]:
     """
@@ -246,43 +237,6 @@ def normalize_summary(summary: str) -> str:
     result = ' '.join(result.split())
 
     return result.strip()
-
-
-def calculate_similarity(str1: str, str2: str) -> float:
-    """
-    计算两个字符串的相似度 (0.0 - 1.0)
-    优先使用RapidFuzz，不可用时回退到difflib
-    先对摘要进行标准化处理以降低误匹配率
-    """
-    # 类型安全检查：处理None和NaN
-    if str1 is None or str2 is None:
-        return 0.0
-    if pd.isna(str1) or pd.isna(str2):
-        return 0.0
-
-    # 确保转换为字符串
-    try:
-        if not isinstance(str1, str):
-            str1 = str(str1)
-        if not isinstance(str2, str):
-            str2 = str(str2)
-    except:
-        return 0.0
-
-    # 过滤掉"nan"/"none"字符串
-    if str1.lower() in ('nan', 'none', '') or str2.lower() in ('nan', 'none', ''):
-        return 0.0
-
-    norm_str1 = normalize_summary(str1)
-    norm_str2 = normalize_summary(str2)
-
-    if not norm_str1 or not norm_str2:
-        return 0.0
-
-    if RAPIDFUZZ_AVAILABLE:
-        return fuzz.ratio(norm_str1, norm_str2) / 100.0
-    else:
-        return SequenceMatcher(None, norm_str1, norm_str2).ratio()
 
 
 def round_decimal(value: Any, decimals: int = 2) -> float:

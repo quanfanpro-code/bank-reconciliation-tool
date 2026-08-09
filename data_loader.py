@@ -435,20 +435,6 @@ class DataLoader:
             self.logger(f"自动检测表格结构：{structure.explanation}")
         return structure
 
-    def find_header_row(self, file_path: str, max_scan_rows: int = 10) -> int:
-        """
-        自动检测表头行位置
-        """
-        try:
-            return detect_table_structure(
-                file_path,
-                max_scan_rows=max_scan_rows,
-            ).skiprows
-        except Exception as e:
-            if self.logger:
-                self.logger(f"自动检测表头行时出错: {str(e)}")
-        return 0
-
     def _process_amount_column(self, data: pd.DataFrame, col_name: Optional[str], 
                                   source_type: str = "") -> Tuple[pd.Series, List[Dict[str, Any]]]:
         """
