@@ -1,6 +1,7 @@
 ﻿"""匹配可靠性补强测试。"""
 
 from decimal import Decimal
+from pathlib import Path
 
 import pandas as pd
 
@@ -166,3 +167,22 @@ def test_收入支出抵销后总额相同也不得整组匹配():
     matcher.match_continuous_summary_groups()
 
     assert matcher.candidates == []
+
+
+def test_运行依赖清单覆盖桌面版和三种输入格式():
+    requirements = (
+        Path(__file__).parents[1] / "requirements.txt"
+    ).read_text(encoding="utf-8-sig")
+
+    for package in (
+        "customtkinter",
+        "numpy",
+        "openpyxl",
+        "pandas",
+        "psutil",
+        "xlrd",
+    ):
+        assert any(
+            line.lower().startswith(package)
+            for line in requirements.splitlines()
+        )

@@ -5,13 +5,6 @@ from enum import Enum
 from typing import List, Dict, Any, Optional
 import pandas as pd
 
-# 尝试引入RapidFuzz，如果不可用则回退到difflib
-try:
-    from rapidfuzz import fuzz, process
-    RAPIDFUZZ_AVAILABLE = True
-except ImportError:
-    RAPIDFUZZ_AVAILABLE = False
-
 # ==========================================
 # 模块级常量 (Module Constants)
 # ==========================================
