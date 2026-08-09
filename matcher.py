@@ -55,6 +55,8 @@ from matching_policy import (
     score_candidate,
     score_text_fields,
 )
+from utils import normalize_summary
+
 # ==========================================
 # 辅助函数
 # ==========================================
@@ -1363,6 +1365,7 @@ class Matcher:
             ("精确匹配", self.match_exact_1to1),
             ("日期容差匹配", self.match_tolerance),
             ("批量聚合匹配", self.match_batch_aggregation),
+            ("连续摘要整组匹配", self.match_continuous_summary_groups),
             ("智能组合匹配", self.match_dfs_combinations),
             ("日总额匹配", self.match_daily_total),
             ("月度总额匹配", self.match_monthly_total),
@@ -1541,6 +1544,87 @@ class Matcher:
                     resolves_full_group=True,
                 )
         self._commit_if_standalone()
+
+    def match_continuous_summary_groups(self) -> None:
+        """为物理相邻、标准化摘要一致的完整连续组生成双向候选。"""
+        self._match_continuous_summary_side("bank", self.bank, self.journal)
+        self._match_continuous_summary_side("journal", self.journal, self.bank)
+        self._commit_if_standalone()
+
+    def _match_continuous_summary_side(
+        self,
+        source_side: str,
+        source: pd.DataFrame,
+        target: pd.DataFrame,
+    ) -> None:
+        if source.empty or target.empty:
+            return
+
+        target_by_summary: Dict[str, List[int]] = {}
+        for target_index, target_row in target.iterrows():
+            summary = normalize_summary(target_row["summary"])
+            if summary:
+                target_by_summary.setdefault(summary, []).append(int(target_index))
+
+        def add_run(run: List[int], summary: str) -> None:
+            if len(run) < 2:
+                return
+            source_amounts = source.loc[run, "amount_decimal"].tolist()
+            source_dates = [pd.Timestamp(value) for value in source.loc[run, "date"]]
+            source_rows = tuple(int(value) for value in source.loc[run, "original_idx"])
+            for target_index in target_by_summary.get(summary, []):
+                target_amount = int(target.at[target_index, "amount_decimal"])
+                all_amounts = source_amounts + [target_amount]
+                if not self.config.allow_zero_match and any(
+                    amount == 0 for amount in all_amounts
+                ):
+                    continue
+                target_date = pd.Timestamp(target.at[target_index, "date"])
+                date_span = max(source_dates + [target_date]) - min(
+                    source_dates + [target_date]
+                )
+                if date_span.days > self.config.dfs_date_window:
+                    continue
+                if source_side == "bank":
+                    bank_amounts, journal_amounts = source_amounts, [target_amount]
+                    bank_idxs, journal_idxs = run, [target_index]
+                else:
+                    bank_amounts, journal_amounts = [target_amount], source_amounts
+                    bank_idxs, journal_idxs = [target_index], run
+                if not self._total_structure_matches(bank_amounts, journal_amounts):
+                    continue
+                self._add_candidate(
+                    bank_idxs,
+                    journal_idxs,
+                    "continuous_summary_group",
+                    "连续摘要整组",
+                    is_rule_matched=True,
+                    source_side=source_side,
+                    normalized_summary=summary,
+                    group_count=len(run),
+                    source_rows=source_rows,
+                )
+
+        run: List[int] = []
+        run_summary = ""
+        previous_row: Optional[int] = None
+        for source_index, row in source.sort_values("original_idx").iterrows():
+            summary = normalize_summary(row["summary"])
+            original_row = int(row["original_idx"])
+            if (
+                run
+                and summary
+                and summary == run_summary
+                and previous_row is not None
+                and original_row == previous_row + 1
+            ):
+                run.append(int(source_index))
+            else:
+                add_run(run, run_summary)
+                run = [int(source_index)] if summary else []
+                run_summary = summary
+            previous_row = original_row
+        add_run(run, run_summary)
 
     def match_dfs_combinations(self) -> None:
         self._dfs_one_to_many('bank', 'journal')
