@@ -315,6 +315,14 @@ def route_candidate(
         )
     if candidate.is_cross_month_many_to_many:
         return ProcessingStatus.PENDING_REVIEW, "跨月多对多必须人工复核"
+    review_reasons: list[str] = []
+    if candidate.text_evidence and candidate.text_evidence.conflicting_fields:
+        fields = "、".join(candidate.text_evidence.conflicting_fields)
+        review_reasons.append(f"关键文字字段冲突：{fields}")
+    if candidate.is_ambiguous:
+        review_reasons.append("候选歧义")
+    if review_reasons:
+        return ProcessingStatus.PENDING_REVIEW, "；".join(review_reasons)
     if candidate.metrics.total_diff_li == 0:
         return ProcessingStatus.AUTO_CONFIRMED, "金额完全一致"
     if candidate.metrics.total_diff_li <= trivial_li:
