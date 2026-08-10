@@ -2,7 +2,7 @@
 银行流水核对工具 v3.0 — 卡片化 GUI
 
 布局结构（grid）：
-  页眉卡片 → 输入卡片 | 参数配置卡片 → 列映射卡片（可折叠）→ 执行卡片 → 日志卡片
+  输入卡片 | 参数配置卡片 → 列映射卡片（可折叠）→ 执行卡片 → 日志卡片
 """
 
 import threading
@@ -1181,64 +1181,21 @@ class ReconciliationApp(ctk.CTk):
     # ─── UI 构建 ──────────────────────────────────────────────────────────
 
     def _init_ui(self):
-        # 根窗口 grid 配置：页眉、紧凑设置、执行、日志
-        self.grid_rowconfigure(0, weight=0)  # 页眉
-        self.grid_rowconfigure(1, weight=0)  # 输入 + 策略 + 配置入口
-        self.grid_rowconfigure(2, weight=0)  # 执行
-        self.grid_rowconfigure(3, weight=1)  # 日志 — 占满剩余空间
+        # 根窗口 grid 配置：紧凑设置、执行、日志
+        self.grid_rowconfigure(0, weight=0)  # 输入 + 策略 + 配置入口
+        self.grid_rowconfigure(1, weight=0)  # 执行
+        self.grid_rowconfigure(2, weight=1)  # 日志 — 占满剩余空间
         self.grid_columnconfigure(0, weight=1)
 
-        self._build_header_card()
         self._build_input_and_config_cards()
         self._build_action_card()
         self._build_log_card()
-
-    # ─── 页眉卡片 ─────────────────────────────────────────────────────────
-
-    def _build_header_card(self):
-        card, _ = _make_card(self, "", row=0, column=0)
-
-        card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            card, text="银行流水核对工具 v3.0",
-            font=ctk.CTkFont(size=18, weight="bold")
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=PAD_CARD[0],
-            pady=(PAD_CARD[1], 1),
-        )
-        ctk.CTkLabel(
-            card,
-            text="自动分组核对银行流水与日记账，复杂事项留在 Excel 中复核。",
-            text_color=("gray40", "gray70"),
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w",
-            padx=PAD_CARD[0],
-            pady=(1, PAD_CARD[1]),
-        )
-
-        ctk.CTkButton(
-            card, text="切换主题", width=100,
-            fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
-            command=self.toggle_theme
-        ).grid(
-            row=0,
-            column=1,
-            rowspan=2,
-            sticky="e",
-            padx=PAD_CARD[0],
-            pady=PAD_CARD[1],
-        )
 
     # ─── 输入卡片 + 参数配置卡片（并排） ─────────────────────────────────
 
     def _build_input_and_config_cards(self):
         container = ctk.CTkFrame(self, fg_color="transparent")
-        container.grid(row=1, column=0, sticky="ew", padx=4, pady=GAP_BETWEEN_CARDS)
+        container.grid(row=0, column=0, sticky="ew", padx=4, pady=GAP_BETWEEN_CARDS)
         container.grid_columnconfigure(0, weight=3)
         container.grid_columnconfigure(1, weight=2)
         container.grid_columnconfigure(2, weight=2)
@@ -1633,7 +1590,7 @@ class ReconciliationApp(ctk.CTk):
     # ─── 执行卡片 ─────────────────────────────────────────────────────────
 
     def _build_action_card(self):
-        card, _ = _make_card(self, "", row=2, column=0)
+        card, _ = _make_card(self, "", row=1, column=0)
 
         # 主按钮：开始核对
         self.btn_start = ctk.CTkButton(
@@ -1672,14 +1629,24 @@ class ReconciliationApp(ctk.CTk):
             hover_color=("#FFCDD2", "#5C3030"),
             state="disabled", command=self.stop_process
         )
-        self.btn_stop.grid(row=0, column=2, sticky="e", padx=PAD_CARD[0], pady=PAD_CARD[1])
+        self.btn_stop.grid(row=0, column=2, sticky="e", padx=(CONTENT_GAP, 6), pady=PAD_CARD[1])
+
+        # 弱按钮：切换主题（原页眉卡片控件挪入执行区）
+        ctk.CTkButton(
+            card, text="切换主题", width=90, height=40,
+            fg_color="transparent", border_width=1,
+            border_color=("#B0B0B0", "#5A5A5A"),
+            text_color=("gray40", "gray70"),
+            hover_color=("#E8E8E8", "#3A3A3A"),
+            command=self.toggle_theme
+        ).grid(row=0, column=3, sticky="e", padx=(0, PAD_CARD[0]), pady=PAD_CARD[1])
 
         card.grid_columnconfigure(1, weight=1)
 
     # ─── 日志卡片 ─────────────────────────────────────────────────────────
 
     def _build_log_card(self):
-        card, _ = _make_card(self, "运行日志", row=3, column=0)
+        card, _ = _make_card(self, "运行日志", row=2, column=0)
 
         self.txt_log = ctk.CTkTextbox(card, wrap="word")
         self.txt_log.grid(row=1, column=0, sticky="nsew",
