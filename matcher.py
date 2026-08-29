@@ -516,7 +516,7 @@ def _randomized_greedy(window_amounts: List[int], window_dates: List[pd.Timestam
     return None
 
 
-def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[int], str]]:
+def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[List[int]], str]]:
     """处理单个 source 的 DFS 匹配"""
     source_idx, source_date, target_val, targets_data, config = args
     target_val = int(target_val)
@@ -567,7 +567,7 @@ def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[int], str]]:
         window_amounts_int = [PrecisionEngine.to_integer_li(a) for a in window_amounts]
         if 0 in window_amounts_int:
             zero_pos = window_amounts_int.index(0)
-            return (source_idx, [window_indices[zero_pos]], '中')
+            return (source_idx, [[window_indices[zero_pos]]], '中')
         return None
 
     indexed = list(zip(window_amounts, window_dates, window_indices))
@@ -609,7 +609,33 @@ def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[int], str]]:
 
     if result_info:
         result_idxs, confidence = result_info
-        return (source_idx, result_idxs, confidence)
+        solutions = [result_idxs]
+        # ponytail: 两套解已足以证明候选不唯一，无需穷举所有子集。
+        for excluded_index in result_idxs:
+            remaining = [
+                (amount, date, index)
+                for amount, date, index in zip(
+                    window_amounts,
+                    window_dates,
+                    window_indices,
+                )
+                if index != excluded_index
+            ]
+            if len(remaining) < 2:
+                continue
+            alternative = _solve_combination(
+                [item[0] for item in remaining],
+                [item[1] for item in remaining],
+                [item[2] for item in remaining],
+                target_val,
+                curr_max_depth,
+                allow_mixed_sign,
+                date_window,
+            )
+            if alternative and len(alternative[0]) >= 2:
+                solutions.append(alternative[0])
+                break
+        return (source_idx, solutions, confidence)
 
     if allow_greedy_fallback:
         greedy_result = _randomized_greedy(
@@ -618,7 +644,7 @@ def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[int], str]]:
         )
         if greedy_result and len(greedy_result[0]) >= 2:
             result_idxs, confidence = greedy_result
-            return (source_idx, result_idxs, confidence)
+            return (source_idx, [result_idxs], confidence)
 
     return None
 
@@ -635,6 +661,7 @@ def select_non_conflicting_candidates(
     ordered = sorted(
         candidates,
         key=lambda item: (
+            0 if item.evidence.get("closed_group_fallback") else 1,
             -item.scores.total,
             item.metrics.total_diff_li,
             item.date_span_days,
@@ -896,11 +923,15 @@ class Matcher:
                 )
             self._score_existing_candidate(candidate)
 
-    def _group_ambiguous_candidates(self) -> List[List[MatchCandidate]]:
+    def _group_ambiguous_candidates(
+        self,
+        candidates: Optional[List[MatchCandidate]] = None,
+    ) -> List[List[MatchCandidate]]:
         """把共享任一银行或日记账记录的候选归入同一竞争组。"""
+        candidates = self.candidates if candidates is None else candidates
         bank_members: Dict[int, Set[int]] = {}
         journal_members: Dict[int, Set[int]] = {}
-        for position, candidate in enumerate(self.candidates):
+        for position, candidate in enumerate(candidates):
             for bank_index in candidate.bank_idxs:
                 bank_members.setdefault(bank_index, set()).add(position)
             for journal_index in candidate.journal_idxs:
@@ -908,7 +939,7 @@ class Matcher:
 
         groups: List[List[MatchCandidate]] = []
         visited: Set[int] = set()
-        for start in range(len(self.candidates)):
+        for start in range(len(candidates)):
             if start in visited:
                 continue
             pending = [start]
@@ -918,7 +949,7 @@ class Matcher:
                 if position in component:
                     continue
                 component.add(position)
-                candidate = self.candidates[position]
+                candidate = candidates[position]
                 neighbours: Set[int] = set()
                 for bank_index in candidate.bank_idxs:
                     neighbours.update(bank_members.get(bank_index, set()))
@@ -928,18 +959,56 @@ class Matcher:
             visited.update(component)
             groups.append(
                 [
-                    self.candidates[position]
+                    candidates[position]
                     for position in sorted(
                         component,
-                        key=lambda item: self.candidates[item].candidate_id,
+                        key=lambda item: candidates[item].candidate_id,
                     )
                 ]
             )
         return groups
 
+    def _add_closed_candidate_groups(self) -> None:
+        """把多解但整体借贷相等的竞争组归并为可自动确认的整组关系。"""
+        exact_candidates = [
+            candidate
+            for candidate in self.candidates
+            if candidate.metrics.total_diff_li == 0
+            and not candidate.evidence.get("closed_group_fallback")
+        ]
+        for group in self._group_ambiguous_candidates(exact_candidates):
+            if len(group) < 2:
+                continue
+            if any(
+                candidate.evidence.get("resolves_full_group")
+                for candidate in group
+            ):
+                continue
+            bank_idxs = sorted(
+                {index for candidate in group for index in candidate.bank_idxs}
+            )
+            journal_idxs = sorted(
+                {index for candidate in group for index in candidate.journal_idxs}
+            )
+            if not self._total_structure_matches(
+                self.bank.loc[bank_idxs, "amount_decimal"].tolist(),
+                self.journal.loc[journal_idxs, "amount_decimal"].tolist(),
+            ):
+                continue
+            self._add_candidate(
+                bank_idxs,
+                journal_idxs,
+                "closed_candidate_group",
+                "整组勾稽",
+                resolves_full_group=True,
+                closed_group_fallback=True,
+                alternative_count=len(group),
+            )
+
     @staticmethod
     def _candidate_sort_key(candidate: MatchCandidate) -> Tuple[Any, ...]:
         return (
+            0 if candidate.evidence.get("closed_group_fallback") else 1,
             -candidate.scores.total,
             candidate.metrics.total_diff_li,
             candidate.date_span_days,
@@ -1163,13 +1232,15 @@ class Matcher:
 
     def _commit_selected_candidates(self) -> None:
         """统一完成排序、占用、稳定编号和旧字段回填。"""
+        self._add_closed_candidate_groups()
         self._refresh_candidate_ambiguity()
         self._apply_llm_assistance()
         self.selected_candidates = select_non_conflicting_candidates(self.candidates)
         for sequence, candidate in enumerate(self.selected_candidates, start=1):
             candidate.final_match_id = f"M{sequence:06d}"
-            status, reason = route_candidate(candidate, self.config)
+            status, risk, reason = route_candidate(candidate, self.config)
             candidate.processing_status = status
+            candidate.risk_level = risk
             candidate.processing_reason = reason
             confidence = self._legacy_confidence(candidate.scores.total)
             bank_idxs = list(candidate.bank_idxs)
@@ -1185,6 +1256,7 @@ class Matcher:
                 frame.loc[indices, "confidence"] = confidence
                 frame.loc[indices, "confidence_score"] = candidate.scores.total
                 frame.loc[indices, "processing_status"] = status.value
+                frame.loc[indices, "risk_level"] = risk.value
 
             self.matches.append(
                 {
@@ -1193,6 +1265,7 @@ class Matcher:
                     "confidence": confidence,
                     "confidence_score": candidate.scores.total,
                     "processing_status": status.value,
+                    "risk_level": risk.value,
                     "processing_reason": reason,
                     "bank_idxs": bank_idxs,
                     "journal_idxs": journal_idxs,
@@ -1231,7 +1304,7 @@ class Matcher:
         }
         for candidate in self.selected_candidates:
             if not candidate.evidence.get(
-                "included_in_pool_review",
+                "included_in_risk_pool",
                 False,
             ):
                 continue
@@ -1241,13 +1314,11 @@ class Matcher:
             ):
                 frame.loc[
                     indices,
-                    "processing_status",
-                ] = candidate.processing_status.value
+                    "risk_level",
+                ] = candidate.risk_level.value
             match = match_by_candidate.get(candidate.candidate_id)
             if match is not None:
-                match["processing_status"] = (
-                    candidate.processing_status.value
-                )
+                match["risk_level"] = candidate.risk_level.value
                 match["processing_reason"] = candidate.processing_reason
 
     def _commit_if_standalone(self) -> None:
@@ -1706,7 +1777,7 @@ class Matcher:
             len(tasks) >= parallel_threshold
             and self._should_use_parallel(len(tasks))
         )
-        results: List[Tuple[int, List[int], str]] = []
+        results: List[Tuple[int, List[List[int]], str]] = []
 
         def run_serial_tasks() -> None:
             for task in tasks:
@@ -1789,26 +1860,27 @@ class Matcher:
         results.sort(
             key=lambda item: (
                 self._confidence_sort_key(item[2]),
-                len(item[1]),
+                len(item[1][0]),
                 source_order.get(item[0], len(source_order)),
-                min(item[1]) if item[1] else -1,
+                min(item[1][0]) if item[1] and item[1][0] else -1,
             )
         )
         
-        for source_idx, matched_idxs, _confidence in results:
-            if source_type == 'bank':
-                bank_idxs = [int(source_idx)]
-                journal_idxs = [int(index) for index in matched_idxs]
-            else:
-                bank_idxs = [int(index) for index in matched_idxs]
-                journal_idxs = [int(source_idx)]
-            self._add_candidate(
-                bank_idxs,
-                journal_idxs,
-                "combination_dfs",
-                "组合",
-                combo_count=max(len(bank_idxs), len(journal_idxs)),
-            )
+        for source_idx, matched_solutions, _confidence in results:
+            for matched_idxs in matched_solutions:
+                if source_type == 'bank':
+                    bank_idxs = [int(source_idx)]
+                    journal_idxs = [int(index) for index in matched_idxs]
+                else:
+                    bank_idxs = [int(index) for index in matched_idxs]
+                    journal_idxs = [int(source_idx)]
+                self._add_candidate(
+                    bank_idxs,
+                    journal_idxs,
+                    "combination_dfs",
+                    "组合",
+                    combo_count=max(len(bank_idxs), len(journal_idxs)),
+                )
 
     def match_monthly_total(self) -> None:
         self._match_total('month', self.MONTHLY_MAX_COUNT_DIFF_BASE, self.MONTHLY_MAX_COUNT_DIFF_RATIO, 'M')
@@ -1868,7 +1940,7 @@ class Matcher:
         self._commit_if_standalone()
 
     def match_cross_month_total(self) -> None:
-        """相邻月份边界内的多对多只生成待复核候选。"""
+        """生成相邻月份边界内的多对多候选，由重要性规则自动分流。"""
         if self.bank.empty or self.journal.empty:
             return
         bank_periods = self.bank["date"].dt.to_period("M")

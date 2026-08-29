@@ -199,7 +199,7 @@ def test_主窗口尺寸和日志伸缩规则():
 
     assert 'self.geometry("1200x850")' in source
     assert "self.minsize(960, 700)" in source
-    assert "self.grid_rowconfigure(3, weight=1)" in source
+    assert "self.grid_rowconfigure(2, weight=1)" in source
 
 
 def test_主窗口可以完成最小启动():

@@ -37,10 +37,21 @@ def test_审计策略使用已确认默认值():
     assert config.allow_mixed_sign is False
 
 
-def test_最终处理状态使用三个正式中文名称():
-    assert ds.ProcessingStatus.AUTO_CONFIRMED.value == "自动确认"
-    assert ds.ProcessingStatus.PENDING_REVIEW.value == "待人工复核"
-    assert ds.ProcessingStatus.NO_CANDIDATE.value == "未找到候选"
+def test_最终处理状态不包含等待人工():
+    assert {item.value for item in ds.ProcessingStatus} == {
+        "自动确认",
+        "整组勾稽一致",
+        "自动归集事项",
+        "疑点事项",
+        "未找到候选",
+    }
+    assert {item.value for item in ds.RiskLevel} == {
+        "正常",
+        "低风险",
+        "中风险",
+        "高风险",
+        "范围未知",
+    }
 
 
 def test_差异池使用四个互不抵销的正式分类():
@@ -136,41 +147,50 @@ def test_组金额取双方绝对金额合计较大值且收入支出不抵销()
     assert metrics.total_diff_li == 300_000_000
 
 
-def test_大额但差异很小仍然待人工复核():
+def test_大额交易的小差异按差异金额自动分级():
     candidate = _candidate(group_amount="100000.01", total_diff="1", score=100)
 
-    status, reason = _policy().route_candidate(candidate, ds.MatcherConfig())
+    status, risk, reason = _policy().route_candidate(candidate, ds.MatcherConfig())
 
-    assert status is ds.ProcessingStatus.PENDING_REVIEW
-    assert "实际执行重要性水平" in reason
+    assert status is ds.ProcessingStatus.AUTO_CLASSIFIED
+    assert risk is ds.RiskLevel.LOW
+    assert "金额差异" in reason
 
 
 def test_组金额刚好等于实际执行重要性水平不算超过():
     candidate = _candidate(group_amount="100000", total_diff="0", score=100)
 
-    status, _ = _policy().route_candidate(candidate, ds.MatcherConfig())
+    status, risk, _ = _policy().route_candidate(candidate, ds.MatcherConfig())
 
     assert status is ds.ProcessingStatus.AUTO_CONFIRMED
+    assert risk is ds.RiskLevel.NORMAL
 
 
 def test_明显微小错报不受低可信度限制自动处理():
     candidate = _candidate(group_amount="10000", total_diff="5000", score=0)
 
-    status, reason = _policy().route_candidate(candidate, ds.MatcherConfig())
+    status, risk, reason = _policy().route_candidate(candidate, ds.MatcherConfig())
 
-    assert status is ds.ProcessingStatus.AUTO_CONFIRMED
-    assert "明显微小错报" in reason
+    assert status is ds.ProcessingStatus.AUTO_CLASSIFIED
+    assert risk is ds.RiskLevel.LOW
+    assert "金额差异" in reason
 
 
-def test_非明显微小错报按七十分门槛分流():
+def test_非明显微小差异不因评分停止自动处理():
     at_threshold = _candidate(group_amount="10000", total_diff="6000", score=70)
     below_threshold = _candidate(group_amount="10000", total_diff="6000", score=69)
 
-    assert _policy().route_candidate(at_threshold, ds.MatcherConfig())[0] is ds.ProcessingStatus.AUTO_CONFIRMED
-    assert _policy().route_candidate(below_threshold, ds.MatcherConfig())[0] is ds.ProcessingStatus.PENDING_REVIEW
+    assert _policy().route_candidate(at_threshold, ds.MatcherConfig())[:2] == (
+        ds.ProcessingStatus.AUTO_CLASSIFIED,
+        ds.RiskLevel.MEDIUM,
+    )
+    assert _policy().route_candidate(below_threshold, ds.MatcherConfig())[:2] == (
+        ds.ProcessingStatus.AUTO_CLASSIFIED,
+        ds.RiskLevel.MEDIUM,
+    )
 
 
-def test_跨月多对多即使满分也必须待人工复核():
+def test_跨月多对多自动形成带风险疑点():
     candidate = _candidate(
         group_amount="1000",
         total_diff="0",
@@ -178,9 +198,10 @@ def test_跨月多对多即使满分也必须待人工复核():
         cross_month=True,
     )
 
-    status, reason = _policy().route_candidate(candidate, ds.MatcherConfig())
+    status, risk, reason = _policy().route_candidate(candidate, ds.MatcherConfig())
 
-    assert status is ds.ProcessingStatus.PENDING_REVIEW
+    assert status is ds.ProcessingStatus.FLAGGED
+    assert risk is ds.RiskLevel.LOW
     assert "跨月多对多" in reason
 
 

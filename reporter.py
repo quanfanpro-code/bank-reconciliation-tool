@@ -187,6 +187,7 @@ class Reporter:
             )
             stats = pd.merge(stats, df.groupby('date')['amount'].agg(net='sum'), on='date', how='outer')
             stats = pd.merge(pd.DataFrame({'date': date_range}), stats, on='date', how='left').fillna(0)
+            stats['expense_amount'] = stats['expense_amount'].abs()
             if has_bal:
                 bal = df.sort_values(['date', 'original_idx']).groupby('date')['balance'].last()
                 stats = pd.merge(stats, bal, on='date', how='left')
@@ -254,15 +255,19 @@ class Reporter:
 
     @staticmethod
     def _postprocess_summary(ws, has_initial_warning: bool) -> None:
-        """汇总表后处理：期初警告行添加红字/黄底。"""
+        """核对结论后处理：只高亮实际的期初余额警告行。"""
         if not has_initial_warning:
             return
         warning_font = Font(color='FF0000', bold=True, size=14)
         warning_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-        # 警告块为前 6 行数据（第 1 行是表头），即数据行 2~7
         max_row = ws.max_row or 7
         max_col = ws.max_column or 3
-        for r in range(2, min(max_row + 1, 8)):
+        headers = {cell.value: cell.column for cell in ws[1] if cell.value is not None}
+        item_column = headers.get("项目", 1)
+        for r in range(2, max_row + 1):
+            item_name = str(ws.cell(row=r, column=item_column).value or "")
+            if "期初余额" not in item_name:
+                continue
             for c in range(2, max_col + 1):
                 cell = ws.cell(row=r, column=c)
                 cell.font = warning_font
@@ -270,12 +275,13 @@ class Reporter:
 
     @staticmethod
     def _postprocess_details(ws) -> None:
-        """匹配明细后处理：低置信度行黄底红字，差额列条件格式。"""
+        """按风险等级标示差异，不把正负方向误当成好坏。"""
         max_row = ws.max_row or 1
         max_col = ws.max_column or 1
 
         # 查找关键列索引
         low_conf_col_idx = None
+        risk_col_idx = None
         diff_col_indices = []
         amount_keywords = ['金额', '余额', '净额', '差额', '收入', '支出']
 
@@ -287,13 +293,19 @@ class Reporter:
             header_lower = header_str.lower()
             if header_str == '_低置信度标记':
                 low_conf_col_idx = ci
+            if header_str == '风险等级':
+                risk_col_idx = ci
             if '差额' in header_str or 'diff' in header_lower:
                 diff_col_indices.append(ci)
 
         low_conf_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
         low_conf_font = Font(color='FF0000', bold=True)
-        positive_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
-        negative_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+        risk_fills = {
+            '低风险': PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid'),
+            '中风险': PatternFill(start_color='FCE4D6', end_color='FCE4D6', fill_type='solid'),
+            '高风险': PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),
+            '范围未知': PatternFill(start_color='F4CCCC', end_color='F4CCCC', fill_type='solid'),
+        }
 
         for r in range(2, max_row + 1):
             # 低置信度行着色
@@ -311,10 +323,9 @@ class Reporter:
                 cell = ws.cell(row=r, column=dc)
                 try:
                     v = float(cell.value) if cell.value is not None else 0
-                    if v > 0:
-                        cell.fill = positive_fill
-                    elif v < 0:
-                        cell.fill = negative_fill
+                    if v != 0:
+                        risk = ws.cell(row=r, column=risk_col_idx).value if risk_col_idx else '低风险'
+                        cell.fill = risk_fills.get(str(risk), risk_fills['低风险'])
                 except (ValueError, TypeError):
                     pass
 
@@ -324,11 +335,10 @@ class Reporter:
 
     @staticmethod
     def _postprocess_diff_columns(ws) -> None:
-        """对含差额列的工作表应用正绿负红条件格式。"""
+        """统计表中的非零差额统一提示，不按正负方向判断好坏。"""
         max_row = ws.max_row or 1
         max_col = ws.max_column or 1
-        positive_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
-        negative_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+        difference_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
 
         for ci in range(2, max_col + 1):
             header = ws.cell(row=1, column=ci).value
@@ -340,10 +350,8 @@ class Reporter:
                     cell = ws.cell(row=r, column=ci)
                     try:
                         v = float(cell.value) if cell.value is not None else 0
-                        if v > 0:
-                            cell.fill = positive_fill
-                        elif v < 0:
-                            cell.fill = negative_fill
+                        if v != 0:
+                            cell.fill = difference_fill
                     except (ValueError, TypeError):
                         pass
 
@@ -361,8 +369,9 @@ class Reporter:
 
     @staticmethod
     def _safe_table(frame: pd.DataFrame) -> pd.DataFrame:
-        """保留数值和日期类型，只清理所有外来文字。"""
+        """保留数值和日期类型，清理所有外来表头和文字。"""
         safe = frame.copy()
+        safe.columns = [clean_excel_string(column) for column in safe.columns]
         for column in safe.columns:
             def clean_value(value):
                 if value is None:
@@ -417,308 +426,6 @@ class Reporter:
         )
         return balance_check_possible, has_warning
 
-    @staticmethod
-    def _append_source_stats(
-        rows: list[tuple[str, Any]],
-        frame: pd.DataFrame,
-        name: str,
-    ) -> None:
-        income = frame[frame["amount"] > 0]
-        expense = frame[frame["amount"] < 0]
-        rows.extend(
-            [
-                (f"{name}总笔数", int(len(frame))),
-                (f"{name}总金额", float(frame["amount"].sum())),
-                (f"{name}收入笔数", int(len(income))),
-                (f"{name}收入金额", float(income["amount"].sum())),
-                (f"{name}支出笔数", int(len(expense))),
-                (f"{name}支出金额", float(expense["amount"].sum())),
-            ]
-        )
-
-    def _build_summary_table(
-        self,
-        config: MatcherConfig,
-        *,
-        balance_check_possible: bool,
-        has_warning: bool,
-    ) -> pd.DataFrame:
-        bank = self.matcher.bank
-        journal = self.matcher.journal
-        candidates = list(
-            getattr(self.matcher, "selected_candidates", [])
-        )
-        rows: list[tuple[str, Any]] = []
-        warning = self.initial_balance_warning
-        if has_warning and warning is not None:
-            rows.extend(
-                [
-                    ("期初余额差异警告", "请先核对期初余额"),
-                    ("银行期初余额", float(warning.bank_initial)),
-                    ("日记账期初余额", float(warning.journal_initial)),
-                    ("期初余额差额", float(warning.diff)),
-                    ("期初余额状态", "不一致"),
-                    ("处理提示", "请先核对期初余额"),
-                ]
-            )
-
-        self._append_source_stats(rows, bank, "银行流水")
-        self._append_source_stats(rows, journal, "日记账")
-
-        exact_bank: set[int] = set()
-        exact_journal: set[int] = set()
-        automatic_bank: set[int] = set()
-        automatic_journal: set[int] = set()
-        low_confidence_groups = 0
-        for candidate in candidates:
-            if candidate.metrics.total_diff_li == 0:
-                exact_bank.update(candidate.bank_idxs)
-                exact_journal.update(candidate.journal_idxs)
-            status_value = getattr(
-                candidate.processing_status,
-                "value",
-                str(candidate.processing_status),
-            )
-            if status_value == "自动确认":
-                automatic_bank.update(candidate.bank_idxs)
-                automatic_journal.update(candidate.journal_idxs)
-            if candidate.scores.total < config.auto_confirm_score:
-                low_confidence_groups += 1
-
-        total_rows = len(bank) + len(journal)
-        exact_rate = (
-            (len(exact_bank) + len(exact_journal)) / total_rows
-            if total_rows
-            else 0.0
-        )
-        automatic_rate = (
-            (len(automatic_bank) + len(automatic_journal)) / total_rows
-            if total_rows
-            else 0.0
-        )
-        low_ratio = (
-            low_confidence_groups / len(candidates)
-            if candidates
-            else 0.0
-        )
-        automatic_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.processing_status.value == "自动确认"
-        ]
-        trivial_candidates = [
-            candidate
-            for candidate in automatic_candidates
-            if candidate.metrics.total_diff_li > 0
-        ]
-        standalone_pending = [
-            candidate
-            for candidate in candidates
-            if candidate.processing_status.value == "待人工复核"
-            and not candidate.evidence.get(
-                "included_in_pool_review",
-                False,
-            )
-        ]
-        pools = list(
-            getattr(self.matcher, "difference_pools", [])
-        )
-        pending_pools = [
-            pool
-            for pool in pools
-            if pool.exceeds_performance_materiality
-        ]
-        bank_unmatched = bank[~bank["matched"]]
-        journal_unmatched = journal[~journal["matched"]]
-        llm_records = list(
-            getattr(self.matcher, "llm_records", [])
-        )
-        assistant_config = getattr(
-            getattr(self.matcher, "llm_assistant", None),
-            "config",
-            None,
-        )
-        llm_status_changes = sum(
-            1
-            for candidate in candidates
-            if candidate.llm_decision is not None
-            and (
-                int(
-                    candidate.evidence.get(
-                        "pre_llm_total_score",
-                        candidate.scores.total,
-                    )
-                )
-                < config.auto_confirm_score
-                <= candidate.scores.total
-            )
-        )
-
-        def group_amount(items) -> float:
-            return float(
-                sum(
-                    PrecisionEngine.from_integer_li(
-                        item.metrics.group_amount_li
-                    )
-                    for item in items
-                )
-            )
-
-        rows.extend(
-            [
-                ("银行已找到候选笔数", int(bank["matched"].sum())),
-                ("日记账已找到候选笔数", int(journal["matched"].sum())),
-                (
-                    "银行候选覆盖率",
-                    float(bank["matched"].mean()) if len(bank) else 0.0,
-                ),
-                (
-                    "日记账候选覆盖率",
-                    float(journal["matched"].mean())
-                    if len(journal)
-                    else 0.0,
-                ),
-                ("银行自动确认笔数", len(automatic_bank)),
-                ("日记账自动确认笔数", len(automatic_journal)),
-                (
-                    "银行自动确认率",
-                    len(automatic_bank) / len(bank) if len(bank) else 0.0,
-                ),
-                (
-                    "日记账自动确认率",
-                    len(automatic_journal) / len(journal)
-                    if len(journal)
-                    else 0.0,
-                ),
-                ("精确匹配率", float(min(1.0, exact_rate))),
-                ("自动处理率", float(min(1.0, automatic_rate))),
-                ("匹配组数", int(len(candidates))),
-                ("自动确认组数", len(automatic_candidates)),
-                ("自动确认金额", group_amount(automatic_candidates)),
-                ("明显微小错报组数", len(trivial_candidates)),
-                (
-                    "明显微小错报金额",
-                    float(
-                        sum(
-                            PrecisionEngine.from_integer_li(
-                                candidate.metrics.total_diff_li
-                            )
-                            for candidate in trivial_candidates
-                        )
-                    ),
-                ),
-                ("低可信度组数", int(low_confidence_groups)),
-                ("低可信度组占比", float(min(1.0, low_ratio))),
-                (
-                    "待人工复核事项数",
-                    len(standalone_pending) + len(pending_pools),
-                ),
-                (
-                    "待人工复核金额",
-                    group_amount(standalone_pending)
-                    + float(
-                        sum(
-                            PrecisionEngine.from_integer_li(
-                                pool.total_diff_li
-                            )
-                            for pool in pending_pools
-                        )
-                    ),
-                ),
-                (
-                    "银行未找到候选笔数",
-                    len(bank_unmatched),
-                ),
-                (
-                    "银行未找到候选金额",
-                    float(bank_unmatched["amount"].abs().sum())
-                    if not bank_unmatched.empty
-                    else 0.0,
-                ),
-                (
-                    "日记账未找到候选笔数",
-                    len(journal_unmatched),
-                ),
-                (
-                    "日记账未找到候选金额",
-                    float(journal_unmatched["amount"].abs().sum())
-                    if not journal_unmatched.empty
-                    else 0.0,
-                ),
-                (
-                    "明显微小错报池数",
-                    len(pools),
-                ),
-                (
-                    "大模型参与组数",
-                    len(llm_records),
-                ),
-                (
-                    "大模型辅助",
-                    "启用"
-                    if assistant_config is not None
-                    and getattr(assistant_config, "enabled", False)
-                    else "关闭",
-                ),
-                (
-                    "大模型成功次数",
-                    sum(
-                        1
-                        for record in llm_records
-                        if not record.fallback_used
-                    ),
-                ),
-                (
-                    "大模型降级次数",
-                    sum(
-                        1
-                        for record in llm_records
-                        if record.fallback_used
-                    ),
-                ),
-                ("大模型状态变化数", llm_status_changes),
-                ("实际执行重要性水平", float(config.performance_materiality)),
-                (
-                    "明显微小错报临界值",
-                    float(config.clearly_trivial_threshold),
-                ),
-                ("自动确认最低综合可信度", config.auto_confirm_score),
-            ]
-        )
-        for pool in pools:
-            rows.append(
-                (
-                    (
-                        f"差异池累计|{pool.month}|"
-                        f"{pool.pool_type.value}"
-                    ),
-                    float(
-                        PrecisionEngine.from_integer_li(
-                            pool.total_diff_li
-                        )
-                    ),
-                )
-            )
-
-        if warning is not None and not has_warning:
-            if balance_check_possible:
-                rows.extend(
-                    [
-                        ("银行期初余额", float(warning.bank_initial)),
-                        ("日记账期初余额", float(warning.journal_initial)),
-                        ("期初余额差额", float(warning.diff)),
-                        ("期初余额状态", "一致"),
-                    ]
-                )
-            else:
-                rows.append(
-                    (
-                        "期初余额核对",
-                        "任一方未提供有效余额列数据，跳过期初核对",
-                    )
-                )
-        return pd.DataFrame(rows, columns=["项目", "数值"])
-
     def _build_daily_and_monthly_tables(
         self,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -763,6 +470,7 @@ class Reporter:
             "daily_total": "日总额",
             "monthly_total": "月总额",
             "cross_month_total": "跨月多对多",
+            "closed_candidate_group": "整组勾稽",
         }
         return names.get(match_type, match_type)
 
@@ -797,6 +505,10 @@ class Reporter:
                     "阶段": candidate.match_stage,
                     "类型": self._match_type_name(candidate.match_type),
                     "最终状态": candidate.processing_status.value,
+                    "风险等级": candidate.risk_level.value,
+                    "系统结论": candidate.processing_status.value,
+                    "判断依据": candidate.processing_reason,
+                    "建议动作": self._suggested_action(candidate.risk_level.value),
                     "处理原因": candidate.processing_reason,
                     "综合可信度": candidate.scores.total,
                     "金额分": candidate.scores.amount,
@@ -880,10 +592,10 @@ class Reporter:
                     "是否使用大模型": (
                         "是" if candidate.llm_decision else "否"
                     ),
-                    "纳入整池复核": (
+                    "纳入风险池": (
                         "是"
                         if candidate.evidence.get(
-                            "included_in_pool_review",
+                            "included_in_risk_pool",
                             False,
                         )
                         else "否"
@@ -925,6 +637,10 @@ class Reporter:
                     "阶段": "",
                     "类型": self._match_type_name(str(match_type)),
                     "最终状态": "自动确认",
+                    "风险等级": "正常",
+                    "系统结论": "自动确认",
+                    "判断依据": "兼容旧匹配记录",
+                    "建议动作": "无需额外处理",
                     "处理原因": "兼容旧匹配记录",
                     "综合可信度": {"高": 90, "中": 75, "低": 60}.get(
                         confidence,
@@ -987,22 +703,22 @@ class Reporter:
                     "大模型判断": "",
                     "差异池ID": "",
                     "是否使用大模型": "否",
-                    "纳入整池复核": "否",
+                    "纳入风险池": "否",
                 }
             )
         return rows
 
     def _build_match_group_table(self) -> pd.DataFrame:
         columns = [
-            "匹配ID", "候选ID", "阶段", "类型", "最终状态", "处理原因",
+            "系统结论", "风险等级", "判断依据", "建议动作", "匹配ID",
+            "类型", "银行笔数", "日记账笔数", "银行合计", "日记账合计",
+            "总差额", "最早日期", "最晚日期", "候选ID", "阶段", "最终状态", "处理原因",
             "综合可信度", "金额分", "日期分", "文字分", "结构分",
-            "银行笔数", "日记账笔数", "银行合计", "日记账合计",
             "银行收入", "银行支出", "银行净额", "日记账收入",
             "日记账支出", "日记账净额", "组金额", "收入差额",
-            "支出差额", "总差额", "银_日期",
-            "账_日期", "最早日期", "最晚日期", "文字支持", "文字冲突",
+            "支出差额", "银_日期", "账_日期", "文字支持", "文字冲突",
             "大模型判断", "差异池ID", "是否使用大模型",
-            "纳入整池复核",
+            "纳入风险池",
         ]
         rows = self._candidate_group_rows()
         rows.sort(
@@ -1018,14 +734,18 @@ class Reporter:
     def _auxiliary_text(row: pd.Series) -> str:
         fields = row.get("aux_text_fields", {})
         if isinstance(fields, dict):
-            return json.dumps(fields, ensure_ascii=False, sort_keys=True)
+            return "；".join(
+                f"{key}：{value}"
+                for key, value in sorted(fields.items())
+                if value is not None and str(value).strip()
+            )
         return ""
 
     def _build_match_component_table(self) -> pd.DataFrame:
         columns = [
-            "匹配ID", "候选ID", "来源", "原文件行号", "日期", "金额",
+            "匹配ID", "候选ID", "来源", "原文件行号", "日期", "金额", "收支方向",
             "摘要", "辅助文字", "凭证号", "类型", "处理状态",
-            "纳入整池复核",
+            "纳入风险池",
         ]
         rows: list[dict[str, Any]] = []
         candidates = list(
@@ -1047,6 +767,7 @@ class Reporter:
                 ):
                     for index in indexes:
                         row = frame.loc[index]
+                        amount = float(row.get("amount", 0))
                         rows.append(
                             {
                                 "匹配ID": candidate.final_match_id,
@@ -1059,7 +780,10 @@ class Reporter:
                                     )
                                 ),
                                 "日期": row.get("date", ""),
-                                "金额": float(row.get("amount", 0)),
+                                "金额": abs(amount),
+                                "收支方向": (
+                                    "收入" if amount > 0 else "支出" if amount < 0 else "零金额"
+                                ),
                                 "摘要": row.get("summary", ""),
                                 "辅助文字": self._auxiliary_text(row),
                                 "凭证号": (
@@ -1071,10 +795,10 @@ class Reporter:
                                     candidate.match_type
                                 ),
                                 "处理状态": candidate.processing_status.value,
-                                "纳入整池复核": (
+                                "纳入风险池": (
                                     "是"
                                     if candidate.evidence.get(
-                                        "included_in_pool_review",
+                                        "included_in_risk_pool",
                                         False,
                                     )
                                     else "否"
@@ -1090,6 +814,7 @@ class Reporter:
                     ["date", "amount_decimal"],
                 )
                 for index, row in matched.iterrows():
+                    amount = float(row.get("amount", 0))
                     rows.append(
                         {
                             "匹配ID": row.get("match_id", ""),
@@ -1102,7 +827,10 @@ class Reporter:
                                 )
                             ),
                             "日期": row.get("date", ""),
-                            "金额": float(row.get("amount", 0)),
+                            "金额": abs(amount),
+                            "收支方向": (
+                                "收入" if amount > 0 else "支出" if amount < 0 else "零金额"
+                            ),
                             "摘要": row.get("summary", ""),
                             "辅助文字": self._auxiliary_text(row),
                             "凭证号": (
@@ -1114,21 +842,26 @@ class Reporter:
                                 str(row.get("match_type", ""))
                             ),
                             "处理状态": "自动确认",
-                            "纳入整池复核": "否",
+                            "纳入风险池": "否",
                         }
                     )
         return pd.DataFrame(rows, columns=columns)
 
     def _build_trivial_table(self) -> pd.DataFrame:
         columns = [
-            "月份", "差异池", "池累计金额", "池是否超限", "匹配候选ID",
-            "差异金额", "纳入整池复核", "处理状态", "处理依据",
+            "系统结论", "风险等级", "判断依据", "建议动作", "月份",
+            "差异池", "池累计金额", "池是否超限", "匹配候选ID",
+            "差异金额", "纳入风险池", "处理状态",
         ]
         rows = []
         for pool in getattr(self.matcher, "difference_pools", []):
             for component in pool.components:
                 rows.append(
                     {
+                        "系统结论": pool.processing_status.value,
+                        "风险等级": pool.risk_level.value,
+                        "判断依据": pool.processing_reason,
+                        "建议动作": self._suggested_action(pool.risk_level.value),
                         "月份": pool.month,
                         "差异池": pool.pool_type.value,
                         "池累计金额": float(
@@ -1147,13 +880,12 @@ class Reporter:
                                 component.diff_li
                             )
                         ),
-                        "纳入整池复核": (
+                        "纳入风险池": (
                             "是"
-                            if component.included_in_pool_review
+                            if component.included_in_risk_pool
                             else "否"
                         ),
                         "处理状态": pool.processing_status.value,
-                        "处理依据": pool.processing_reason,
                     }
                 )
         return pd.DataFrame(rows, columns=columns)
@@ -1231,190 +963,6 @@ class Reporter:
             )
         )
         return snapshots
-
-    def _build_pending_review_table(self) -> pd.DataFrame:
-        columns = [
-            "复核事项ID", "事项类型", "月份", "匹配类型", "银行笔数",
-            "日记账笔数", "组金额", "差异金额", "综合可信度", "原因",
-            "金额分", "日期分", "文字分", "结构分", "重要性规则",
-            "银行原文件行号", "日记账原文件行号", "银行日期",
-            "日记账日期", "银行金额", "日记账金额", "银行逐笔金额",
-            "日记账逐笔金额", "银行摘要", "日记账摘要", "银行辅助文字",
-            "日记账辅助文字", "大模型判断", "差异池ID",
-            "差异池累计金额", "匹配候选ID", "组成数量",
-            "复核结论", "复核说明",
-        ]
-        rows = []
-        config = self.matcher.config
-        for candidate in getattr(
-            self.matcher,
-            "selected_candidates",
-            [],
-        ):
-            if candidate.processing_status.value != "待人工复核":
-                continue
-            if candidate.evidence.get("included_in_pool_review", False):
-                continue
-            importance_rule = (
-                "超过实际执行重要性水平"
-                if candidate.metrics.group_amount_li
-                > PrecisionEngine.to_integer_li(
-                    config.performance_materiality
-                )
-                else (
-                    "跨月多对多"
-                    if candidate.is_cross_month_many_to_many
-                    else "综合可信度未达到自动确认门槛"
-                )
-            )
-            row = {
-                    "复核事项ID": candidate.final_match_id,
-                    "事项类型": "匹配组",
-                    "月份": (
-                        min(
-                            candidate.bank_dates
-                            + candidate.journal_dates
-                        ).strftime("%Y-%m")
-                        if candidate.bank_dates or candidate.journal_dates
-                        else ""
-                    ),
-                    "匹配类型": self._match_type_name(
-                        candidate.match_type
-                    ),
-                    "银行笔数": len(candidate.bank_idxs),
-                    "日记账笔数": len(candidate.journal_idxs),
-                    "组金额": float(
-                        PrecisionEngine.from_integer_li(
-                            candidate.metrics.group_amount_li
-                        )
-                    ),
-                    "差异金额": float(
-                        PrecisionEngine.from_integer_li(
-                            candidate.metrics.total_diff_li
-                        )
-                    ),
-                    "综合可信度": candidate.scores.total,
-                    "原因": candidate.processing_reason,
-                    "金额分": candidate.scores.amount,
-                    "日期分": candidate.scores.date,
-                    "文字分": candidate.scores.text,
-                    "结构分": candidate.scores.structure,
-                    "重要性规则": importance_rule,
-                    "大模型判断": (
-                        candidate.llm_decision.reason
-                        if candidate.llm_decision
-                        else ""
-                    ),
-                    "差异池ID": "；".join(
-                        str(value)
-                        for value in candidate.evidence.get(
-                            "difference_pool_ids",
-                            [],
-                        )
-                    ),
-                    "差异池累计金额": "",
-                    "匹配候选ID": candidate.candidate_id,
-                    "组成数量": (
-                        len(candidate.bank_idxs)
-                        + len(candidate.journal_idxs)
-                    ),
-                    "复核结论": "暂不处理",
-                    "复核说明": "",
-            }
-            row.update(self._candidate_snapshots(candidate))
-            rows.append(row)
-        candidate_by_id = {
-            candidate.candidate_id: candidate
-            for candidate in getattr(
-                self.matcher,
-                "selected_candidates",
-                [],
-            )
-        }
-        for pool in getattr(self.matcher, "difference_pools", []):
-            if not pool.exceeds_performance_materiality:
-                continue
-            component_candidates = [
-                candidate_by_id[component.candidate_id]
-                for component in pool.components
-                if component.candidate_id in candidate_by_id
-            ]
-            bank_indexes = [
-                index
-                for candidate in component_candidates
-                for index in candidate.bank_idxs
-            ]
-            journal_indexes = [
-                index
-                for candidate in component_candidates
-                for index in candidate.journal_idxs
-            ]
-            row = {
-                    "复核事项ID": pool.pool_id,
-                    "事项类型": "月度差异池",
-                    "月份": pool.month,
-                    "匹配类型": pool.pool_type.value,
-                    "银行笔数": "",
-                    "日记账笔数": "",
-                    "组金额": float(
-                        PrecisionEngine.from_integer_li(
-                            pool.total_diff_li
-                        )
-                    ),
-                    "差异金额": float(
-                        PrecisionEngine.from_integer_li(
-                            pool.total_diff_li
-                        )
-                    ),
-                    "综合可信度": "",
-                    "原因": pool.processing_reason,
-                    "金额分": "",
-                    "日期分": "",
-                    "文字分": "",
-                    "结构分": "",
-                    "重要性规则": "月度累计超过实际执行重要性水平",
-                    "大模型判断": "；".join(
-                        candidate.llm_decision.reason
-                        for candidate in component_candidates
-                        if candidate.llm_decision
-                    ),
-                    "差异池ID": pool.pool_id,
-                    "差异池累计金额": float(
-                        PrecisionEngine.from_integer_li(
-                            pool.total_diff_li
-                        )
-                    ),
-                    "匹配候选ID": "；".join(
-                        component.candidate_id
-                        for component in pool.components
-                    ),
-                    "组成数量": len(pool.components),
-                    "复核结论": "暂不处理",
-                    "复核说明": "",
-            }
-            row.update(
-                self._source_snapshot(
-                    self.matcher.bank,
-                    bank_indexes,
-                    "银行",
-                )
-            )
-            row.update(
-                self._source_snapshot(
-                    self.matcher.journal,
-                    journal_indexes,
-                    "日记账",
-                )
-            )
-            rows.append(row)
-        rows.sort(
-            key=lambda row: (
-                str(row["月份"]),
-                str(row["事项类型"]),
-                str(row["复核事项ID"]),
-            )
-        )
-        return pd.DataFrame(rows, columns=columns)
 
     def _build_unmatched_table(self, source: str) -> pd.DataFrame:
         frame = (
@@ -1694,30 +1242,30 @@ class Reporter:
         journal_has_balance: bool,
     ) -> dict[str, pd.DataFrame]:
         tables: dict[str, pd.DataFrame] = {}
-        bank_recalculator = BalanceRecalculator()
-        journal_recalculator = BalanceRecalculator()
-        bank_balances = bank_recalculator.recalculate(self.matcher.bank)
-        journal_balances = journal_recalculator.recalculate(
-            self.matcher.journal
-        )
-        reconciler = BalanceReconciler(
-            bank_balances=bank_balances,
-            journal_balances=journal_balances,
-        )
-        differences = reconciler.generate_diff_report()
-        if differences:
-            tables["余额差异明细"] = pd.DataFrame(
-                [
-                    {
-                        "日期": item.date,
-                        "银行余额": float(item.bank_balance or 0),
-                        "日记账余额": float(item.journal_balance or 0),
-                        "差额": float(item.diff or 0),
-                        "差异类型": item.diff_type,
-                    }
-                    for item in differences
-                ]
+        if bank_has_balance and journal_has_balance:
+            bank_balances = BalanceRecalculator().recalculate(
+                self.matcher.bank
             )
+            journal_balances = BalanceRecalculator().recalculate(
+                self.matcher.journal
+            )
+            differences = BalanceReconciler(
+                bank_balances=bank_balances,
+                journal_balances=journal_balances,
+            ).generate_diff_report()
+            if differences:
+                tables["余额差异明细"] = pd.DataFrame(
+                    [
+                        {
+                            "日期": item.date,
+                            "银行余额": float(item.bank_balance or 0),
+                            "日记账余额": float(item.journal_balance or 0),
+                            "差额": float(item.diff or 0),
+                            "差异类型": item.diff_type,
+                        }
+                        for item in differences
+                    ]
+                )
         continuity_rows = []
         if bank_has_balance:
             continuity_rows.extend(
@@ -1737,13 +1285,389 @@ class Reporter:
             tables["余额连续性异常"] = pd.DataFrame(continuity_rows)
         return tables
 
+    @staticmethod
+    def _suggested_action(risk_level: str) -> str:
+        return {
+            "正常": "无需额外处理",
+            "低风险": "随同常规核对留存",
+            "中风险": "结合摘要和期间优先核查",
+            "高风险": "优先核查业务依据及必要的账务处理",
+            "范围未知": "先关注核对范围，再使用明细结论",
+        }.get(risk_level, "结合明细关注异常原因")
+
+    def _build_business_summary_table(
+        self,
+        config: MatcherConfig,
+        *,
+        balance_check_possible: bool,
+    ) -> pd.DataFrame:
+        candidates = list(getattr(self.matcher, "selected_candidates", []))
+        total_rows = len(self.matcher.bank) + len(self.matcher.journal)
+        row_level = [
+            item
+            for item in candidates
+            if len(item.bank_idxs) == 1
+            and len(item.journal_idxs) == 1
+            and item.metrics.total_diff_li == 0
+            and item.processing_status.value == "自动确认"
+        ]
+        group_level = [
+            item
+            for item in candidates
+            if item.metrics.total_diff_li == 0 and item not in row_level
+        ]
+
+        def covered(items: list[Any]) -> int:
+            return sum(len(item.bank_idxs) + len(item.journal_idxs) for item in items)
+
+        status_counts: Dict[str, int] = {}
+        risk_counts: Dict[str, int] = {}
+        status_amounts: Dict[str, Decimal] = {}
+        risk_amounts: Dict[str, Decimal] = {}
+        for item in candidates:
+            status = item.processing_status.value
+            risk = item.risk_level.value
+            amount = abs(
+                PrecisionEngine.from_integer_li(item.metrics.group_amount_li)
+            )
+            status_counts[status] = status_counts.get(status, 0) + 1
+            risk_counts[risk] = risk_counts.get(risk, 0) + 1
+            status_amounts[status] = status_amounts.get(status, Decimal("0")) + amount
+            risk_amounts[risk] = risk_amounts.get(risk, Decimal("0")) + amount
+
+        bank_unmatched = self.matcher.bank[~self.matcher.bank["matched"]]
+        journal_unmatched = self.matcher.journal[~self.matcher.journal["matched"]]
+        bank_unmatched_amount = sum(
+            (abs(Decimal(str(value))) for value in bank_unmatched["amount"]),
+            Decimal("0"),
+        )
+        journal_unmatched_amount = sum(
+            (abs(Decimal(str(value))) for value in journal_unmatched["amount"]),
+            Decimal("0"),
+        )
+
+        range_items = (
+            [item for item in self.precheck_report.items if item.status == "疑点"]
+            if self.precheck_report is not None
+            else []
+        )
+        range_status = "范围受限" if range_items else (
+            "范围可用" if self.precheck_report is not None else "范围未验证"
+        )
+        high_or_unknown = (
+            risk_counts.get("高风险", 0) + risk_counts.get("范围未知", 0)
+        )
+        action1 = (
+            "优先查看高风险及范围未知事项的业务依据"
+            if high_or_unknown
+            else "未发现高风险或范围未知事项，保留自动核对成果"
+        )
+        action2 = (
+            "核查银行侧和日记账侧待查记录的截止期及入账依据"
+            if len(bank_unmatched) or len(journal_unmatched)
+            else "两侧记录均已形成自动关系或组级结论"
+        )
+        action3 = (
+            "结合余额差异和连续性异常定位未入账或重复入账"
+            if balance_check_possible
+            else "本次无双方可用余额，余额核对未实施"
+        )
+        rows = [
+            ("系统结论", "核对已自动完成；疑点已分级列示，不依赖人工填写"),
+            ("核对范围", range_status),
+            ("范围说明", "；".join(item.name for item in range_items) or "未发现范围疑点"),
+            ("银行有效交易笔数", len(self.matcher.bank)),
+            ("日记账有效交易笔数", len(self.matcher.journal)),
+            ("逐笔精确匹配率", covered(row_level) / total_rows if total_rows else 0.0),
+            ("组级勾稽率", covered(group_level) / total_rows if total_rows else 0.0),
+            ("自动完成率", 1.0 if total_rows else 0.0),
+            ("自动确认组数", status_counts.get("自动确认", 0)),
+            ("自动确认金额", float(status_amounts.get("自动确认", Decimal("0")))),
+            ("整组勾稽组数", status_counts.get("整组勾稽一致", 0)),
+            ("整组勾稽金额", float(status_amounts.get("整组勾稽一致", Decimal("0")))),
+            ("自动归集事项数", status_counts.get("自动归集事项", 0)),
+            ("自动归集金额", float(status_amounts.get("自动归集事项", Decimal("0")))),
+            ("疑点事项数", status_counts.get("疑点事项", 0)),
+            ("疑点事项金额", float(status_amounts.get("疑点事项", Decimal("0")))),
+            ("低风险事项数", risk_counts.get("低风险", 0)),
+            ("低风险事项金额", float(risk_amounts.get("低风险", Decimal("0")))),
+            ("中风险事项数", risk_counts.get("中风险", 0)),
+            ("中风险事项金额", float(risk_amounts.get("中风险", Decimal("0")))),
+            ("高风险事项数", risk_counts.get("高风险", 0)),
+            ("高风险事项金额", float(risk_amounts.get("高风险", Decimal("0")))),
+            ("范围未知事项数", risk_counts.get("范围未知", 0)),
+            ("范围未知事项金额", float(risk_amounts.get("范围未知", Decimal("0")))),
+            ("银行侧待查笔数", len(bank_unmatched)),
+            ("银行侧待查金额", float(bank_unmatched_amount)),
+            ("日记账侧待查笔数", len(journal_unmatched)),
+            ("日记账侧待查金额", float(journal_unmatched_amount)),
+            ("余额核对", "已实施" if balance_check_possible else "余额核对未实施"),
+            ("待处理事项数", 0),
+            ("已关注事项数", 0),
+            ("已处理事项数", 0),
+            ("无需处理事项数", 0),
+            ("实际执行重要性水平", float(config.performance_materiality)),
+            ("明显微小错报临界值", float(config.clearly_trivial_threshold)),
+            ("建议动作1", action1),
+            ("建议动作2", action2),
+            ("建议动作3", action3),
+        ]
+        warning = self.initial_balance_warning
+        if balance_check_possible and warning is not None:
+            rows[2:2] = [
+                ("银行期初余额", float(warning.bank_initial)),
+                ("日记账期初余额", float(warning.journal_initial)),
+                ("期初余额差额", float(warning.diff)),
+                ("期初余额状态", "不一致" if warning.has_warning else "一致"),
+            ]
+        return pd.DataFrame(rows, columns=["项目", "数值"])
+
+    def _build_issue_table(self) -> pd.DataFrame:
+        columns = [
+            "系统结论", "风险等级", "判断依据", "建议动作", "事项类型",
+            "月份", "匹配类型", "银行笔数", "日记账笔数", "组金额", "差异金额",
+            "银行原文件行号", "日记账原文件行号", "银行日期", "日记账日期",
+            "银行金额", "日记账金额", "银行摘要", "日记账摘要",
+            "后续状态", "处理说明", "调整凭证号", "责任人", "处理日期",
+            "匹配ID", "候选ID", "综合可信度", "金额分", "日期分", "文字分",
+            "结构分", "差异池ID",
+        ]
+        rows: list[dict[str, Any]] = []
+        for candidate in getattr(self.matcher, "selected_candidates", []):
+            risk = candidate.risk_level.value
+            if (
+                candidate.processing_status.value not in {"疑点事项", "自动归集事项"}
+                and risk not in {"高风险", "范围未知"}
+            ):
+                continue
+            row = {
+                "系统结论": candidate.processing_status.value,
+                "风险等级": risk,
+                "判断依据": candidate.processing_reason,
+                "建议动作": self._suggested_action(risk),
+                "事项类型": "匹配或差异事项",
+                "月份": min(candidate.bank_dates + candidate.journal_dates).strftime("%Y-%m")
+                if candidate.bank_dates or candidate.journal_dates else "",
+                "匹配类型": self._match_type_name(candidate.match_type),
+                "银行笔数": len(candidate.bank_idxs),
+                "日记账笔数": len(candidate.journal_idxs),
+                "组金额": float(PrecisionEngine.from_integer_li(candidate.metrics.group_amount_li)),
+                "差异金额": float(PrecisionEngine.from_integer_li(candidate.metrics.total_diff_li)),
+                "后续状态": "",
+                "处理说明": "",
+                "调整凭证号": "",
+                "责任人": "",
+                "处理日期": "",
+                "匹配ID": candidate.final_match_id,
+                "候选ID": candidate.candidate_id,
+                "综合可信度": candidate.scores.total,
+                "金额分": candidate.scores.amount,
+                "日期分": candidate.scores.date,
+                "文字分": candidate.scores.text,
+                "结构分": candidate.scores.structure,
+                "差异池ID": "；".join(candidate.evidence.get("difference_pool_ids", [])),
+            }
+            row.update(self._candidate_snapshots(candidate))
+            rows.append(row)
+
+        existing_pool_ids = {row.get("差异池ID") for row in rows}
+        for pool in getattr(self.matcher, "difference_pools", []):
+            if pool.risk_level.value not in {"高风险", "范围未知"}:
+                continue
+            if pool.pool_id in existing_pool_ids:
+                continue
+            rows.append(
+                {
+                    "系统结论": pool.processing_status.value,
+                    "风险等级": pool.risk_level.value,
+                    "判断依据": pool.processing_reason,
+                    "建议动作": self._suggested_action(pool.risk_level.value),
+                    "事项类型": "月度差异池",
+                    "月份": pool.month,
+                    "匹配类型": pool.pool_type.value,
+                    "组金额": float(PrecisionEngine.from_integer_li(pool.total_diff_li)),
+                    "差异金额": float(PrecisionEngine.from_integer_li(pool.total_diff_li)),
+                    "后续状态": "",
+                    "处理说明": "",
+                    "调整凭证号": "",
+                    "责任人": "",
+                    "处理日期": "",
+                    "差异池ID": pool.pool_id,
+                }
+            )
+        return pd.DataFrame(rows, columns=columns)
+
+    @staticmethod
+    def _decorate_unmatched(table: pd.DataFrame, side: str) -> pd.DataFrame:
+        result = table.copy()
+        result.insert(0, "建议动作", "结合对侧记录和截止期继续核查")
+        result.insert(0, "判断依据", "程序未找到足以建立关系的候选")
+        result.insert(0, "风险等级", "范围未知")
+        result.insert(0, "系统结论", f"{side}未找到候选")
+        return result
+
+    def _apply_report_presentation(self, workbook: Any) -> None:
+        technical_sheets = {"运行参数", "大模型辅助明细", "解析异常明细"}
+        technical_columns = {
+            "候选ID", "阶段", "最终状态", "处理原因", "综合可信度",
+            "金额分", "日期分", "文字分", "结构分", "银_日期", "账_日期",
+            "文字支持", "文字冲突", "大模型判断", "差异池ID", "是否使用大模型",
+            "纳入风险池", "匹配候选ID", "银行收入", "银行支出", "银行净额",
+            "日记账收入", "日记账支出", "日记账净额", "组金额", "收入差额",
+            "支出差额",
+        }
+        issue_hidden_columns = {
+            "银行原文件行号", "日记账原文件行号", "银行日期", "日记账日期",
+            "银行金额", "日记账金额", "调整凭证号", "责任人", "处理日期", "匹配ID",
+        }
+        amount_keywords = ("金额", "合计", "收入", "支出", "净额", "差额", "余额", "组金额")
+        percent_headers = {"逐笔精确匹配率", "组级勾稽率", "自动完成率"}
+        for sheet in workbook.worksheets:
+            if sheet.title in technical_sheets:
+                sheet.sheet_state = "hidden"
+            business_columns = [cell.column for cell in sheet[1] if cell.value is not None]
+            first_business_column = min(business_columns) if business_columns else 1
+            if first_business_column > 1:
+                for column in range(1, first_business_column):
+                    sheet.column_dimensions[get_column_letter(column)].hidden = True
+            sheet.freeze_panes = f"{get_column_letter(first_business_column)}2"
+            if sheet.max_row >= 1 and sheet.max_column >= 1:
+                sheet.auto_filter.ref = (
+                    f"{get_column_letter(first_business_column)}1:"
+                    f"{get_column_letter(sheet.max_column)}{sheet.max_row}"
+                )
+            for cell in sheet[1]:
+                if cell.value in technical_columns:
+                    sheet.column_dimensions[cell.column_letter].hidden = True
+                if sheet.title == "疑点事项" and cell.value in issue_hidden_columns:
+                    sheet.column_dimensions[cell.column_letter].hidden = True
+                width = 14
+                if cell.value in {"系统结论", "判断依据", "建议动作", "摘要", "银行摘要", "日记账摘要", "说明"}:
+                    width = 28
+                sheet.column_dimensions[cell.column_letter].width = width
+                header = str(cell.value or "")
+                for data_cell in sheet.iter_cols(
+                    min_col=cell.column,
+                    max_col=cell.column,
+                    min_row=2,
+                    max_row=max(2, sheet.max_row),
+                ):
+                    for item in data_cell:
+                        item.alignment = Alignment(vertical="top", wrap_text=True)
+                        if any(keyword in header for keyword in amount_keywords):
+                            item.number_format = '#,##0.00'
+            if sheet.title == "核对结论":
+                headers = {cell.value: cell.column for cell in sheet[1] if cell.value is not None}
+                item_column = headers.get("项目", first_business_column)
+                value_column = headers.get("数值", item_column + 1)
+                sheet.column_dimensions[
+                    get_column_letter(item_column)
+                ].width = 24
+                sheet.column_dimensions[
+                    get_column_letter(value_column)
+                ].width = 58
+                for row in range(2, sheet.max_row + 1):
+                    if sheet.cell(row=row, column=item_column).value in percent_headers:
+                        sheet.cell(row=row, column=value_column).number_format = "0.00%"
+                    value = sheet.cell(row=row, column=value_column).value
+                    sheet.row_dimensions[row].height = (
+                        32 if len(str(value or "")) > 20 else 20
+                    )
+            if sheet.title == "输入检查":
+                headers = {
+                    cell.value: cell.column
+                    for cell in sheet[1]
+                    if cell.value is not None
+                }
+                widths = {
+                    "检查项目": 20,
+                    "银行流水结果": 20,
+                    "银行日记账结果": 20,
+                    "双方比较结果": 24,
+                    "状态": 12,
+                    "说明": 52,
+                }
+                for header, width in widths.items():
+                    column = headers.get(header)
+                    if column is not None:
+                        sheet.column_dimensions[
+                            get_column_letter(column)
+                        ].width = width
+                for row in range(2, sheet.max_row + 1):
+                    longest_text = max(
+                        (
+                            len(str(sheet.cell(row=row, column=column).value or ""))
+                            for column in headers.values()
+                        ),
+                        default=0,
+                    )
+                    sheet.row_dimensions[row].height = (
+                        36 if longest_text > 18 else 22
+                    )
+
+        if "疑点事项" in workbook.sheetnames:
+            sheet = workbook["疑点事项"]
+            headers = {cell.value: cell.column for cell in sheet[1]}
+            status_column = headers.get("后续状态")
+            if status_column is not None:
+                validation = DataValidation(
+                    type="list",
+                    formula1='"已关注,已处理,无需处理"',
+                    allow_blank=True,
+                )
+                sheet.add_data_validation(validation)
+                letter = get_column_letter(status_column)
+                validation.add(f"{letter}2:{letter}{max(2, sheet.max_row)}")
+
+            if "核对结论" in workbook.sheetnames:
+                item_column = headers.get("系统结论")
+                if status_column is not None and item_column is not None:
+                    last_row = max(2, sheet.max_row)
+                    status_letter = get_column_letter(status_column)
+                    item_letter = get_column_letter(item_column)
+                    status_range = (
+                        f"'疑点事项'!${status_letter}$2:"
+                        f"${status_letter}${last_row}"
+                    )
+                    item_range = (
+                        f"'疑点事项'!${item_letter}$2:"
+                        f"${item_letter}${last_row}"
+                    )
+                    formulas = {
+                        "待处理事项数": (
+                            f'=COUNTIFS({item_range},"<>",{status_range},"")'
+                        ),
+                        "已关注事项数": f'=COUNTIF({status_range},"已关注")',
+                        "已处理事项数": f'=COUNTIF({status_range},"已处理")',
+                        "无需处理事项数": f'=COUNTIF({status_range},"无需处理")',
+                    }
+                    summary = workbook["核对结论"]
+                    summary_headers = {
+                        cell.value: cell.column for cell in summary[1]
+                    }
+                    summary_item_column = summary_headers.get("项目", 1)
+                    summary_value_column = summary_headers.get("数值", 2)
+                    for row in range(2, summary.max_row + 1):
+                        item = summary.cell(
+                            row=row,
+                            column=summary_item_column,
+                        ).value
+                        if item in formulas:
+                            summary.cell(
+                                row=row,
+                                column=summary_value_column,
+                            ).value = formulas[item]
+                    workbook.calculation.calcMode = "auto"
+                    workbook.calculation.fullCalcOnLoad = True
+                    workbook.calculation.forceFullCalc = True
+
     def build_report_tables(
         self,
         config: MatcherConfig,
         date_format: str = "auto",
     ) -> dict[str, pd.DataFrame]:
         """在写入 Excel 前构造所有可单独检查的结构化表。"""
-        balance_possible, has_warning = self._prepare_initial_balance()
+        balance_possible, _ = self._prepare_initial_balance()
         bank_has_balance = self._has_balance_data(
             self.matcher.bank,
             self.bank_mapping,
@@ -1758,27 +1682,35 @@ class Reporter:
             self.journal_mapping,
         )
         daily, monthly = self._build_daily_and_monthly_tables()
+        groups = self._build_match_group_table()
+        row_mask = (
+            (groups["银行笔数"] == 1) & (groups["日记账笔数"] == 1)
+            if not groups.empty
+            else pd.Series(dtype=bool)
+        )
         tables = {
-            "核对汇总": self._build_summary_table(
+            "核对结论": self._build_business_summary_table(
                 config,
                 balance_check_possible=balance_possible,
-                has_warning=has_warning,
             ),
-            "每日统计": daily,
-            "月度统计": monthly,
-            "匹配明细": self._build_match_group_table(),
-            "匹配组成明细": self._build_match_component_table(),
-            "明显微小错报": self._build_trivial_table(),
-            "待人工复核": self._build_pending_review_table(),
-            "银行未达": self._build_unmatched_table("bank"),
-            "日记账未达": self._build_unmatched_table("journal"),
-            "运行参数": self._build_parameter_table(
-                config,
-                date_format,
+            "疑点事项": self._build_issue_table(),
+            "自动归集事项": self._build_trivial_table(),
+            "银行侧待查": self._decorate_unmatched(
+                self._build_unmatched_table("bank"), "银行侧"
             ),
+            "日记账侧待查": self._decorate_unmatched(
+                self._build_unmatched_table("journal"), "日记账侧"
+            ),
+            "逐笔匹配": groups.loc[row_mask].reset_index(drop=True)
+            if not groups.empty else groups.copy(),
+            "整组勾稽": groups.loc[~row_mask].reset_index(drop=True)
+            if not groups.empty else groups.copy(),
+            "匹配组成": self._build_match_component_table(),
         }
         if self.precheck_report is not None:
-            tables["输入预检查"] = self.precheck_report.to_dataframe()
+            tables["输入检查"] = self.precheck_report.to_dataframe()
+        tables["月度统计"] = monthly
+        tables["每日统计"] = daily
         tables.update(
             self._build_balance_tables(
                 bank_has_balance=bank_has_balance,
@@ -1791,7 +1723,21 @@ class Reporter:
         if self.error_collector and self.error_collector.has_errors():
             errors = self.error_collector.get_all_errors()
             if errors:
-                tables["解析异常明细"] = pd.DataFrame(errors)
+                error_table = pd.DataFrame(errors).rename(
+                    columns={
+                        "type": "异常类型",
+                        "source_type": "来源",
+                        "row": "原文件行号",
+                        "column": "字段",
+                        "original_value": "原值",
+                        "error": "原因",
+                    }
+                )
+                tables["解析异常明细"] = error_table
+        tables["运行参数"] = self._build_parameter_table(
+            config,
+            date_format,
+        )
         return {
             name: self._safe_table(frame)
             for name, frame in tables.items()
@@ -1822,13 +1768,14 @@ class Reporter:
             self.initial_balance_warning
             and self.initial_balance_warning.has_warning
         )
-        if "核对汇总" in workbook.sheetnames:
+        if "核对结论" in workbook.sheetnames:
             self._postprocess_summary(
-                workbook["核对汇总"],
+                workbook["核对结论"],
                 has_warning,
             )
-        if "匹配明细" in workbook.sheetnames:
-            self._postprocess_details(workbook["匹配明细"])
+        for detail_name in ("逐笔匹配", "整组勾稽", "疑点事项", "自动归集事项"):
+            if detail_name in workbook.sheetnames:
+                self._postprocess_details(workbook[detail_name])
         for sheet_name in (
             "每日统计",
             "月度统计",
@@ -1838,26 +1785,5 @@ class Reporter:
             if sheet_name in workbook.sheetnames:
                 self._postprocess_diff_columns(workbook[sheet_name])
 
-        if "待人工复核" in workbook.sheetnames:
-            sheet = workbook["待人工复核"]
-            header_columns = {
-                cell.value: cell.column
-                for cell in sheet[1]
-                if cell.value is not None
-            }
-            conclusion_column = header_columns.get("复核结论")
-            if conclusion_column is not None:
-                validation = DataValidation(
-                    type="list",
-                    formula1='"接受,拒绝,暂不处理"',
-                    allow_blank=False,
-                )
-                validation.error = "请选择接受、拒绝或暂不处理"
-                validation.errorTitle = "复核结论无效"
-                sheet.add_data_validation(validation)
-                column_letter = get_column_letter(conclusion_column)
-                validation.add(
-                    f"{column_letter}2:"
-                    f"{column_letter}{max(2, sheet.max_row)}"
-                )
+        self._apply_report_presentation(workbook)
         workbook.save(output_path)

@@ -10,6 +10,7 @@ from data_structures import (
     MatchCandidate,
     MatcherConfig,
     ProcessingStatus,
+    RiskLevel,
     TextEvidence,
 )
 from matcher import Matcher
@@ -46,52 +47,57 @@ def _exact_candidate(**changes):
 def test_无风险且金额完全一致仍可自动确认():
     candidate = _exact_candidate()
 
-    status, _ = route_candidate(candidate, MatcherConfig())
+    status, risk, _ = route_candidate(candidate, MatcherConfig())
 
     assert status is ProcessingStatus.AUTO_CONFIRMED
+    assert risk is RiskLevel.NORMAL
 
 
-def test_关键文字字段冲突时金额一致也必须复核():
+def test_关键文字字段冲突时自动形成疑点():
     candidate = _exact_candidate(
         text_evidence=TextEvidence(conflicting_fields=("对方户名",)),
     )
 
-    status, reason = route_candidate(candidate, MatcherConfig())
+    status, risk, reason = route_candidate(candidate, MatcherConfig())
 
-    assert status is ProcessingStatus.PENDING_REVIEW
+    assert status is ProcessingStatus.FLAGGED
+    assert risk is RiskLevel.LOW
     assert "对方户名" in reason
 
 
-def test_明显微小金额差异也不能覆盖关键文字冲突():
+def test_明显微小金额差异和关键冲突一并自动披露():
     candidate = _exact_candidate(
         metrics=build_group_metrics([1_000_000], [990_000]),
         text_evidence=TextEvidence(conflicting_fields=("对方户名",)),
     )
 
-    status, reason = route_candidate(candidate, MatcherConfig())
+    status, risk, reason = route_candidate(candidate, MatcherConfig())
 
-    assert status is ProcessingStatus.PENDING_REVIEW
+    assert status is ProcessingStatus.AUTO_CLASSIFIED
+    assert risk is RiskLevel.LOW
     assert "关键文字字段冲突" in reason
 
 
-def test_金额一致但只有候选歧义也必须复核():
+def test_金额一致但存在候选歧义时自动形成疑点():
     candidate = _exact_candidate(is_ambiguous=True)
 
-    status, reason = route_candidate(candidate, MatcherConfig())
+    status, risk, reason = route_candidate(candidate, MatcherConfig())
 
-    assert status is ProcessingStatus.PENDING_REVIEW
+    assert status is ProcessingStatus.FLAGGED
+    assert risk is RiskLevel.LOW
     assert "候选歧义" in reason
 
 
-def test_候选歧义和文字冲突同时写入复核原因():
+def test_候选歧义和文字冲突同时写入疑点原因():
     candidate = _exact_candidate(
         is_ambiguous=True,
         text_evidence=TextEvidence(conflicting_fields=("对方账号",)),
     )
 
-    status, reason = route_candidate(candidate, MatcherConfig())
+    status, risk, reason = route_candidate(candidate, MatcherConfig())
 
-    assert status is ProcessingStatus.PENDING_REVIEW
+    assert status is ProcessingStatus.FLAGGED
+    assert risk is RiskLevel.LOW
     assert "候选歧义" in reason
     assert "对方账号" in reason
 

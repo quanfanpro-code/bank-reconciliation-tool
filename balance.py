@@ -151,17 +151,21 @@ class BalanceRecalculator:
             freq='D'
         )
 
-        first_date = all_dates[0].date()
-        first_day_net = daily_net_dict.get(first_date, Decimal('0'))
-
         # 使用局部变量，避免修改实例状态，保证方法可重入
         calculated_initial = self.initial_balance
-        if calculated_initial is None and 'balance' in df_sorted.columns:
+        if calculated_initial is None:
+            if 'balance' not in df_sorted.columns:
+                return []
+            usable_balances = df_sorted['balance'].dropna()
+            if not any(
+                str(value).strip()
+                and str(value).strip().lower() != 'nan'
+                and clean_amount(value, allow_suffix_sign=False) is not None
+                for value in usable_balances
+            ):
+                return []
             # 与 extract_initial_balance 同一套推断逻辑（容错解析并跳过空余额单元格）
             calculated_initial = self.extract_initial_balance(df_sorted)
-
-        if calculated_initial is None:
-            calculated_initial = Decimal('0')
 
         results = []
         prev_balance = calculated_initial
@@ -232,6 +236,13 @@ class BalanceReconciler:
             if bank_balance is None and journal_balance is None:
                 continue
 
+            if (
+                bank_balance is not None
+                and journal_balance is not None
+                and bank_balance == journal_balance
+            ):
+                continue
+
             diff_type = self.classify_diff(
                 bank_balance=bank_balance,
                 journal_balance=journal_balance,
@@ -273,12 +284,12 @@ class BalanceReconciler:
             journal_net: 日记账当日净额
 
         返回:
-            str: 差异类型 ('时间序错误'/'金额错误'/'缺失记录')
+            str: 中性的业务差异类型
         """
         if bank_balance is None or journal_balance is None:
-            return "缺失记录"
+            return "数据不足"
 
         if bank_net != journal_net:
-            return "金额错误"
+            return "发生额不一致"
 
-        return "时间序错误"
+        return "余额不一致"

@@ -98,24 +98,24 @@ class InputPrecheckReport:
 
     @property
     def has_blockers(self) -> bool:
-        return any(item.status == "阻止" for item in self.items)
+        return any(item.status == "无法计算" for item in self.items)
 
     @property
     def has_warnings(self) -> bool:
-        return any(item.status == "提示" for item in self.items)
+        return any(item.status == "疑点" for item in self.items)
 
     def blocker_message(self) -> str:
         return "\n".join(
             f"• {item.name}：{item.explanation}"
             for item in self.items
-            if item.status == "阻止"
+            if item.status == "无法计算"
         )
 
     def warning_message(self) -> str:
         return "\n".join(
             f"• {item.name}：{item.explanation}"
             for item in self.items
-            if item.status == "提示"
+            if item.status == "疑点"
         )
 
     def to_dataframe(self) -> pd.DataFrame:
@@ -579,6 +579,83 @@ def _auxiliary_result(
     return "；".join(parts), low
 
 
+def _scope_values(
+    frame: pd.DataFrame,
+    mapping: dict[str, Any],
+    identity: str,
+) -> tuple[str, set[str]]:
+    """提取核对账户或币种；缺失仅表示范围未验证，不妨碍继续计算。"""
+    column = None
+    for candidate in frame.columns:
+        name = _cell_text(candidate)
+        lowered = name.lower()
+        if identity == "account":
+            matched = (
+                "对方" not in name
+                and (
+                    "本方账号" in name
+                    or name in {"账号", "银行账号", "账户账号", "卡号"}
+                    or lowered in {"account", "account number", "account_number"}
+                )
+            )
+        else:
+            matched = (
+                "币种" in name
+                or "币别" in name
+                or lowered in {"currency", "currency code", "currency_code"}
+            )
+        if matched:
+            column = candidate
+            break
+    if column is None:
+        return "未提供", set()
+    transaction_rows = frame.loc[~_non_transaction_mask(frame, mapping)]
+    values = {
+        _cell_text(value).upper()
+        for value in transaction_rows[column]
+        if _cell_text(value)
+    }
+    if not values:
+        return f"{column}未提供有效值", set()
+    return f"{column}：{'、'.join(sorted(values))}", values
+
+
+def _scope_item(
+    *,
+    name: str,
+    identity: str,
+    raw_bank: pd.DataFrame,
+    raw_journal: pd.DataFrame,
+    bank_mapping: dict[str, Any],
+    journal_mapping: dict[str, Any],
+) -> PrecheckItem:
+    bank_result, bank_values = _scope_values(raw_bank, bank_mapping, identity)
+    journal_result, journal_values = _scope_values(raw_journal, journal_mapping, identity)
+    missing = not bank_values or not journal_values
+    mixed = len(bank_values) > 1 or len(journal_values) > 1
+    mismatch = bool(bank_values and journal_values and bank_values != journal_values)
+    if missing:
+        comparison = "范围身份未完全验证"
+        explanation = f"{name}字段缺失或无有效值；程序继续处理，并在报告中保留范围限制。"
+    elif mixed:
+        comparison = "单份文件存在多个取值"
+        explanation = f"{name}范围混合；程序继续处理可用交易，结论按范围受限披露。"
+    elif mismatch:
+        comparison = "双方不一致"
+        explanation = f"双方{name}不一致；程序继续处理可用交易，结论按范围受限披露。"
+    else:
+        comparison = "双方一致"
+        explanation = f"双方{name}一致。"
+    return PrecheckItem(
+        name=name,
+        bank_result=bank_result,
+        journal_result=journal_result,
+        comparison=comparison,
+        status="疑点" if missing or mixed or mismatch else "通过",
+        explanation=explanation,
+    )
+
+
 def build_input_precheck(
     *,
     raw_bank: pd.DataFrame,
@@ -591,7 +668,7 @@ def build_input_precheck(
     journal_structure: TableStructure,
     parse_errors: Sequence[dict[str, Any]] = (),
 ) -> InputPrecheckReport:
-    """对已读取和标准化的双方数据执行八项统一检查。"""
+    """对已读取和标准化的双方数据执行十一项统一检查。"""
     items = []
 
     file_blocked = raw_bank.empty or raw_journal.empty
@@ -601,7 +678,7 @@ def build_input_precheck(
             f"可读取，{len(raw_bank)}行" if not raw_bank.empty else "没有可核对数据",
             f"可读取，{len(raw_journal)}行" if not raw_journal.empty else "没有可核对数据",
             "双方均已读取" if not file_blocked else "至少一侧没有数据",
-            "阻止" if file_blocked else "通过",
+            "无法计算" if file_blocked else "通过",
             "文件没有可核对数据，请检查表头和数据区域。" if file_blocked else "文件可正常读取。",
         )
     )
@@ -614,9 +691,9 @@ def build_input_precheck(
         for structure in (bank_structure, journal_structure)
     )
     structure_status = (
-        "阻止"
+        "疑点"
         if bank_major or journal_major
-        else ("提示" if ambiguous or user_override else "通过")
+        else ("疑点" if ambiguous or user_override else "通过")
     )
     items.append(
         PrecheckItem(
@@ -635,7 +712,7 @@ def build_input_precheck(
             structure_status,
             (
                 "表头候选会改变必填列映射，请返回确认表头位置和层级。"
-                if structure_status == "阻止"
+                if bank_major or journal_major
                 else (
                     "当前采用用户设置的表头范围，与程序首选候选不同；列映射仍然有效。"
                     if user_override
@@ -657,14 +734,14 @@ def build_input_precheck(
         for error_type in ("日期解析失败", "空日期行")
     )
     if date_blocked:
-        date_status = "阻止"
+        date_status = "无法计算"
         date_explanation = "至少一侧日期全部无法解析，请检查日期列和日期格式。"
         date_comparison = "无法比较"
     else:
         bank_range = (bank_dates.min(), bank_dates.max())
         journal_range = (journal_dates.min(), journal_dates.max())
         mismatch = bank_range != journal_range
-        date_status = "提示" if mismatch or bank_date_errors or journal_date_errors else "通过"
+        date_status = "疑点" if mismatch or bank_date_errors or journal_date_errors else "通过"
         date_comparison = "范围一致" if not mismatch else "范围不完全一致"
         date_explanation = (
             f"少量日期或金额解析失败：银行流水日期{bank_date_errors}行，"
@@ -683,6 +760,27 @@ def build_input_precheck(
         )
     )
 
+    items.append(
+        _scope_item(
+            name="核对账户",
+            identity="account",
+            raw_bank=raw_bank,
+            raw_journal=raw_journal,
+            bank_mapping=bank_mapping,
+            journal_mapping=journal_mapping,
+        )
+    )
+    items.append(
+        _scope_item(
+            name="核对币种",
+            identity="currency",
+            raw_bank=raw_bank,
+            raw_journal=raw_journal,
+            bank_mapping=bank_mapping,
+            journal_mapping=journal_mapping,
+        )
+    )
+
     bank_direction_errors = _error_count(parse_errors, "bank", "方向解析失败")
     journal_direction_errors = _error_count(parse_errors, "journal", "方向解析失败")
     direction_blocked = bool(bank_direction_errors or journal_direction_errors)
@@ -692,7 +790,7 @@ def build_input_precheck(
             f"银行口径；无法识别{bank_direction_errors}行",
             f"日记账口径；无法识别{journal_direction_errors}行",
             "贷增借减 / 借增贷减",
-            "阻止" if direction_blocked else "通过",
+            "疑点" if direction_blocked else "通过",
             (
                 "方向列存在无法识别的值，收入和支出方向不可靠。"
                 if direction_blocked
@@ -707,14 +805,14 @@ def build_input_precheck(
     bank_amount_errors = _error_count(parse_errors, "bank", "金额解析失败")
     journal_amount_errors = _error_count(parse_errors, "journal", "金额解析失败")
     if amount_blocked:
-        amount_status = "阻止"
+        amount_status = "无法计算"
         amount_comparison = "无法比较"
         amount_explanation = "至少一侧金额全部无法解析，请检查金额列或借贷列。"
     else:
         income_diff = bank_totals[0] - journal_totals[0]
         expense_diff = bank_totals[1] - journal_totals[1]
         has_diff = income_diff != 0 or expense_diff != 0
-        amount_status = "提示" if has_diff or bank_amount_errors or journal_amount_errors else "通过"
+        amount_status = "疑点" if has_diff or bank_amount_errors or journal_amount_errors else "通过"
         amount_comparison = f"收入差额 {income_diff:.2f}；支出差额 {expense_diff:.2f}"
         amount_explanation = (
             f"少量日期或金额解析失败：银行流水金额{bank_amount_errors}行，"
@@ -742,8 +840,49 @@ def build_input_precheck(
             f"识别并排除{bank_non_transactions}行",
             f"识别并排除{journal_non_transactions}行",
             f"合计{bank_non_transactions + journal_non_transactions}行",
-            "提示" if has_non_transactions else "通过",
+            "疑点" if has_non_transactions else "通过",
             "检测到合计、累计、统计、标题、重复表头、注释或空行。" if has_non_transactions else "未发现混入数据区的非交易行。",
+        )
+    )
+
+    bank_parse_errors = sum(
+        1 for error in parse_errors if error.get("source_type") == "bank"
+    )
+    journal_parse_errors = sum(
+        1 for error in parse_errors if error.get("source_type") == "journal"
+    )
+    bank_unexplained = max(
+        0,
+        len(raw_bank) - len(bank) - bank_non_transactions,
+    )
+    journal_unexplained = max(
+        0,
+        len(raw_journal) - len(journal) - journal_non_transactions,
+    )
+    population_risk = bool(
+        bank_parse_errors
+        or journal_parse_errors
+        or bank_unexplained
+        or journal_unexplained
+    )
+    items.append(
+        PrecheckItem(
+            "数据人口",
+            (
+                f"原始{len(raw_bank)}行；有效交易{len(bank)}行；"
+                f"非交易{bank_non_transactions}行；解析异常{bank_parse_errors}行"
+            ),
+            (
+                f"原始{len(raw_journal)}行；有效交易{len(journal)}行；"
+                f"非交易{journal_non_transactions}行；解析异常{journal_parse_errors}行"
+            ),
+            "存在未完全解释的行" if population_risk else "行数去向可解释",
+            "疑点" if population_risk else "通过",
+            (
+                "程序已处理全部可用交易；解析或行数缺口作为范围限制披露。"
+                if population_risk
+                else "原始数据行已分为有效交易和非交易行。"
+            ),
         )
     )
 
@@ -756,7 +895,7 @@ def build_input_precheck(
             "完整" if not bank_mapping_problems else "；".join(bank_mapping_problems),
             "完整" if not journal_mapping_problems else "；".join(journal_mapping_problems),
             "双方完整" if not mapping_blocked else "存在缺失或无效映射",
-            "阻止" if mapping_blocked else "通过",
+            "无法计算" if mapping_blocked else "通过",
             "请返回选择当前金额模式所需的必填列。" if mapping_blocked else "当前金额模式所需字段完整。",
         )
     )
@@ -770,7 +909,7 @@ def build_input_precheck(
             bank_aux,
             journal_aux,
             "至少一侧偏低" if aux_low else "双方可用",
-            "提示" if aux_low else "通过",
+            "疑点" if aux_low else "通过",
             "摘要、对方户名等辅助文字非空率低于80%，文字匹配证据可能不足。" if aux_low else "辅助文字列可用。",
         )
     )

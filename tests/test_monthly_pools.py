@@ -7,6 +7,7 @@ from data_structures import (
     MatchCandidate,
     MatcherConfig,
     ProcessingStatus,
+    RiskLevel,
 )
 from matcher import Matcher
 from matching_policy import (
@@ -73,7 +74,7 @@ def test_同月四类差异分别累计且收入支出不抵销():
     ] == PrecisionEngine.to_integer_li("1000")
 
 
-def test_单池累计超过实际执行重要性时只形成一项整池待复核():
+def test_单池累计超过实际执行重要性时只升级为高风险():
     candidates = [
         _candidate(
             f"C{index:02d}",
@@ -84,8 +85,9 @@ def test_单池累计超过实际执行重要性时只形成一项整池待复�
         for index in range(21)
     ]
     for candidate in candidates:
-        candidate.processing_status = ProcessingStatus.AUTO_CONFIRMED
-        candidate.processing_reason = "明显微小错报自动处理"
+        candidate.processing_status = ProcessingStatus.AUTO_CLASSIFIED
+        candidate.risk_level = RiskLevel.LOW
+        candidate.processing_reason = "自动归集低风险差异"
 
     pools = apply_monthly_difference_pools(
         candidates,
@@ -100,23 +102,24 @@ def test_单池累计超过实际执行重要性时只形成一项整池待复�
     assert len(over_limit) == 1
     assert (
         over_limit[0].processing_status
-        is ProcessingStatus.PENDING_REVIEW
+        is ProcessingStatus.AUTO_CLASSIFIED
     )
+    assert over_limit[0].risk_level is RiskLevel.HIGH
     assert len(over_limit[0].components) == 21
     assert all(
-        component.included_in_pool_review
+        component.included_in_risk_pool
         for component in over_limit[0].components
     )
     assert all(
-        candidate.evidence["included_in_pool_review"] is True
+        candidate.evidence["included_in_risk_pool"] is True
         for candidate in candidates
     )
     assert all(
-        candidate.processing_status is ProcessingStatus.PENDING_REVIEW
+        candidate.processing_status is ProcessingStatus.AUTO_CLASSIFIED
         for candidate in candidates
     )
     assert all(
-        candidate.processing_reason == "纳入月度差异池整池复核"
+        candidate.risk_level is RiskLevel.HIGH
         for candidate in candidates
     )
 
@@ -139,7 +142,8 @@ def test_单池累计刚好等于实际执行重要性水平不算超过():
 
     assert pool.total_diff_li == PrecisionEngine.to_integer_li("100000")
     assert pool.exceeds_performance_materiality is False
-    assert pool.processing_status is ProcessingStatus.AUTO_CONFIRMED
+    assert pool.processing_status is ProcessingStatus.AUTO_CLASSIFIED
+    assert pool.risk_level is RiskLevel.MEDIUM
 
 
 def test_不同自然月的同类差异不能合并累计():
@@ -205,8 +209,9 @@ def test_真实匹配会生成金额差异候选并进入对应月度池():
     assert matcher.selected_candidates[0].match_type == "amount_difference"
     assert (
         matcher.selected_candidates[0].processing_status
-        is ProcessingStatus.AUTO_CONFIRMED
+        is ProcessingStatus.AUTO_CLASSIFIED
     )
+    assert matcher.selected_candidates[0].risk_level is RiskLevel.LOW
     assert len(matcher.difference_pools) == 1
     assert (
         matcher.difference_pools[0].pool_type

@@ -32,8 +32,20 @@ class ProcessingStatus(str, Enum):
     """核对结果的最终处理状态。"""
 
     AUTO_CONFIRMED = "自动确认"
-    PENDING_REVIEW = "待人工复核"
+    GROUP_RECONCILED = "整组勾稽一致"
+    AUTO_CLASSIFIED = "自动归集事项"
+    FLAGGED = "疑点事项"
     NO_CANDIDATE = "未找到候选"
+
+
+class RiskLevel(str, Enum):
+    """程序自动评定的业务风险等级。"""
+
+    NORMAL = "正常"
+    LOW = "低风险"
+    MEDIUM = "中风险"
+    HIGH = "高风险"
+    UNKNOWN = "范围未知"
 
 
 class DifferencePoolType(str, Enum):
@@ -130,7 +142,8 @@ class MatchCandidate:
     is_cross_month_many_to_many: bool = False
     is_ambiguous: bool = False
     rule_matched: bool = False
-    processing_status: ProcessingStatus = ProcessingStatus.PENDING_REVIEW
+    processing_status: ProcessingStatus = ProcessingStatus.FLAGGED
+    risk_level: RiskLevel = RiskLevel.NORMAL
     processing_reason: str = ""
     final_match_id: str = ""
     text_evidence: Optional[TextEvidence] = None
@@ -146,7 +159,7 @@ class DifferenceComponent:
     pool_type: DifferencePoolType
     candidate_id: str
     diff_li: int
-    included_in_pool_review: bool = False
+    included_in_risk_pool: bool = False
 
 
 @dataclass
@@ -159,7 +172,8 @@ class DifferencePoolResult:
     total_diff_li: int = 0
     components: List[DifferenceComponent] = field(default_factory=list)
     exceeds_performance_materiality: bool = False
-    processing_status: ProcessingStatus = ProcessingStatus.AUTO_CONFIRMED
+    processing_status: ProcessingStatus = ProcessingStatus.AUTO_CLASSIFIED
+    risk_level: RiskLevel = RiskLevel.NORMAL
     processing_reason: str = ""
 
 

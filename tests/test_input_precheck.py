@@ -267,8 +267,8 @@ def test_日期范围与收支合计分别比较且只提示():
     date_item = next(item for item in report.items if item.name == "日期范围")
     amount_item = next(item for item in report.items if item.name == "金额合计")
     assert report.has_blockers is False
-    assert date_item.status == "提示"
-    assert amount_item.status == "提示"
+    assert date_item.status == "疑点"
+    assert amount_item.status == "疑点"
     assert amount_item.bank_result == "收入 100.00；支出 30.00"
     assert amount_item.journal_result == "收入 80.00；支出 20.00"
     assert amount_item.comparison == "收入差额 20.00；支出差额 10.00"
@@ -298,7 +298,7 @@ def test_用户表头设置不同于首选但映射有效时只提示():
 
     item = next(item for item in report.items if item.name == "表格结构")
     assert report.has_blockers is False
-    assert item.status == "提示"
+    assert item.status == "疑点"
     assert "用户设置" in item.explanation
 
 
@@ -332,9 +332,9 @@ def test_无效方向与必填列缺失会阻止运行():
     )
 
     assert report.has_blockers is True
-    assert next(item for item in report.items if item.name == "金额方向").status == "阻止"
-    assert next(item for item in report.items if item.name == "必填字段").status == "阻止"
-    assert "方向" in report.blocker_message()
+    assert next(item for item in report.items if item.name == "金额方向").status == "疑点"
+    assert next(item for item in report.items if item.name == "必填字段").status == "无法计算"
+    assert "必填字段" in report.blocker_message()
 
 
 def test_少量解析异常非交易行和低文字非空率只提示():
@@ -366,8 +366,8 @@ def test_少量解析异常非交易行和低文字非空率只提示():
     )
 
     assert report.has_blockers is False
-    assert next(item for item in report.items if item.name == "非交易行").status == "提示"
-    assert next(item for item in report.items if item.name == "辅助文字完整性").status == "提示"
+    assert next(item for item in report.items if item.name == "非交易行").status == "疑点"
+    assert next(item for item in report.items if item.name == "辅助文字完整性").status == "疑点"
     assert "少量日期或金额解析失败" in report.warning_message()
 
 
@@ -389,7 +389,7 @@ def test_无法沿用日期的空日期交易行会在预检查中提示():
     )
 
     date_item = next(item for item in report.items if item.name == "日期范围")
-    assert date_item.status == "提示"
+    assert date_item.status == "疑点"
     assert "银行流水日期1行" in date_item.explanation
 
 
@@ -443,8 +443,8 @@ def test_日期或金额全部无可用记录会阻止():
     report = _build_report(raw, raw, empty, empty)
 
     assert report.has_blockers is True
-    assert next(item for item in report.items if item.name == "日期范围").status == "阻止"
-    assert next(item for item in report.items if item.name == "金额合计").status == "阻止"
+    assert next(item for item in report.items if item.name == "日期范围").status == "无法计算"
+    assert next(item for item in report.items if item.name == "金额合计").status == "无法计算"
 
 
 def test_检查结果可直接转换为固定列报告表():
@@ -472,9 +472,12 @@ def test_检查结果可直接转换为固定列报告表():
         "文件读取",
         "表格结构",
         "日期范围",
+        "核对账户",
+        "核对币种",
         "金额方向",
         "金额合计",
         "非交易行",
+        "数据人口",
         "必填字段",
         "辅助文字完整性",
     ]
@@ -542,29 +545,69 @@ def test_无界面入口遇到无效方向会阻止且不创建报告(tmp_path):
     assert not output_path.exists()
 
 
-def test_普通提示回调可以返回调整且不创建报告(tmp_path):
+def test_业务疑点不再调用确认回调且仍生成报告(tmp_path):
     bank_path, journal_path, mapping = _write_direction_pair(
         tmp_path,
         bank_amount=100,
         journal_amount=90,
     )
-    output_path = tmp_path / "用户已返回调整.xlsx"
+    output_path = tmp_path / "自动完成.xlsx"
     received = []
 
-    with pytest.raises(InterruptedError, match="返回调整"):
-        run_reconciliation(
-            bank_path=str(bank_path),
-            journal_path=str(journal_path),
-            bank_mapping=mapping,
-            journal_mapping=mapping,
-            matcher_config=MatcherConfig(),
-            output_path=output_path,
-            precheck_warning_callback=lambda report: received.append(report) or False,
-        )
+    run_reconciliation(
+        bank_path=str(bank_path),
+        journal_path=str(journal_path),
+        bank_mapping=mapping,
+        journal_mapping=mapping,
+        matcher_config=MatcherConfig(),
+        output_path=output_path,
+        precheck_warning_callback=lambda report: received.append(report) or False,
+    )
 
-    assert len(received) == 1
-    assert received[0].has_warnings is True
-    assert not output_path.exists()
+    assert received == []
+    assert output_path.exists()
+
+
+def test_预检查只使用通过疑点和无法计算三种状态():
+    raw_bank = pd.DataFrame(
+        [{"日期": "2026-01-01", "金额": 100, "摘要": "收款"}]
+    )
+    raw_journal = pd.DataFrame(
+        [{"日期": "2026-01-02", "金额": 90, "摘要": "收款"}]
+    )
+    report = _build_report(
+        raw_bank,
+        raw_journal,
+        _standardized([("2026-01-01", 100, "收款")], "bank"),
+        _standardized([("2026-01-02", 90, "收款")], "journal"),
+    )
+
+    assert {item.status for item in report.items} <= {"通过", "疑点", "无法计算"}
+    assert report.has_blockers is False
+
+
+def test_账户币种冲突形成范围疑点但不阻止计算():
+    raw_bank = pd.DataFrame(
+        [
+            {"日期": "2026-01-01", "金额": 100, "摘要": "收款", "本方账号": "A1", "币种": "CNY"},
+            {"日期": "2026-01-02", "金额": 20, "摘要": "收款", "本方账号": "A2", "币种": "CNY"},
+        ]
+    )
+    raw_journal = pd.DataFrame(
+        [{"日期": "2026-01-01", "金额": 100, "摘要": "收款", "本方账号": "A1", "币种": "USD"}]
+    )
+    report = _build_report(
+        raw_bank,
+        raw_journal,
+        _standardized([("2026-01-01", 100, "收款"), ("2026-01-02", 20, "收款")], "bank"),
+        _standardized([("2026-01-01", 100, "收款")], "journal"),
+    )
+
+    account = next(item for item in report.items if item.name == "核对账户")
+    currency = next(item for item in report.items if item.name == "核对币种")
+    assert account.status == "疑点"
+    assert currency.status == "疑点"
+    assert report.has_blockers is False
 
 
 def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_path):
@@ -583,8 +626,8 @@ def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_
     )
 
     assert result == output_path
-    assert "输入预检查" in pd.ExcelFile(output_path).sheet_names
-    table = pd.read_excel(output_path, sheet_name="输入预检查")
+    assert "输入检查" in pd.ExcelFile(output_path).sheet_names
+    table = pd.read_excel(output_path, sheet_name="输入检查")
     business_columns = [
         column for column in table.columns if not str(column).startswith("Unnamed:")
     ]
@@ -597,7 +640,7 @@ def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_
         "说明",
     ]
     assert table.loc[table["检查项目"] == "金额合计", "状态"].item() == "通过"
-    assert "输入预检查通过" in logs
+    assert any("程序已自动继续" in message for message in logs)
 
 
 class _Variable:

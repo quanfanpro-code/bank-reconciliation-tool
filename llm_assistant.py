@@ -31,7 +31,7 @@ REQUIRED_DECISION_KEYS = frozenset(
     }
 )
 ALLOWED_SUGGESTED_STATUSES = frozenset(
-    {"自动确认", "待人工复核", "未找到候选", ""}
+    {"自动确认", "整组勾稽一致", "自动归集事项", "疑点事项", "未找到候选", ""}
 )
 
 

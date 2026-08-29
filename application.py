@@ -39,7 +39,7 @@ def _blocked_report(
                 bank_result="未通过",
                 journal_result="未通过",
                 comparison="无法进入正式匹配",
-                status="阻止",
+                status="无法计算",
                 explanation=explanation,
             ),
         ),
@@ -202,12 +202,10 @@ def run_reconciliation(
     if precheck_report.has_blockers:
         raise InputPrecheckBlockedError(precheck_report)
     if precheck_report.has_warnings:
-        log("输入预检查提示：\n" + precheck_report.warning_message())
-        if (
-            precheck_warning_callback is not None
-            and not precheck_warning_callback(precheck_report)
-        ):
-            raise InterruptedError("用户返回调整输入")
+        log(
+            "输入预检查发现疑点，程序已自动继续并将在报告中披露：\n"
+            + precheck_report.warning_message()
+        )
     else:
         log("输入预检查通过")
     if progress_callback:

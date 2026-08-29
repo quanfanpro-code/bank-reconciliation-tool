@@ -13,6 +13,7 @@ from data_structures import (
     MatchCandidate,
     MatcherConfig,
     ProcessingStatus,
+    RiskLevel,
     ScoreBreakdown,
     TextEvidence,
 )
@@ -300,36 +301,62 @@ def build_group_metrics(
     )
 
 
+def risk_level_for(
+    impact_li: int,
+    config: MatcherConfig,
+    *,
+    unquantifiable: bool = False,
+    qualitative_high: bool = False,
+) -> RiskLevel:
+    """按两个重要性阈值自动划分风险，不产生等待人工状态。"""
+    if unquantifiable:
+        return RiskLevel.UNKNOWN
+    if qualitative_high:
+        return RiskLevel.HIGH
+    if impact_li <= 0:
+        return RiskLevel.NORMAL
+    trivial_li = PrecisionEngine.to_integer_li(config.clearly_trivial_threshold)
+    performance_li = PrecisionEngine.to_integer_li(config.performance_materiality)
+    if impact_li <= trivial_li:
+        return RiskLevel.LOW
+    if impact_li <= performance_li:
+        return RiskLevel.MEDIUM
+    return RiskLevel.HIGH
+
+
 def route_candidate(
     candidate: MatchCandidate,
     config: MatcherConfig,
-) -> tuple[ProcessingStatus, str]:
-    """按更严格规则优先确定候选的最终处理状态。"""
-    performance_li = PrecisionEngine.to_integer_li(config.performance_materiality)
-    trivial_li = PrecisionEngine.to_integer_li(config.clearly_trivial_threshold)
-
-    if candidate.metrics.group_amount_li > performance_li:
-        return (
-            ProcessingStatus.PENDING_REVIEW,
-            "匹配组金额超过实际执行重要性水平",
-        )
-    if candidate.is_cross_month_many_to_many:
-        return ProcessingStatus.PENDING_REVIEW, "跨月多对多必须人工复核"
-    review_reasons: list[str] = []
+) -> tuple[ProcessingStatus, RiskLevel, str]:
+    """自动确定关系状态和风险等级，业务疑点不阻断处理。"""
+    reasons: list[str] = []
     if candidate.text_evidence and candidate.text_evidence.conflicting_fields:
         fields = "、".join(candidate.text_evidence.conflicting_fields)
-        review_reasons.append(f"关键文字字段冲突：{fields}")
+        reasons.append(f"关键文字字段冲突：{fields}")
     if candidate.is_ambiguous:
-        review_reasons.append("候选歧义")
-    if review_reasons:
-        return ProcessingStatus.PENDING_REVIEW, "；".join(review_reasons)
-    if candidate.metrics.total_diff_li == 0:
-        return ProcessingStatus.AUTO_CONFIRMED, "金额完全一致"
-    if candidate.metrics.total_diff_li <= trivial_li:
-        return ProcessingStatus.AUTO_CONFIRMED, "明显微小错报自动处理"
-    if candidate.scores.total >= config.auto_confirm_score:
-        return ProcessingStatus.AUTO_CONFIRMED, "综合可信度达到自动确认门槛"
-    return ProcessingStatus.PENDING_REVIEW, "综合可信度未达到自动确认门槛"
+        reasons.append("候选歧义")
+    if candidate.is_cross_month_many_to_many:
+        reasons.append("跨月多对多")
+
+    has_relationship_risk = bool(reasons)
+    if candidate.evidence.get("resolves_full_group", False):
+        status = ProcessingStatus.GROUP_RECONCILED
+        reasons.insert(0, "交易组收支分别闭合")
+    elif candidate.metrics.total_diff_li > 0:
+        status = ProcessingStatus.AUTO_CLASSIFIED
+        reasons.insert(0, "存在可量化金额差异")
+    elif has_relationship_risk:
+        status = ProcessingStatus.FLAGGED
+    else:
+        return ProcessingStatus.AUTO_CONFIRMED, RiskLevel.NORMAL, "金额完全一致且关系明确"
+
+    impact_li = (
+        candidate.metrics.group_amount_li
+        if has_relationship_risk
+        else candidate.metrics.total_diff_li
+    )
+    risk = risk_level_for(impact_li, config)
+    return status, risk, "；".join(reasons)
 
 
 def bucket_distribution(amounts_li: Sequence[int]) -> tuple[int, ...]:
@@ -423,9 +450,6 @@ def apply_monthly_difference_pools(
     config: MatcherConfig,
 ) -> list[DifferencePoolResult]:
     """按自然月和四种来源方向累计明显微小错报。"""
-    trivial_li = PrecisionEngine.to_integer_li(
-        config.clearly_trivial_threshold
-    )
     performance_li = PrecisionEngine.to_integer_li(
         config.performance_materiality
     )
@@ -437,14 +461,8 @@ def apply_monthly_difference_pools(
         candidate.candidate_id: candidate for candidate in candidates
     }
     for candidate in candidates:
-        candidate.evidence.setdefault("included_in_pool_review", False)
+        candidate.evidence.setdefault("included_in_risk_pool", False)
         if candidate.metrics.total_diff_li <= 0:
-            continue
-        if candidate.metrics.total_diff_li > trivial_li:
-            continue
-        if candidate.metrics.group_amount_li > performance_li:
-            continue
-        if candidate.is_cross_month_many_to_many:
             continue
         for component in build_difference_components(candidate):
             key = (component.month, component.pool_type)
@@ -465,35 +483,32 @@ def apply_monthly_difference_pools(
         pools.values(),
         key=lambda pool: (pool.month, pool.pool_type.value),
     )
+    risk_order = {
+        RiskLevel.NORMAL: 0,
+        RiskLevel.LOW: 1,
+        RiskLevel.MEDIUM: 2,
+        RiskLevel.HIGH: 3,
+        RiskLevel.UNKNOWN: 4,
+    }
     for pool in results:
         pool.exceeds_performance_materiality = (
             pool.total_diff_li > performance_li
         )
-        if pool.exceeds_performance_materiality:
-            pool.processing_status = ProcessingStatus.PENDING_REVIEW
-            pool.processing_reason = "月度累计超出实际执行重要性水平"
-            for component in pool.components:
-                component.included_in_pool_review = True
-                matched_candidate = candidate_by_id.get(
-                    component.candidate_id
-                )
-                if matched_candidate is not None:
-                    matched_candidate.evidence[
-                        "included_in_pool_review"
-                    ] = True
-                    matched_candidate.processing_status = (
-                        ProcessingStatus.PENDING_REVIEW
-                    )
-                    matched_candidate.processing_reason = (
-                        "纳入月度差异池整池复核"
-                    )
-                    pool_ids = matched_candidate.evidence.setdefault(
-                        "difference_pool_ids",
-                        [],
-                    )
-                    if pool.pool_id not in pool_ids:
-                        pool_ids.append(pool.pool_id)
-        else:
-            pool.processing_status = ProcessingStatus.AUTO_CONFIRMED
-            pool.processing_reason = "月度累计未超过实际执行重要性水平"
+        pool.processing_status = ProcessingStatus.AUTO_CLASSIFIED
+        pool.risk_level = risk_level_for(pool.total_diff_li, config)
+        pool.processing_reason = f"月度累计评定为{pool.risk_level.value}"
+        for component in pool.components:
+            component.included_in_risk_pool = True
+            matched_candidate = candidate_by_id.get(component.candidate_id)
+            if matched_candidate is None:
+                continue
+            matched_candidate.evidence["included_in_risk_pool"] = True
+            if risk_order[pool.risk_level] > risk_order[matched_candidate.risk_level]:
+                matched_candidate.risk_level = pool.risk_level
+            pool_ids = matched_candidate.evidence.setdefault(
+                "difference_pool_ids",
+                [],
+            )
+            if pool.pool_id not in pool_ids:
+                pool_ids.append(pool.pool_id)
     return results

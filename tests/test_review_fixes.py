@@ -197,8 +197,8 @@ def test_期初警告_无余额数据时跳过(tmp_path):
     reporter.generate_report(str(out), config=MatcherConfig())
 
     assert reporter.initial_balance_warning.has_warning is False
-    texts = [str(v) for row in _read_sheet_rows(out, "核对汇总") for v in row]
-    assert any("跳过期初核对" in t for t in texts)
+    texts = [str(v) for row in _read_sheet_rows(out, "核对结论") for v in row]
+    assert any("余额核对未实施" in t for t in texts)
 
 
 def test_余额连续性异常sheet会生成(tmp_path):
@@ -246,12 +246,12 @@ def test_汇总表数值项为数字类型(tmp_path):
     reporter.generate_report(str(out), config=MatcherConfig())
 
     wb = load_workbook(out)
-    ws = wb["核对汇总"]
+    ws = wb["核对结论"]
     label_value = {}
     for row in ws.iter_rows(min_col=2, max_col=3, values_only=True):
         label_value[row[0]] = row[1]
-    assert isinstance(label_value["银行流水总笔数"], (int, float))
-    assert isinstance(label_value["银行流水总金额"], (int, float))
+    assert isinstance(label_value["银行有效交易笔数"], (int, float))
+    assert isinstance(label_value["日记账有效交易笔数"], (int, float))
 
 
 def test_匹配明细按日期金额排序可复现(tmp_path):
@@ -279,7 +279,7 @@ def test_匹配明细按日期金额排序可复现(tmp_path):
     out = tmp_path / "r.xlsx"
     reporter.generate_report(str(out), config=MatcherConfig())
 
-    rows = _read_sheet_rows(out, "匹配明细")
+    rows = _read_sheet_rows(out, "逐笔匹配")
     header = rows[0]
     date_col = header.index("银_日期")
     dates = [r[date_col] for r in rows[1:]]
@@ -305,10 +305,15 @@ def test_期初警告涂色不覆盖表头(tmp_path):
     assert reporter.initial_balance_warning.has_warning is True
 
     wb = load_workbook(out)
-    ws = wb["核对汇总"]
+    ws = wb["核对结论"]
     header_fill = ws.cell(row=1, column=2).fill
     assert header_fill.start_color.rgb != "00FFFF00" and header_fill.start_color.rgb != "FFFFFF00"
-    assert ws.cell(row=2, column=2).fill.start_color.rgb in ("00FFFF00", "FFFFFF00")
+    warning_row = next(
+        row
+        for row in range(2, ws.max_row + 1)
+        if "期初余额" in str(ws.cell(row=row, column=2).value or "")
+    )
+    assert ws.cell(row=warning_row, column=3).fill.start_color.rgb in ("00FFFF00", "FFFFFF00")
 
 
 # ==========================================
@@ -448,7 +453,7 @@ def test_汇总表期初余额为数值类型(tmp_path):
     reporter.generate_report(str(out), config=MatcherConfig())
 
     found = 0
-    for row in _read_sheet_rows(out, "核对汇总"):
+    for row in _read_sheet_rows(out, "核对结论"):
         for i, v in enumerate(row[:-1]):
             if isinstance(v, str) and v in ("银行期初余额", "日记账期初余额", "期初余额差额"):
                 cell_val = row[i + 1]

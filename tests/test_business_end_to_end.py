@@ -89,7 +89,7 @@ def _numeric_metric(summary, name):
     return float(values.iloc[0])
 
 
-def test_完整核对流程同时产生自动确认整池复核和未找到候选(
+def test_完整核对流程自动形成结论风险分级和待查事项(
     tmp_path,
 ):
     bank_path, journal_path, mapping = _build_business_workbooks(
@@ -107,24 +107,22 @@ def test_完整核对流程同时产生自动确认整池复核和未找到候�
         ),
     )
 
-    summary = pd.read_excel(output_path, sheet_name="核对汇总")
-    pending = pd.read_excel(output_path, sheet_name="待人工复核")
-    groups = pd.read_excel(output_path, sheet_name="匹配明细")
-    unmatched = pd.read_excel(output_path, sheet_name="银行未达")
+    summary = pd.read_excel(output_path, sheet_name="核对结论")
+    pending = pd.read_excel(output_path, sheet_name="疑点事项")
+    groups = pd.concat(
+        [
+            pd.read_excel(output_path, sheet_name="逐笔匹配"),
+            pd.read_excel(output_path, sheet_name="整组勾稽"),
+        ],
+        ignore_index=True,
+    )
+    unmatched = pd.read_excel(output_path, sheet_name="银行侧待查")
 
-    assert 0 <= _numeric_metric(summary, "精确匹配率") <= 1
-    assert 0 <= _numeric_metric(summary, "自动处理率") <= 1
-    assert "自动确认" in set(groups["最终状态"])
-    assert "月度累计超出实际执行重要性水平" in set(
-        pending["原因"]
-    )
-    assert "重大设备采购" in set(
-        pending.loc[pending["事项类型"] == "匹配组", "原因"].map(
-            lambda value: "重大设备采购"
-            if "超过实际执行重要性水平" in str(value)
-            else ""
-        )
-    )
+    assert 0 <= _numeric_metric(summary, "逐笔精确匹配率") <= 1
+    assert 0 <= _numeric_metric(summary, "自动完成率") <= 1
+    assert "自动确认" in set(groups["系统结论"])
+    assert "高风险" in set(pending["风险等级"])
+    assert pending["系统结论"].notna().all()
     assert "银行独有记录" in set(unmatched["摘要"])
 
 

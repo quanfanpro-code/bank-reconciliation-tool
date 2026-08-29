@@ -268,7 +268,7 @@ def test_普通一对一跨月但在日期容差内可以自动确认():
     )
 
 
-def test_跨月多对多即使合计一致也只能待人工复核():
+def test_跨月多对多合计一致时自动形成整组勾稽():
     bank = _std_df(
         [
             ("2026-01-31", 60, {"摘要": "项目回款"}),
@@ -291,7 +291,7 @@ def test_跨月多对多即使合计一致也只能待人工复核():
     ]
 
     assert len(groups) == 1
-    assert groups[0].processing_status is ProcessingStatus.PENDING_REVIEW
+    assert groups[0].processing_status is ProcessingStatus.GROUP_RECONCILED
 
 
 def test_一坨做账组合存在微小金额差异时仍可自动形成整组():
@@ -319,7 +319,7 @@ def test_一坨做账组合存在微小金额差异时仍可自动形成整组()
     )
     assert (
         candidate.processing_status
-        is ProcessingStatus.AUTO_CONFIRMED
+        is ProcessingStatus.AUTO_CLASSIFIED
     )
 
 
@@ -531,7 +531,7 @@ class _FakeAssistant:
         )
 
 
-def test_大模型不能把超过实际执行重要性水平的候选改成自动确认():
+def test_重大歧义不调用大模型且自动形成高风险疑点():
     assistant = _FakeAssistant()
     bank = _std_df(
         [("2026-01-05", 120000, {"摘要": "甲公司设备款"})]
@@ -554,8 +554,9 @@ def test_大模型不能把超过实际执行重要性水平的候选改成自�
     assert assistant.requests == []
     assert (
         matcher.selected_candidates[0].processing_status
-        is ProcessingStatus.PENDING_REVIEW
+        is ProcessingStatus.FLAGGED
     )
+    assert matcher.selected_candidates[0].risk_level.value == "高风险"
 
 
 def test_大模型超时后使用本地评分且核对继续():
