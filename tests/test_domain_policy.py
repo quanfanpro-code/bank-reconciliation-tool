@@ -159,6 +159,10 @@ def test_大额交易的小差异按差异金额自动分级():
 
 def test_组金额刚好等于实际执行重要性水平不算超过():
     candidate = _candidate(group_amount="100000", total_diff="0", score=100)
+    candidate.evidence.update({
+        "business_strength": 3,
+        "business_basis": "明确业务编号及对方共同对应",
+    })
 
     status, risk, _ = _policy().route_candidate(candidate, ds.MatcherConfig())
 

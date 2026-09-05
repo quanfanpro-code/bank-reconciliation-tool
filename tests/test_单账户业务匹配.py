@@ -108,13 +108,14 @@ def test_同额两对一仍有竞争组成():
     assert c.evidence["alternative_candidate_ids"]
 
 
-def test_同额两对两保留整组一致():
+def test_同额两对两仅有宽泛摘要和主体不得整组确认():
     行 = [记录(100, "收款", "甲公司"), 记录(100, "收款", "甲公司")]
     m = 核对(行, 行)
     assert len(m.selected_candidates) == 1
     c = m.selected_candidates[0]
     assert (c.bank_idxs, c.journal_idxs) == ((0, 1), (0, 1))
-    assert c.processing_status is ProcessingStatus.GROUP_RECONCILED
+    assert c.processing_status is ProcessingStatus.FLAGGED
+    assert c.evidence.get("total_only_without_boundary") is True
 
 
 def test_工资双方实际主体不同仍是冲突():
@@ -167,7 +168,9 @@ def test_同日同额两批工资对无批次汇总保留整批竞争():
 def test_两个业务各差十元不能以合计相等抵销():
     m = 核对([记录(-1000, "项目款", 编号="A"), 记录(-1000, "项目款", 编号="B")],
              [记录(-990, "项目款", 编号="A"), 记录(-1010, "项目款", 编号="B")])
-    assert [(c.bank_idxs, c.journal_idxs) for c in m.selected_candidates] == [((0,), (0,)), ((1,), (1,))]
+    assert {
+        (c.bank_idxs, c.journal_idxs) for c in m.selected_candidates
+    } == {((0,), (0,)), ((1,), (1,))}
     assert all(c.metrics.total_diff_li == PrecisionEngine.to_integer_li(10)
                and c.processing_status is ProcessingStatus.AUTO_CLASSIFIED for c in m.selected_candidates)
 

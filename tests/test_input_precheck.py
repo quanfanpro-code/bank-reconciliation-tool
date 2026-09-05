@@ -471,11 +471,13 @@ def test_检查结果可直接转换为固定列报告表():
     assert table["检查项目"].tolist() == [
         "文件读取",
         "表格结构",
-        "日期范围",
-        "核对账户",
-        "核对币种",
+            "日期范围",
+            "核对账户",
+            "核对币种",
+            "金额口径",
         "金额方向",
         "金额合计",
+        "总体余额控制",
         "非交易行",
         "数据人口",
         "必填字段",
@@ -586,7 +588,7 @@ def test_预检查只使用通过疑点和无法计算三种状态():
     assert report.has_blockers is False
 
 
-def test_账户币种冲突形成范围疑点但不阻止计算():
+def test_账户币种明确冲突形成硬阻断():
     raw_bank = pd.DataFrame(
         [
             {"日期": "2026-01-01", "金额": 100, "摘要": "收款", "本方账号": "A1", "币种": "CNY"},
@@ -605,9 +607,9 @@ def test_账户币种冲突形成范围疑点但不阻止计算():
 
     account = next(item for item in report.items if item.name == "核对账户")
     currency = next(item for item in report.items if item.name == "核对币种")
-    assert account.status == "疑点"
-    assert currency.status == "疑点"
-    assert report.has_blockers is False
+    assert account.status == "无法计算"
+    assert currency.status == "无法计算"
+    assert report.has_blockers is True
 
 
 def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_path):

@@ -45,19 +45,26 @@ def _report_df(date, amounts, source, summaries=None):
 
 
 def _three_vs_five_reporter():
+    bank = _report_df(
+        "2026-01-15",
+        [200, 200, 100],
+        "bank",
+        ["销售回款"] * 3,
+    )
+    journal = _report_df(
+        "2026-01-15",
+        [100, 100, 100, 100, 100],
+        "journal",
+        ["销售回款"] * 5,
+    )
+    for frame in (bank, journal):
+        frame["aux_text_fields"] = [
+            {**fields, "批次号": "SALE-202601-01"}
+            for fields in frame["aux_text_fields"]
+        ]
     matcher = Matcher(
-        _report_df(
-            "2026-01-15",
-            [200, 200, 100],
-            "bank",
-            ["销售回款"] * 3,
-        ),
-        _report_df(
-            "2026-01-15",
-            [100, 100, 100, 100, 100],
-            "journal",
-            ["销售回款"] * 5,
-        ),
+        bank,
+        journal,
         MatcherConfig(),
     )
     matcher.run()

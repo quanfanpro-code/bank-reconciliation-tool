@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+import unicodedata
+import json
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -11,6 +13,9 @@ from statistics import pstdev
 from typing import Any, Iterable, Sequence
 
 import pandas as pd
+
+from data_structures import OverallControlResult
+from utils import clean_excel_string
 
 
 SUPPORTED_SUFFIXES = {".xlsx", ".xls", ".csv"}
@@ -95,6 +100,10 @@ class InputPrecheckReport:
     """本次核对的全部输入检查结果。"""
 
     items: tuple[PrecheckItem, ...]
+    source_info: tuple[dict[str, Any], ...] = ()
+    population_rows: tuple[dict[str, Any], ...] = ()
+    overall_control: OverallControlResult | None = None
+    parse_errors: tuple[dict[str, Any], ...] = ()
 
     @property
     def has_blockers(self) -> bool:
@@ -131,13 +140,73 @@ class InputPrecheckReport:
             ),
         )
 
+    def source_dataframe(self) -> pd.DataFrame:
+        columns = (
+            "来源", "文件路径", "文件SHA256", "文件大小", "工作表",
+            "表头起始行", "表头行数", "采用映射",
+        )
+        return pd.DataFrame(list(self.source_info), columns=columns)
+
+    def population_dataframe(self) -> pd.DataFrame:
+        columns = (
+            "来源", "原文件行号", "唯一处置类别", "处置原因", "原日期列名",
+            "原日期值", "原金额列名", "原金额值", "原方向列名", "原方向值",
+            "原始可解析净额", "金额去向说明", "标准化净额", "进入匹配", "账户原值", "币种原值",
+        )
+        return pd.DataFrame(list(self.population_rows), columns=columns)
+
 
 class InputPrecheckBlockedError(ValueError):
     """输入存在硬错误，正式匹配不得开始。"""
 
-    def __init__(self, report: InputPrecheckReport):
+    def __init__(
+        self,
+        report: InputPrecheckReport,
+        report_path: str | Path | None = None,
+        report_write_error: str | None = None,
+    ):
         self.report = report
+        self.report_path = str(report_path) if report_path else None
+        self.problem_report_path = self.report_path
+        self.report_write_error = report_write_error
         super().__init__(report.blocker_message() or "输入预检查未通过")
+
+
+def write_input_problem_report(
+    report: InputPrecheckReport,
+    output_path: str | Path,
+) -> Path:
+    """在正式匹配前写出独立的输入问题证据。"""
+    from make_excel import make_excel
+
+    path = Path(output_path)
+    def safe_table(frame: pd.DataFrame) -> pd.DataFrame:
+        result = frame.copy()
+        for column in result.columns:
+            result[column] = result[column].map(
+                lambda value: clean_excel_string(value)
+                if isinstance(value, str)
+                else value
+            )
+        return result
+
+    tables = [
+            ("输入检查", safe_table(report.to_dataframe())),
+            ("运行资料与映射", safe_table(report.source_dataframe())),
+            ("数据人口处置", safe_table(report.population_dataframe())),
+        ]
+    if report.parse_errors:
+        errors = pd.DataFrame(report.parse_errors).rename(columns={
+            "type": "异常类型", "source_type": "来源", "row": "记录行号",
+            "original_file_row": "原文件行号", "column": "字段", "original_value": "原值",
+        })
+        tables.append(("解析异常明细", safe_table(errors)))
+    make_excel(
+        tables,
+        str(path),
+        theme="deep-navy",
+    )
+    return path
 
 
 def _cell_text(value: Any) -> str:
@@ -424,6 +493,16 @@ def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any]) -> list[s
             problems.append(f"{label}列与其他必填映射重复：{value}")
         else:
             selected.append(value)
+    for key, label in (
+        ("account", "本方账号"),
+        ("currency", "币种"),
+        ("voucher_word", "凭证字/类型"),
+        ("voucher", "凭证号"),
+        ("balance", "余额"),
+    ):
+        value = mapping.get(key)
+        if value not in (None, "", "(无)") and value not in available:
+            problems.append(f"{label}列不存在：{value}")
     return problems
 
 
@@ -583,41 +662,76 @@ def _scope_values(
     frame: pd.DataFrame,
     mapping: dict[str, Any],
     identity: str,
-) -> tuple[str, set[str]]:
-    """提取核对账户或币种；缺失仅表示范围未验证，不妨碍继续计算。"""
-    column = None
-    for candidate in frame.columns:
-        name = _cell_text(candidate)
-        lowered = name.lower()
-        if identity == "account":
-            matched = (
-                "对方" not in name
-                and (
-                    "本方账号" in name
-                    or name in {"账号", "银行账号", "账户账号", "卡号"}
-                    or lowered in {"account", "account number", "account_number"}
+) -> tuple[str, set[str], int, int]:
+    """提取核对账户或币种，同时统计有效交易中的空白身份行。"""
+    columns = []
+    explicit_column = mapping.get(identity)
+    if explicit_column and explicit_column in frame.columns:
+        columns = [explicit_column]
+    else:
+        for candidate in frame.columns:
+            name = _cell_text(candidate)
+            lowered = name.lower()
+            if identity == "account":
+                matched = (
+                    "对方" not in name
+                    and (
+                        "本方账号" in name
+                        or name in {"账号", "银行账号", "账户账号", "卡号"}
+                        or lowered in {"account", "account number", "account_number"}
+                    )
                 )
-            )
-        else:
-            matched = (
-                "币种" in name
-                or "币别" in name
-                or lowered in {"currency", "currency code", "currency_code"}
-            )
-        if matched:
-            column = candidate
-            break
-    if column is None:
-        return "未提供", set()
+            else:
+                matched = (
+                    "对方" not in name
+                    and (
+                        "币种" in name
+                        or "币别" in name
+                        or lowered in {"currency", "currency code", "currency_code"}
+                    )
+                )
+            if matched:
+                columns.append(candidate)
     transaction_rows = frame.loc[~_non_transaction_mask(frame, mapping)]
-    values = {
-        _cell_text(value).upper()
-        for value in transaction_rows[column]
-        if _cell_text(value)
-    }
-    if not values:
-        return f"{column}未提供有效值", set()
-    return f"{column}：{'、'.join(sorted(values))}", values
+    total_rows = len(transaction_rows)
+    if not columns:
+        return "未提供", set(), total_rows, total_rows
+
+    def row_raw_values(row: pd.Series) -> set[str]:
+        return {
+            _cell_text(row[column]).upper()
+            for column in columns
+            if _cell_text(row[column])
+        }
+
+    row_values = transaction_rows.apply(row_raw_values, axis=1)
+    raw_values = set().union(*row_values) if len(row_values) else set()
+    missing_rows = int(row_values.map(lambda values: not values).sum())
+    if not raw_values:
+        return f"{'、'.join(map(str, columns))}未提供有效值", set(), missing_rows, total_rows
+
+    def normalize(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value).strip().upper()
+        if identity == "currency":
+            aliases = {
+                "人民币": "CNY",
+                "人民币元": "CNY",
+                "RMB": "CNY",
+                "CNY": "CNY",
+                "156": "CNY",
+            }
+            return aliases.get(normalized, normalized)
+        compact = re.sub(r"[\s\-_]", "", normalized)
+        # Excel 常把纯数字账号读成 12345.0；仅去掉确定无意义的小数尾零。
+        if re.fullmatch(r"\d+\.0+", compact):
+            return compact.split(".", 1)[0]
+        return compact
+
+    values = {normalize(value) for value in raw_values}
+    result = f"{'、'.join(map(str, columns))}：{'、'.join(sorted(raw_values))}"
+    if missing_rows:
+        result += f"；{total_rows}行有效交易中缺失{missing_rows}行"
+    return result, values, missing_rows, total_rows
 
 
 def _scope_item(
@@ -629,31 +743,373 @@ def _scope_item(
     bank_mapping: dict[str, Any],
     journal_mapping: dict[str, Any],
 ) -> PrecheckItem:
-    bank_result, bank_values = _scope_values(raw_bank, bank_mapping, identity)
-    journal_result, journal_values = _scope_values(raw_journal, journal_mapping, identity)
-    missing = not bank_values or not journal_values
+    missing_columns = [
+        f"{label}显式选择的列“{mapping[identity]}”不存在"
+        for label, frame, mapping in (
+            ("银行流水", raw_bank, bank_mapping), ("银行日记账", raw_journal, journal_mapping)
+        )
+        if mapping.get(identity) and mapping[identity] not in frame.columns
+    ]
+    if missing_columns:
+        return PrecheckItem(name, "显式映射待修正", "显式映射待修正", "范围映射无效", "无法计算",
+                            "；".join(missing_columns) + "；程序已停止匹配，不能改用其他列。")
+    bank_result, bank_values, bank_missing, bank_total = _scope_values(
+        raw_bank, bank_mapping, identity
+    )
+    journal_result, journal_values, journal_missing, journal_total = _scope_values(
+        raw_journal, journal_mapping, identity
+    )
+    missing = (
+        not bank_values
+        or not journal_values
+        or bank_missing > 0
+        or journal_missing > 0
+    )
     mixed = len(bank_values) > 1 or len(journal_values) > 1
     mismatch = bool(bank_values and journal_values and bank_values != journal_values)
-    if missing:
-        comparison = "范围身份未完全验证"
-        explanation = f"{name}字段缺失或无有效值；程序继续处理，并在报告中保留范围限制。"
-    elif mixed:
+    if mixed:
         comparison = "单份文件存在多个取值"
-        explanation = f"{name}范围混合；程序继续处理可用交易，结论按范围受限披露。"
+        explanation = f"{name}范围混合，无法确认本次核对范围；程序已停止匹配。"
+        status = "无法计算"
     elif mismatch:
         comparison = "双方不一致"
-        explanation = f"双方{name}不一致；程序继续处理可用交易，结论按范围受限披露。"
+        explanation = f"双方{name}不一致，无法确认核对范围；程序已停止匹配。"
+        status = "无法计算"
+    elif missing:
+        comparison = "范围身份未完全验证"
+        explanation = (
+            f"{name}字段缺失或无有效值：银行流水缺失{bank_missing}/{bank_total}行，"
+            f"银行日记账缺失{journal_missing}/{journal_total}行；程序继续处理，并在报告中保留范围限制。"
+        )
+        status = "疑点"
     else:
         comparison = "双方一致"
         explanation = f"双方{name}一致。"
+        status = "通过"
     return PrecheckItem(
         name=name,
         bank_result=bank_result,
         journal_result=journal_result,
         comparison=comparison,
-        status="疑点" if missing or mixed or mismatch else "通过",
+        status=status,
         explanation=explanation,
     )
+
+
+def _amount_basis(mapping: dict[str, Any]) -> tuple[str, str, bool]:
+    """返回金额口径说明、规范口径及单侧映射是否自相矛盾。"""
+    aliases = {
+        "原币": "原币",
+        "外币": "原币",
+        "交易币": "原币",
+        "ORIGINAL": "原币",
+        "ORIGINAL_CURRENCY": "原币",
+        "TRANSACTION_CURRENCY": "原币",
+        "本位币": "本位币",
+        "本币": "本位币",
+        "记账本位币": "本位币",
+        "BASE": "本位币",
+        "BASE_CURRENCY": "本位币",
+        "FUNCTIONAL_CURRENCY": "本位币",
+    }
+    mode = mapping.get("mode", "debit_credit")
+    keys = ("debit", "credit") if mode == "debit_credit" else ("amount",)
+    columns = [str(mapping.get(key)) for key in keys if mapping.get(key)]
+    detected = set()
+    for column in columns:
+        name = unicodedata.normalize("NFKC", column)
+        if re.search(r"原币|外币|交易币", name):
+            detected.add("原币")
+        if re.search(r"本位币|记账本位币|本币", name):
+            detected.add("本位币")
+    column_text = "、".join(columns) if columns else "未选择金额列"
+    if len(detected) > 1:
+        return f"映射列混用原币和本位币：{column_text}", "", True
+
+    explicit = _cell_text(mapping.get("amount_basis"))
+    if explicit:
+        normalized = unicodedata.normalize("NFKC", explicit).strip().upper()
+        value = aliases.get(normalized, "")
+        if not value:
+            return f"未识别的显式口径：{explicit}", "", True
+        if detected and value != next(iter(detected)):
+            detected_value = next(iter(detected))
+            return (
+                f"显式口径{value}与金额列标记{detected_value}矛盾：{column_text}",
+                "",
+                True,
+            )
+        return f"{value}（映射明确指定）", value, False
+
+    if detected:
+        value = next(iter(detected))
+        return f"{value}（列：{column_text}）", value, False
+    return f"未注明（列：{column_text}）", "", False
+
+
+def _amount_basis_item(
+    bank_mapping: dict[str, Any],
+    journal_mapping: dict[str, Any],
+) -> PrecheckItem:
+    bank_result, bank_basis, bank_conflict = _amount_basis(bank_mapping)
+    journal_result, journal_basis, journal_conflict = _amount_basis(journal_mapping)
+    if bank_conflict or journal_conflict:
+        comparison = "至少一侧金额列口径自相矛盾"
+        status = "无法计算"
+        explanation = "当前映射混用或错误声明原币、本位币，程序已停止匹配。"
+    elif bank_basis and journal_basis and bank_basis != journal_basis:
+        comparison = f"银行流水{bank_basis} / 银行日记账{journal_basis}"
+        status = "无法计算"
+        explanation = "双方采用的金额口径不一致，程序已停止匹配。"
+    elif bank_basis and journal_basis:
+        comparison = f"双方均为{bank_basis}"
+        status = "通过"
+        explanation = f"双方金额列均按{bank_basis}口径核对。"
+    else:
+        comparison = "至少一侧金额列未注明原币或本位币"
+        status = "疑点"
+        explanation = "无法仅凭通用列名验证原币或本位币口径；程序继续处理并在报告中保留范围限制。"
+    return PrecheckItem(
+        name="金额口径",
+        bank_result=bank_result,
+        journal_result=journal_result,
+        comparison=comparison,
+        status=status,
+        explanation=explanation,
+    )
+
+
+def _overall_balance_item(control: OverallControlResult) -> PrecheckItem:
+    """把余额总体控制转成输入检查表的一项，不把未提供余额伪装成已核对。"""
+    def amount(value: Decimal | None) -> str:
+        return "未取得" if value is None else f"{value:.2f}"
+
+    def side_result(source: str) -> str:
+        if source == "bank":
+            status = control.bank_balance_status
+            initial = control.bank_initial_balance
+            ending = control.bank_ending_balance
+            expected = control.bank_expected_ending_balance
+            difference = control.bank_balance_diff
+            label = "银行流水"
+        else:
+            status = control.journal_balance_status
+            initial = control.journal_initial_balance
+            ending = control.journal_ending_balance
+            expected = control.journal_expected_ending_balance
+            difference = control.journal_balance_diff
+            label = "银行日记账"
+        if status == "未实施":
+            return "未提供可用余额，余额核对未实施"
+        anomalies = sum(
+            str(item.get("来源", "")) == label
+            for item in control.continuity_anomalies
+        )
+        return (
+            f"期初{amount(initial)}；预期期末{amount(expected)}；"
+            f"实际期末{amount(ending)}；控制差额{amount(difference)}；"
+            f"连续性异常{anomalies}处；"
+            + "；".join(reason for reason in control.reasons if reason.startswith(label))
+        )
+
+    balance_anomaly = (
+        control.bank_balance_status == "疑点"
+        or control.journal_balance_status == "疑点"
+        or bool(control.continuity_anomalies)
+        or (control.initial_balance_diff is not None and control.initial_balance_diff != 0)
+        or (control.ending_balance_diff is not None and control.ending_balance_diff != 0)
+    )
+    missing_side = (
+        control.bank_balance_status == "未实施"
+        or control.journal_balance_status == "未实施"
+    )
+    if control.balance_check_possible:
+        comparison = (
+            f"期初余额差额{amount(control.initial_balance_diff)}；"
+            f"期末余额差额{amount(control.ending_balance_diff)}"
+        )
+    else:
+        comparison = "至少一侧无可用余额，双方余额比较未实施"
+    status = "疑点" if balance_anomaly or missing_side or control.scope_limited else "通过"
+    explanation = (
+        "总体控制范围受限："
+        + "；".join(control.reasons)
+        + "；相关候选不得无保留自动确认。"
+        if control.scope_limited
+        else (
+            "余额连续性或期初加期间净发生额等于期末余额的控制存在异常，"
+            "相关候选不得无保留自动确认。"
+            if balance_anomaly
+            else (
+                "至少一侧未提供逐笔余额，程序未据此降低单笔关系，但总体余额核对范围受限。"
+                if missing_side
+                else "双方余额连续性及期初、期间发生额、期末余额控制通过。"
+            )
+        )
+    )
+    return PrecheckItem(
+        name="总体余额控制",
+        bank_result=side_result("bank"),
+        journal_result=side_result("journal"),
+        comparison=comparison,
+        status=status,
+        explanation=explanation,
+    )
+
+
+def _raw_population_amount(row: pd.Series, mapping: dict[str, Any], source: str) -> Decimal | None:
+    """按标准化同一口径重算原行金额，无法解释的原值保留为空，不冒充零。"""
+    from data_loader import parse_source_amount, direction_sign
+
+    mode = mapping.get("mode", "debit_credit")
+    if mode == "debit_credit":
+        values = [row.get(mapping.get(key)) for key in ("debit", "credit")]
+        if not any(_cell_text(value) for value in values):
+            return None
+        amounts = [parse_source_amount(value, source, False) if _cell_text(value) else Decimal("0")
+                   for value in values]
+        if any(value is None for value in amounts):
+            return None
+        debit, credit = amounts
+        return credit - debit if source == "bank" else debit - credit
+    amount = parse_source_amount(row.get(mapping.get("amount")), source, mode == "signed_amount")
+    if amount is None:
+        return None
+    if mode == "single_amount_with_direction":
+        sign = direction_sign(row.get(mapping.get("direction")), source)
+        return amount * sign if sign is not None else None
+    return amount
+
+
+def _population_detail_rows(
+    *,
+    source_type: str,
+    raw: pd.DataFrame,
+    standardized: pd.DataFrame,
+    mapping: dict[str, Any],
+    structure: TableStructure,
+    parse_errors: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """将每个原始数据行唯一归入有效、非交易、解析异常或其他排除。"""
+    valid_rows = {
+        int(value)
+        for value in standardized.get("original_file_row", pd.Series(dtype=object))
+        if pd.notna(value)
+    }
+    issues_by_row: dict[int, set[str]] = {}
+    for error in parse_errors:
+        error_source = error.get("source_type")
+        if error_source is None and error.get("type") == "被丢弃的汇总行":
+            error_source = "journal"
+        if error_source != source_type:
+            continue
+        row = error.get("original_file_row", error.get("row"))
+        try:
+            row_number = int(row)
+        except (TypeError, ValueError):
+            continue
+        issues_by_row.setdefault(row_number, set()).add(
+            str(error.get("type") or error.get("error_type") or "解析异常")
+        )
+
+    non_transaction = _non_transaction_mask(raw, mapping)
+    date_column = mapping.get("date")
+    amount_keys = (
+        ("debit", "credit")
+        if mapping.get("mode", "debit_credit") == "debit_credit"
+        else ("amount",)
+    )
+    amount_columns = [mapping.get(key) for key in amount_keys if mapping.get(key)]
+    direction_column = mapping.get("direction")
+
+    standardized_amounts = {}
+    if "original_file_row" in standardized.columns:
+        for _, std_row in standardized.iterrows():
+            try:
+                row_number = int(std_row["original_file_row"])
+            except (TypeError, ValueError):
+                continue
+            standardized_amounts[row_number] = std_row.get("amount")
+
+    def matching_columns(identity: str) -> list[Any]:
+        explicit = mapping.get(identity)
+        if explicit:
+            return [explicit] if explicit in raw.columns else []
+        result = []
+        for column in raw.columns:
+            name = _cell_text(column)
+            lowered = name.lower()
+            if identity == "account":
+                matched = "对方" not in name and (
+                    "本方账号" in name
+                    or name in {"账号", "银行账号", "账户账号", "卡号"}
+                    or lowered in {"account", "account number", "account_number"}
+                )
+            else:
+                matched = "对方" not in name and (
+                    "币种" in name
+                    or "币别" in name
+                    or lowered in {"currency", "currency code", "currency_code"}
+                )
+            if matched:
+                result.append(column)
+        return result
+
+    account_columns = matching_columns("account")
+    currency_columns = matching_columns("currency")
+    rows = []
+    for position, (index, raw_row) in enumerate(raw.iterrows()):
+        if "__file_row__" in raw.columns and pd.notna(raw_row.get("__file_row__")):
+            file_row = int(raw_row["__file_row__"])
+        else:
+            file_row = position + int(structure.skiprows) + int(structure.header_rows) + 1
+        if file_row in valid_rows:
+            category = "有效交易"
+            reasons = "日期和金额可用，已进入匹配"
+        elif bool(non_transaction.loc[index]):
+            category = "非交易行"
+            reasons = "合计、累计、标题、重复表头、注释或空行"
+        elif file_row in issues_by_row:
+            category = "解析异常"
+            reasons = "、".join(sorted(issues_by_row[file_row]))
+        else:
+            category = "其他排除"
+            reasons = "未进入标准化交易且未被现有规则解释"
+
+        amount_values = {
+            str(column): raw_row.get(column)
+            for column in amount_columns
+            if column in raw.columns and _cell_text(raw_row.get(column))
+        }
+        account_values = [
+            _cell_text(raw_row.get(column)) for column in account_columns
+            if _cell_text(raw_row.get(column))
+        ]
+        currency_values = [
+            _cell_text(raw_row.get(column)) for column in currency_columns
+            if _cell_text(raw_row.get(column))
+        ]
+        original_net = _raw_population_amount(raw_row, mapping, source_type)
+        rows.append({
+            "来源": "银行流水" if source_type == "bank" else "银行日记账",
+            "原文件行号": file_row,
+            "唯一处置类别": category,
+            "处置原因": reasons,
+            "原日期列名": date_column or "",
+            "原日期值": _cell_text(raw_row.get(date_column)) if date_column in raw.columns else "",
+            "原金额列名": "、".join(map(str, amount_columns)),
+            "原金额值": json.dumps(amount_values, ensure_ascii=False, default=str),
+            "原方向列名": direction_column or "",
+            "原方向值": _cell_text(raw_row.get(direction_column)) if direction_column in raw.columns else "",
+            "原始可解析净额": original_net,
+            "金额去向说明": (f"原行金额归入{category}，未与其他类别重复累计" if original_net is not None
+                           else "原金额或方向无法解析或未提供；保留原值，不以零计入金额勾稽"),
+            "标准化净额": standardized_amounts.get(file_row),
+            "进入匹配": category == "有效交易",
+            "账户原值": "、".join(account_values),
+            "币种原值": "、".join(currency_values),
+        })
+    return rows
 
 
 def build_input_precheck(
@@ -667,8 +1123,14 @@ def build_input_precheck(
     bank_structure: TableStructure,
     journal_structure: TableStructure,
     parse_errors: Sequence[dict[str, Any]] = (),
+    source_info: Sequence[dict[str, Any]] = (),
+    overall_control: OverallControlResult | None = None,
 ) -> InputPrecheckReport:
-    """对已读取和标准化的双方数据执行十一项统一检查。"""
+    """对已读取和标准化的双方数据执行统一检查。"""
+    if overall_control is None:
+        # 局部导入，避免 DataLoader -> input_precheck -> balance -> DataLoader 的循环。
+        from balance import build_overall_controls
+        overall_control = build_overall_controls(bank, journal)
     items = []
 
     file_blocked = raw_bank.empty or raw_journal.empty
@@ -781,6 +1243,27 @@ def build_input_precheck(
         )
     )
 
+    items.append(_amount_basis_item(bank_mapping, journal_mapping))
+
+    scope_warnings = [
+        item
+        for item in items
+        if item.name in {"核对账户", "核对币种", "金额口径"}
+        and item.status == "疑点"
+    ]
+    if scope_warnings:
+        scope_reasons = tuple(
+            f"{item.name}未完全验证：{item.comparison}"
+            for item in scope_warnings
+        )
+        overall_control = replace(
+            overall_control,
+            scope_limited=True,
+            reasons=tuple(
+                dict.fromkeys((*overall_control.reasons, *scope_reasons))
+            ),
+        )
+
     bank_direction_errors = _error_count(parse_errors, "bank", "方向解析失败")
     journal_direction_errors = _error_count(parse_errors, "journal", "方向解析失败")
     direction_blocked = bool(bank_direction_errors or journal_direction_errors)
@@ -830,6 +1313,22 @@ def build_input_precheck(
             amount_explanation,
         )
     )
+    bank_balance_errors = _error_count(parse_errors, "bank", "余额解析失败")
+    journal_balance_errors = _error_count(parse_errors, "journal", "余额解析失败")
+    if bank_balance_errors or journal_balance_errors:
+        balance_parse_reason = (
+            "余额解析失败："
+            f"银行流水{bank_balance_errors}行，银行日记账{journal_balance_errors}行；"
+            "总体余额控制只覆盖其余可解析行。"
+        )
+        overall_control = replace(
+            overall_control,
+            scope_limited=True,
+            reasons=tuple(
+                dict.fromkeys((*overall_control.reasons, balance_parse_reason))
+            ),
+        )
+    items.append(_overall_balance_item(overall_control))
 
     bank_non_transactions = int(_non_transaction_mask(raw_bank, bank_mapping).sum())
     journal_non_transactions = int(_non_transaction_mask(raw_journal, journal_mapping).sum())
@@ -844,44 +1343,90 @@ def build_input_precheck(
             "检测到合计、累计、统计、标题、重复表头、注释或空行。" if has_non_transactions else "未发现混入数据区的非交易行。",
         )
     )
-
-    bank_parse_errors = sum(
-        1 for error in parse_errors if error.get("source_type") == "bank"
+    population_rows = _population_detail_rows(
+        source_type="bank", raw=raw_bank, standardized=bank,
+        mapping=bank_mapping, structure=bank_structure, parse_errors=parse_errors,
+    ) + _population_detail_rows(
+        source_type="journal", raw=raw_journal, standardized=journal,
+        mapping=journal_mapping, structure=journal_structure, parse_errors=parse_errors,
     )
-    journal_parse_errors = sum(
-        1 for error in parse_errors if error.get("source_type") == "journal"
-    )
-    bank_unexplained = max(
-        0,
-        len(raw_bank) - len(bank) - bank_non_transactions,
-    )
-    journal_unexplained = max(
-        0,
-        len(raw_journal) - len(journal) - journal_non_transactions,
-    )
+    population_counts = {
+        source: {
+            category: sum(
+                row["来源"] == source and row["唯一处置类别"] == category
+                for row in population_rows
+            )
+            for category in ("有效交易", "非交易行", "解析异常", "其他排除")
+        }
+        for source in ("银行流水", "银行日记账")
+    }
+    bank_parse_errors = population_counts["银行流水"]["解析异常"]
+    journal_parse_errors = population_counts["银行日记账"]["解析异常"]
+    bank_unexplained = population_counts["银行流水"]["其他排除"]
+    journal_unexplained = population_counts["银行日记账"]["其他排除"]
     population_risk = bool(
         bank_parse_errors
         or journal_parse_errors
         or bank_unexplained
         or journal_unexplained
     )
+    if population_risk:
+        population_control_reasons = []
+        if bank_parse_errors or journal_parse_errors:
+            population_control_reasons.append(
+                "数据人口存在解析异常："
+                f"银行流水{bank_parse_errors}行，银行日记账{journal_parse_errors}行"
+            )
+        if bank_unexplained or journal_unexplained:
+            population_control_reasons.append(
+                "数据人口存在其他排除："
+                f"银行流水{bank_unexplained}行，银行日记账{journal_unexplained}行"
+            )
+        combined_reasons = tuple(
+            dict.fromkeys((*overall_control.reasons, *population_control_reasons))
+        )
+        overall_control = replace(
+            overall_control,
+            scope_limited=True,
+            reasons=combined_reasons,
+        )
+        items = [
+            _overall_balance_item(overall_control)
+            if item.name == "总体余额控制"
+            else item
+            for item in items
+        ]
+
+    def population_summary(source: str) -> str:
+        rows = [row for row in population_rows if row["来源"] == source]
+        counts = population_counts[source]
+        raw_net = sum((row["原始可解析净额"] for row in rows if row["原始可解析净额"] is not None), Decimal("0"))
+        category_net = {
+            category: sum((row["标准化净额"] if category == "有效交易" else row["原始可解析净额"]
+                           for row in rows if row["唯一处置类别"] == category
+                           and (row["标准化净额"] if category == "有效交易" else row["原始可解析净额"]) is not None), Decimal("0"))
+            for category in counts
+        }
+        unknown = sum(row["原始可解析净额"] is None for row in rows)
+        diff = raw_net - sum(category_net.values(), Decimal("0"))
+        return (
+            f"原始{len(rows)}行；有效交易{counts['有效交易']}行；非交易{counts['非交易行']}行；"
+            f"解析异常{counts['解析异常']}行；其他排除{counts['其他排除']}行；"
+            f"原始可解析净额{raw_net:.2f}；"
+            + "；".join(f"{category}净额{net:.2f}" for category, net in category_net.items())
+            + f"；金额勾稽差额{diff:.2f}；原金额或方向未能解析{unknown}行未计入勾稽"
+        )
     items.append(
         PrecheckItem(
             "数据人口",
-            (
-                f"原始{len(raw_bank)}行；有效交易{len(bank)}行；"
-                f"非交易{bank_non_transactions}行；解析异常{bank_parse_errors}行"
-            ),
-            (
-                f"原始{len(raw_journal)}行；有效交易{len(journal)}行；"
-                f"非交易{journal_non_transactions}行；解析异常{journal_parse_errors}行"
-            ),
+            population_summary("银行流水"),
+            population_summary("银行日记账"),
             "存在未完全解释的行" if population_risk else "行数去向可解释",
             "疑点" if population_risk else "通过",
             (
                 "程序已处理全部可用交易；解析或行数缺口作为范围限制披露。"
                 if population_risk
-                else "原始数据行已分为有效交易和非交易行。"
+                else "原始数据行已按唯一类别归集；原始可解析净额包含非交易合计行，不是交易发生额。"
             ),
         )
     )
@@ -914,4 +1459,10 @@ def build_input_precheck(
         )
     )
 
-    return InputPrecheckReport(items=tuple(items))
+    return InputPrecheckReport(
+        items=tuple(items),
+        source_info=tuple(source_info),
+        population_rows=tuple(population_rows),
+        overall_control=overall_control,
+        parse_errors=tuple(parse_errors),
+    )

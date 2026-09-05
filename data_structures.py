@@ -149,6 +149,8 @@ class MatchCandidate:
     text_evidence: Optional[TextEvidence] = None
     llm_decision: Optional[LLMDecisionRecord] = None
     evidence: Dict[str, Any] = field(default_factory=dict)
+    stable_key: str = ""
+    composition_key: str = ""
 
 
 @dataclass
@@ -191,6 +193,9 @@ class MatcherConfig:
     similarity_threshold: float = 0.5
     similarity_high_threshold: float = 0.7
     max_candidates: int = 30
+    combination_node_limit_per_source: int = 100000
+    combination_task_timeout_seconds: float = 30.0
+    combination_global_time_limit_seconds: float = 300.0
     random_seed: int = 0
     whitelist_rules: Optional[List[Dict[str, Any]]] = None
     performance_materiality: Decimal = Decimal("100000.00")
@@ -257,3 +262,44 @@ class InitialBalanceWarning:
     journal_initial: Decimal = Decimal('0')
     diff: Decimal = Decimal('0')
     message: str = ""
+
+
+@dataclass(frozen=True)
+class OverallControlResult:
+    """匹配前形成的期间、收支和余额总体控制结果。"""
+
+    bank_start_date: Optional[pd.Timestamp] = None
+    bank_end_date: Optional[pd.Timestamp] = None
+    journal_start_date: Optional[pd.Timestamp] = None
+    journal_end_date: Optional[pd.Timestamp] = None
+    period_status: str = "未实施"
+    bank_income: Decimal = Decimal('0')
+    bank_expense: Decimal = Decimal('0')
+    bank_net: Decimal = Decimal('0')
+    journal_income: Decimal = Decimal('0')
+    journal_expense: Decimal = Decimal('0')
+    journal_net: Decimal = Decimal('0')
+    amount_status: str = "未实施"
+    bank_initial_balance: Optional[Decimal] = None
+    bank_ending_balance: Optional[Decimal] = None
+    bank_expected_ending_balance: Optional[Decimal] = None
+    bank_balance_diff: Optional[Decimal] = None
+    bank_balance_status: str = "未实施"
+    journal_initial_balance: Optional[Decimal] = None
+    journal_ending_balance: Optional[Decimal] = None
+    journal_expected_ending_balance: Optional[Decimal] = None
+    journal_balance_diff: Optional[Decimal] = None
+    journal_balance_status: str = "未实施"
+    initial_balance_diff: Optional[Decimal] = None
+    ending_balance_diff: Optional[Decimal] = None
+    continuity_anomalies: tuple[Dict[str, Any], ...] = ()
+    scope_limited: bool = False
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def balance_check_possible(self) -> bool:
+        """双方都有余额数据时才可执行双侧余额核对。"""
+        return (
+            self.bank_balance_status != "未实施"
+            and self.journal_balance_status != "未实施"
+        )

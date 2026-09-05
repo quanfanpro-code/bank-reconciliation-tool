@@ -1,8 +1,9 @@
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import pandas as pd
-from data_structures import DailyBalance, BalanceDiff
+from data_structures import DailyBalance, BalanceDiff, OverallControlResult
 from data_loader import direction_sign, parse_source_amount
+from precision_engine import PrecisionEngine
 from utils import clean_amount
 
 
@@ -108,7 +109,7 @@ class BalanceRecalculator:
                     sign = direction_sign(row[direction_col], source_type)
                     if amount is None or sign is None:
                         return None
-                    return abs(amount) * Decimal(sign)
+                    return amount * Decimal(sign)
                 if mode == 'signed_amount':
                     return parse_source_amount(
                         row[amount_col],
@@ -121,7 +122,13 @@ class BalanceRecalculator:
                 credit = _parse(row[credit_col])
                 if debit is None and credit is None:
                     return None
-                return (debit or Decimal('0')) - (credit or Decimal('0'))
+                debit = debit or Decimal('0')
+                credit = credit or Decimal('0')
+                if source_type == 'bank':
+                    return credit - debit
+                if source_type == 'journal':
+                    return debit - credit
+                raise ValueError(f"未知数据来源: {source_type}")
             return None
 
         cumulative = Decimal('0')
@@ -293,3 +300,229 @@ class BalanceReconciler:
             return "发生额不一致"
 
         return "余额不一致"
+
+
+def _decimal_value(value: Any) -> Optional[Decimal]:
+    """将标准化表中的金额或余额安全转为 Decimal。"""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, Decimal):
+        return value
+    return clean_amount(value, allow_suffix_sign=False)
+
+
+def _date_bounds(frame: pd.DataFrame) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    if frame.empty or 'date' not in frame.columns:
+        return None, None
+    dates = pd.to_datetime(frame['date'], errors='coerce').dropna()
+    if dates.empty:
+        return None, None
+    return dates.min().normalize(), dates.max().normalize()
+
+
+def _amount_totals(frame: pd.DataFrame) -> tuple[Decimal, Decimal, Decimal]:
+    if frame.empty or 'amount' not in frame.columns:
+        zero = Decimal('0')
+        return zero, zero, zero
+    amounts = [
+        amount
+        for amount in (_decimal_value(value) for value in frame['amount'])
+        if amount is not None
+    ]
+    income = sum((amount for amount in amounts if amount > 0), Decimal('0'))
+    expense = sum((-amount for amount in amounts if amount < 0), Decimal('0'))
+    return income, expense, income - expense
+
+
+def check_balance_continuity(
+    frame: pd.DataFrame,
+    tolerance_li: int = 10,
+    source: str = "",
+) -> List[Dict[str, Any]]:
+    """按最近有效余额和区间净额检查余额连续性，不修改输入表。"""
+    if frame.empty or not {'date', 'amount', 'balance'} <= set(frame.columns):
+        return []
+
+    row_column = 'original_file_row' if 'original_file_row' in frame.columns else 'original_idx'
+    sort_columns = ['date'] + ([row_column] if row_column in frame.columns else [])
+    work = frame.sort_values(sort_columns, kind='stable').reset_index(drop=True).copy()
+    work['date'] = pd.to_datetime(work['date'], errors='coerce').dt.normalize()
+    work = work.dropna(subset=['date'])
+    if work.empty:
+        return []
+
+    tolerance = PrecisionEngine.from_integer_li(tolerance_li)
+    anomalies: List[Dict[str, Any]] = []
+    previous_balance: Optional[Decimal] = None
+    accumulated_net = Decimal('0')
+    for _, row in work.iterrows():
+        day = row['date']
+        net = _decimal_value(row['amount'])
+        balance = _decimal_value(row['balance'])
+        if net is None:
+            # 缺金额的区间无法可靠勾稽；下个余额只作为新基准。
+            previous_balance = balance
+            accumulated_net = Decimal('0')
+            continue
+        if balance is None:
+            accumulated_net += net
+            continue
+        if previous_balance is not None:
+            period_net = accumulated_net + net
+            expected = previous_balance + period_net
+            difference = abs(balance - expected)
+            if difference > tolerance:
+                anomalies.append({
+                    '来源': source,
+                    '日期': day,
+                    '原文件行号': row.get('original_file_row', row.get('original_idx')),
+                    '基准余额': previous_balance,
+                    '区间净额': period_net,
+                    '预期余额': expected,
+                    '实际余额': balance,
+                    '差额': difference,
+                })
+        previous_balance = balance
+        accumulated_net = Decimal('0')
+    return anomalies
+
+
+def _balance_control(
+    frame: pd.DataFrame,
+    source: str,
+    tolerance_li: int,
+) -> tuple[
+    Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal],
+    str, tuple[Dict[str, Any], ...], tuple[str, ...]
+]:
+    if frame.empty or not {'date', 'amount', 'balance'} <= set(frame.columns):
+        return None, None, None, None, "未实施", (), ()
+
+    valid_balances = frame['balance'].map(_decimal_value)
+    if valid_balances.dropna().empty:
+        return None, None, None, None, "未实施", (), ()
+
+    row_column = 'original_file_row' if 'original_file_row' in frame.columns else 'original_idx'
+    sort_columns = ['date'] + ([row_column] if row_column in frame.columns else [])
+    work = frame.sort_values(sort_columns, kind='stable').reset_index(drop=True).copy()
+    parsed_balances = work['balance'].map(_decimal_value)
+    last_balance_position = parsed_balances.last_valid_index()
+    ending_balance = parsed_balances.loc[last_balance_position]
+    initial_balance = BalanceRecalculator.extract_initial_balance(work)
+    _, _, net = _amount_totals(work)
+    expected_ending = initial_balance + net
+    difference = abs(ending_balance - expected_ending)
+    anomalies = tuple(check_balance_continuity(work, tolerance_li, source))
+    tolerance = PrecisionEngine.from_integer_li(tolerance_li)
+    reasons = []
+    if parsed_balances.notna().sum() < 2:
+        reasons.append(f"{source}仅有1个有效余额点，连续性核对未实施；倒算期初不构成独立验证")
+    if difference > tolerance:
+        reasons.append(f"{source}期初加净发生额与期末余额相差{difference}")
+    if anomalies:
+        reasons.append(f"{source}存在{len(anomalies)}处余额连续性异常")
+    if last_balance_position != work.index[-1]:
+        reasons.append(f"{source}最后交易行未提供余额")
+    status = "疑点" if reasons else "通过"
+    return (
+        initial_balance,
+        ending_balance,
+        expected_ending,
+        difference,
+        status,
+        anomalies,
+        tuple(reasons),
+    )
+
+
+def build_overall_controls(
+    bank: pd.DataFrame,
+    journal: pd.DataFrame,
+    tolerance_li: int = 10,
+) -> OverallControlResult:
+    """在匹配前计算双方期间、收支和余额总体控制，不修改输入表。"""
+    bank_start, bank_end = _date_bounds(bank)
+    journal_start, journal_end = _date_bounds(journal)
+    if None in (bank_start, bank_end, journal_start, journal_end):
+        period_status = "无法计算"
+    elif (bank_start, bank_end) == (journal_start, journal_end):
+        period_status = "通过"
+    else:
+        period_status = "疑点"
+
+    bank_income, bank_expense, bank_net = _amount_totals(bank)
+    journal_income, journal_expense, journal_net = _amount_totals(journal)
+    if bank.empty or journal.empty:
+        amount_status = "无法计算"
+    elif (bank_income, bank_expense) == (journal_income, journal_expense):
+        amount_status = "通过"
+    else:
+        amount_status = "疑点"
+
+    bank_balance = _balance_control(bank, "银行流水", tolerance_li)
+    journal_balance = _balance_control(journal, "银行日记账", tolerance_li)
+    tolerance = PrecisionEngine.from_integer_li(tolerance_li)
+    initial_balance_diff = (
+        abs(bank_balance[0] - journal_balance[0])
+        if bank_balance[0] is not None and journal_balance[0] is not None
+        else None
+    )
+    ending_balance_diff = (
+        abs(bank_balance[1] - journal_balance[1])
+        if bank_balance[1] is not None and journal_balance[1] is not None
+        else None
+    )
+    reasons = []
+    if period_status != "通过":
+        reasons.append(
+            "双方起止日期无法确认"
+            if period_status == "无法计算"
+            else "双方起止日期不一致"
+        )
+    if amount_status != "通过":
+        reasons.append(
+            "双方收支金额无法确认"
+            if amount_status == "无法计算"
+            else "双方收入或支出合计不一致"
+        )
+    reasons.extend(bank_balance[6])
+    reasons.extend(journal_balance[6])
+    if initial_balance_diff is not None and initial_balance_diff > tolerance:
+        reasons.append(f"双方期初余额相差{initial_balance_diff}")
+    if ending_balance_diff is not None and ending_balance_diff > tolerance:
+        reasons.append(f"双方期末余额相差{ending_balance_diff}")
+
+    return OverallControlResult(
+        bank_start_date=bank_start,
+        bank_end_date=bank_end,
+        journal_start_date=journal_start,
+        journal_end_date=journal_end,
+        period_status=period_status,
+        bank_income=bank_income,
+        bank_expense=bank_expense,
+        bank_net=bank_net,
+        journal_income=journal_income,
+        journal_expense=journal_expense,
+        journal_net=journal_net,
+        amount_status=amount_status,
+        bank_initial_balance=bank_balance[0],
+        bank_ending_balance=bank_balance[1],
+        bank_expected_ending_balance=bank_balance[2],
+        bank_balance_diff=bank_balance[3],
+        bank_balance_status=bank_balance[4],
+        journal_initial_balance=journal_balance[0],
+        journal_ending_balance=journal_balance[1],
+        journal_expected_ending_balance=journal_balance[2],
+        journal_balance_diff=journal_balance[3],
+        journal_balance_status=journal_balance[4],
+        initial_balance_diff=initial_balance_diff,
+        ending_balance_diff=ending_balance_diff,
+        continuity_anomalies=bank_balance[5] + journal_balance[5],
+        scope_limited=bool(reasons),
+        reasons=tuple(reasons),
+    )

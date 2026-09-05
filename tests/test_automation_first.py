@@ -110,7 +110,7 @@ def test_月度累计超限只升级风险而不改成人工状态():
     )
 
 
-def test_唯一一对多组合自动确认():
+def test_唯一一对多组合只有相同摘要时仍须列为疑点():
     bank = _std_df([("2026-01-02", 100, "项目回款", 1)])
     journal = _std_df(
         [
@@ -129,10 +129,11 @@ def test_唯一一对多组合自动确认():
     selected = matcher.selected_candidates[0]
     assert selected.bank_idxs == (0,)
     assert selected.journal_idxs == (0, 1)
-    assert selected.processing_status is ds.ProcessingStatus.AUTO_CONFIRMED
+    assert selected.processing_status is ds.ProcessingStatus.FLAGGED
+    assert "业务依据不足" in selected.processing_reason
 
 
-def test_多解但整组金额闭合时自动输出整组勾稽一致():
+def test_无业务边界的多解总额闭合也不能输出整组勾稽一致():
     bank = _std_df(
         [
             ("2026-01-02", 100, "项目回款", 1),
@@ -154,12 +155,27 @@ def test_多解但整组金额闭合时自动输出整组勾稽一致():
     matcher._collecting_candidates = False
     matcher._commit_selected_candidates()
 
-    assert len(matcher.selected_candidates) == 1
-    selected = matcher.selected_candidates[0]
-    assert selected.bank_idxs == (0, 1)
-    assert selected.journal_idxs == (0, 1, 2, 3)
-    assert selected.processing_status is ds.ProcessingStatus.GROUP_RECONCILED
-    assert selected.evidence["closed_group_fallback"] is True
+    assert len(matcher.selected_candidates) == 2
+    assert not any(
+        selected.bank_idxs == (0, 1)
+        and selected.journal_idxs == (0, 1, 2, 3)
+        and selected.processing_status is ds.ProcessingStatus.GROUP_RECONCILED
+        for selected in matcher.selected_candidates
+    )
+    assert all(
+        selected.processing_status is ds.ProcessingStatus.FLAGGED
+        for selected in matcher.selected_candidates
+    )
+    assert {
+        index
+        for selected in matcher.selected_candidates
+        for index in selected.bank_idxs
+    } == {0, 1}
+    assert {
+        index
+        for selected in matcher.selected_candidates
+        for index in selected.journal_idxs
+    } == {0, 1, 2, 3}
 
 
 def test_没有有效余额时不从零伪造余额轨迹():

@@ -11,6 +11,7 @@ from data_structures import (
     MatcherConfig,
     ProcessingStatus,
     RiskLevel,
+    ScoreBreakdown,
     TextEvidence,
 )
 from matcher import Matcher
@@ -46,6 +47,16 @@ def _exact_candidate(**changes):
 
 def test_无风险且金额完全一致仍可自动确认():
     candidate = _exact_candidate()
+    candidate.evidence.update({
+        "business_strength": 3,
+        "business_basis": "明确业务编号及对方共同对应",
+    })
+    candidate.scores = ScoreBreakdown(
+        amount=40,
+        date=15,
+        text=30,
+        structure=15,
+    )
 
     status, risk, _ = route_candidate(candidate, MatcherConfig())
 

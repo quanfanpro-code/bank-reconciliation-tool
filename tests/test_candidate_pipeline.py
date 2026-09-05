@@ -249,7 +249,7 @@ def test_当前日期正好十笔且双方均为工资可形成批量候选():
     assert groups[0].journal_idxs == (0,)
 
 
-def test_普通一对一跨月但在日期容差内可以自动确认():
+def test_普通一对一跨月且只有相同摘要时仍须列为疑点():
     bank = _std_df(
         [("2026-01-31", 100, {"摘要": "甲公司货款"})]
     )
@@ -262,13 +262,11 @@ def test_普通一对一跨月但在日期容差内可以自动确认():
 
     assert len(matcher.selected_candidates) == 1
     assert matcher.selected_candidates[0].match_type == "tolerance_date"
-    assert (
-        matcher.selected_candidates[0].processing_status
-        is ProcessingStatus.AUTO_CONFIRMED
-    )
+    assert matcher.selected_candidates[0].processing_status is ProcessingStatus.FLAGGED
+    assert "业务依据不足" in matcher.selected_candidates[0].processing_reason
 
 
-def test_跨月多对多合计一致时自动形成整组勾稽():
+def test_跨月多对多只有相同摘要时不得形成整组勾稽():
     bank = _std_df(
         [
             ("2026-01-31", 60, {"摘要": "项目回款"}),
@@ -291,7 +289,8 @@ def test_跨月多对多合计一致时自动形成整组勾稽():
     ]
 
     assert len(groups) == 1
-    assert groups[0].processing_status is ProcessingStatus.GROUP_RECONCILED
+    assert groups[0].processing_status is ProcessingStatus.FLAGGED
+    assert groups[0].evidence.get("total_only_without_boundary") is True
 
 
 def test_一坨做账组合存在微小金额差异时仍可自动形成整组():

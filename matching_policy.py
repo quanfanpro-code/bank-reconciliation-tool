@@ -21,6 +21,20 @@ from data_structures import (
 from precision_engine import PrecisionEngine
 
 
+COUNTERPARTY_FIELD_KEYWORDS = (
+    "对方户名",
+    "对方名称",
+    "客户名称",
+    "供应商名称",
+    "供应商户名",
+    "收款单位",
+    "付款单位",
+    "对方单位",
+    "对手方",
+    "交易对手",
+)
+
+
 def _normalize_text(value: object) -> str:
     """统一全半角、大小写和标点，但保留中文、字母与数字。"""
     if value is None:
@@ -51,7 +65,17 @@ def _text_similarity(left: str, right: str) -> int:
 def _critical_field_category(label: str) -> str:
     """把同义的关键账户字段归入同一个冲突检查类别。"""
     compact = _normalize_text(label)
-    if "户名" in compact or "客户名称" in compact or "对方名称" in compact:
+    if (
+        "回单" in compact
+        or "交易流水" in compact
+        or compact in {"流水号", "银行流水号", "交易编号"}
+    ):
+        return "交易流水号"
+    is_account_label = any(marker in compact for marker in ("账号", "帐号", "卡号"))
+    if not is_account_label and any(
+        marker in compact
+        for marker in (*COUNTERPARTY_FIELD_KEYWORDS, "户名")
+    ):
         return "对方户名"
     if "账号" in compact or "帐号" in compact:
         return "账号"
@@ -340,11 +364,48 @@ def route_candidate(
         reasons.append("候选歧义")
     if candidate.is_cross_month_many_to_many:
         reasons.append("跨月多对多")
+    if candidate.evidence.get("total_only_without_boundary"):
+        reasons.append("仅日月总额闭合，缺少可证明完整范围的业务组边界")
+    if candidate.evidence.get("batch_boundary_uncertain"):
+        reasons.append("同日同用途存在多个可能批次，资料不足以证明批次边界")
+    is_complete_group = bool(candidate.evidence.get("resolves_full_group", False))
+    if (
+        candidate.evidence.get("represents_full_observed_group")
+        and not is_complete_group
+    ):
+        reasons.append("已保留完整组成，但缺少足以证明跨双方范围闭合的业务证据")
+    if (
+        candidate.metrics.total_diff_li == 0
+        and not is_complete_group
+        and candidate.scores.total < config.auto_confirm_score
+    ):
+        reasons.append(
+            f"综合可信度{candidate.scores.total}低于自动确认门槛{config.auto_confirm_score}"
+        )
+    if (
+        candidate.metrics.total_diff_li == 0
+        and not is_complete_group
+        and int(candidate.evidence.get("business_strength", 0)) < 2
+        and not candidate.evidence.get("shared_transaction_id")
+    ):
+        reasons.append("金额和日期相同但业务依据不足，只有相同摘要不能证明交易对应")
+    overall_scope_limited = bool(candidate.evidence.get("overall_scope_limited"))
+    if overall_scope_limited:
+        control_reasons = "、".join(
+            str(value)
+            for value in candidate.evidence.get("overall_control_reasons", ())
+            if str(value).strip()
+        )
+        reasons.append(
+            "总体资料尚未闭合"
+            + (f"：{control_reasons}" if control_reasons else "")
+        )
 
     has_relationship_risk = bool(reasons)
-    if (candidate.evidence.get("resolves_full_group", False)
+    if (is_complete_group
             and candidate.metrics.total_diff_li == 0
             and not candidate.is_ambiguous
+            and not overall_scope_limited
             and not (candidate.text_evidence and candidate.text_evidence.conflicting_fields)):
         status = ProcessingStatus.GROUP_RECONCILED
         reasons.insert(0, "交易组收支分别闭合")
@@ -361,7 +422,11 @@ def route_candidate(
         if has_relationship_risk
         else candidate.metrics.total_diff_li
     )
-    risk = risk_level_for(impact_li, config)
+    risk = risk_level_for(
+        impact_li,
+        config,
+        unquantifiable=overall_scope_limited,
+    )
     return status, risk, "；".join(reasons)
 
 

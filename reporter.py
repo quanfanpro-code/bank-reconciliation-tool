@@ -9,6 +9,7 @@ from decimal import Decimal
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -24,7 +25,11 @@ from data_loader import ParseErrorCollector
 from input_precheck import InputPrecheckReport
 from matcher import Matcher
 from utils import round_decimal, clean_excel_string
-from balance import BalanceRecalculator, BalanceReconciler
+from balance import (
+    BalanceRecalculator,
+    BalanceReconciler,
+    check_balance_continuity as check_row_balance_continuity,
+)
 from make_excel import make_excel
 from llm_assistant import redact_sensitive_text, sanitize_url
 
@@ -85,6 +90,10 @@ class Reporter:
         self.error_collector = error_collector
         self.precheck_report = precheck_report
 
+    def _log(self, message: str) -> None:
+        if self.logger:
+            self.logger(message)
+
     @staticmethod
     def _get_ordered_columns(df: pd.DataFrame, date_col: str = 'date') -> List[str]:
         """按照指标顺序排列列名。"""
@@ -131,41 +140,12 @@ class Reporter:
 
     def check_balance_continuity(self, df: pd.DataFrame, tolerance_li: int = 10,
                                  source: str = "") -> List[Dict[str, Any]]:
-        """按日检查余额连续性：以最近一个有效余额日为基准，用累计净额推算预期余额。
-
-        空余额日安全跳过且不断链——其净额计入累计，下一个有效余额日仍可校验。
-        """
-        anomalies: List[Dict[str, Any]] = []
-        if df.empty or 'balance' not in df.columns or 'amount' not in df.columns:
-            return anomalies
-        sorted_df = df.sort_values(['date', 'original_idx'])
-        daily_end = sorted_df.groupby('date').last()
-        daily_net = df.groupby('date')['amount'].sum().reset_index()
-        merged = pd.merge(daily_end[['balance']], daily_net, left_index=True, right_on='date', how='left')
-
-        tolerance_yuan = PrecisionEngine.from_integer_li(tolerance_li)
-        prev_valid_balance = None
-        cum_net = Decimal('0')  # 自最近一个有效余额日之后（不含当日）的累计净额
-        for _, row in merged.iterrows():
-            balance, net = row['balance'], row['amount']
-            net_val = Decimal('0') if pd.isna(net) else net
-            if pd.isna(balance):
-                # 空余额日：无法校验，但当日净额计入累计，不断链
-                cum_net += net_val
-                continue
-            if prev_valid_balance is not None:
-                period_net = cum_net + net_val
-                expected = prev_valid_balance + period_net
-                diff = abs(balance - expected)
-                if Decimal(str(diff)) > tolerance_yuan:
-                    anomalies.append({
-                        '来源': source, '日期': row['date'], '基准余额': prev_valid_balance,
-                        '区间净额': period_net, '预期余额': expected,
-                        '实际余额': balance, '差额': diff
-                    })
-            prev_valid_balance = balance
-            cum_net = Decimal('0')
-        return anomalies
+        """按原文件顺序复用总体控制的逐行余额连续性检查。"""
+        return check_row_balance_continuity(
+            df,
+            tolerance_li=tolerance_li,
+            source=source,
+        )
 
     def calculate_daily_stats(self, bank: pd.DataFrame, journal: pd.DataFrame) -> pd.DataFrame:
         """计算每日统计对比数据。"""
@@ -385,30 +365,30 @@ class Reporter:
         return safe
 
     def _prepare_initial_balance(self) -> tuple[bool, bool]:
-        bank = self.matcher.bank
-        journal = self.matcher.journal
-        journal_source = (
-            self.raw_journal
-            if self.raw_journal is not None
-            else journal
-        )
-        journal_initial = BalanceRecalculator.extract_initial_balance(
-            journal_source,
-            self.journal_mapping,
-        )
-        bank_initial = BalanceRecalculator.extract_initial_balance(
-            bank,
-            self.bank_mapping,
-        )
+        overall_control = getattr(self.matcher, "overall_control", None)
+        if overall_control is not None:
+            bank_initial = overall_control.bank_initial_balance or Decimal("0")
+            journal_initial = overall_control.journal_initial_balance or Decimal("0")
+            bank_has_balance = (
+                overall_control.bank_balance_status != "未实施"
+                and overall_control.bank_initial_balance is not None
+            )
+            journal_has_balance = (
+                overall_control.journal_balance_status != "未实施"
+                and overall_control.journal_initial_balance is not None
+            )
+        else:
+            bank_initial = BalanceRecalculator.extract_initial_balance(
+                self.matcher.bank,
+                source_type="bank",
+            )
+            journal_initial = BalanceRecalculator.extract_initial_balance(
+                self.matcher.journal,
+                source_type="journal",
+            )
+            bank_has_balance = self._has_balance_data(self.matcher.bank)
+            journal_has_balance = self._has_balance_data(self.matcher.journal)
         initial_diff = abs(bank_initial - journal_initial)
-        journal_has_balance = self._has_balance_data(
-            journal_source,
-            self.journal_mapping,
-        )
-        bank_has_balance = self._has_balance_data(
-            bank,
-            self.bank_mapping,
-        )
         balance_check_possible = bank_has_balance and journal_has_balance
         has_warning = (
             balance_check_possible and initial_diff > Decimal("0.01")
@@ -507,6 +487,8 @@ class Reporter:
                     "匹配ID": candidate.final_match_id
                     or candidate.candidate_id,
                     "候选ID": candidate.candidate_id,
+                    "候选稳定键": getattr(candidate, "stable_key", ""),
+                    "组成键": getattr(candidate, "composition_key", ""),
                     "阶段": candidate.match_stage,
                     "类型": self._match_type_name(candidate.match_type),
                     "最终状态": candidate.processing_status.value,
@@ -514,7 +496,18 @@ class Reporter:
                     "系统结论": candidate.processing_status.value,
                     "判断依据": candidate.processing_reason,
                     "业务分组依据": candidate.evidence.get("business_basis", ""),
+                    "批次核查线索": candidate.evidence.get("batch_review_hint", ""),
                     "其他可能对应": self._alternative_composition(candidate, candidate_by_id),
+                    "竞争组其他候选总数": int(
+                        candidate.evidence.get(
+                            "alternative_candidate_count",
+                            len(candidate.evidence.get("alternative_candidate_ids", ())),
+                        )
+                        or 0
+                    ),
+                    "本报告列示候选数": len(
+                        candidate.evidence.get("alternative_candidate_ids", ())
+                    ),
                     "建议动作": self._suggested_action(candidate.risk_level.value),
                     "处理原因": candidate.processing_reason,
                     "综合可信度": candidate.scores.total,
@@ -717,8 +710,9 @@ class Reporter:
 
     def _build_match_group_table(self) -> pd.DataFrame:
         columns = [
-            "系统结论", "风险等级", "判断依据", "业务分组依据", "其他可能对应", "建议动作", "匹配ID",
-            "类型", "银行笔数", "日记账笔数", "银行合计", "日记账合计",
+            "系统结论", "风险等级", "判断依据", "业务分组依据", "批次核查线索", "其他可能对应",
+            "竞争组其他候选总数", "本报告列示候选数", "建议动作", "匹配ID",
+            "候选稳定键", "组成键", "类型", "银行笔数", "日记账笔数", "银行合计", "日记账合计",
             "总差额", "最早日期", "最晚日期", "候选ID", "阶段", "最终状态", "处理原因",
             "综合可信度", "金额分", "日期分", "文字分", "结构分",
             "银行收入", "银行支出", "银行净额", "日记账收入",
@@ -740,9 +734,19 @@ class Reporter:
     def _alternative_composition(self, candidate: Any, candidate_by_id: dict) -> str:
         """展示仍有可能的对应关系，行号直接指向两份原始文件。"""
         candidate_ids = candidate.evidence.get("alternative_candidate_ids", ())
-        if len(candidate_ids) > 10:
-            return f"另有{len(candidate_ids)}套可能对应；完整组成见“其他可能对应明细”，按匹配ID查找。"
+        total = int(
+            candidate.evidence.get("alternative_candidate_count", len(candidate_ids))
+            or 0
+        )
+        if total <= len(candidate_ids) and len(candidate_ids) > 10:
+            return f"另有{total}套可能对应；完整组成见“其他可能对应明细”，按匹配ID查找。"
         descriptions = []
+        if total > len(candidate_ids):
+            descriptions.append(
+                f"所在竞争组除本关系外共{total}套候选关系；"
+                f"本报告按稳定优先顺序仅列{len(candidate_ids)}套，"
+                f"其余{total - len(candidate_ids)}套未逐项展开。"
+            )
         for candidate_id in candidate_ids:
             other = candidate_by_id.get(candidate_id)
             if other is None:
@@ -757,7 +761,9 @@ class Reporter:
                     if len(indexes) <= 30 else f"共{len(indexes)}笔，逐行见“其他可能对应明细”"
                 )
                 sides.append(f"{label}原文件行：{row_numbers}")
-            descriptions.append("；".join(sides))
+            descriptions.append(
+                f"对应候选：{candidate_id}；" + "；".join(sides)
+            )
         return "\n".join(descriptions)
 
     def _build_alternative_component_table(self) -> pd.DataFrame:
@@ -778,6 +784,24 @@ class Reporter:
                         amount = float(row["amount"])
                         rows.append({
                             "匹配ID": selected.final_match_id or selected.candidate_id,
+                            "竞争组其他候选总数": int(
+                                selected.evidence.get(
+                                    "alternative_candidate_count",
+                                    len(selected.evidence.get("alternative_candidate_ids", ())),
+                                )
+                                or 0
+                            ),
+                            "本报告列示候选数": len(
+                                selected.evidence.get("alternative_candidate_ids", ())
+                            ),
+                            "是否截断列示": (
+                                "是"
+                                if selected.evidence.get("alternative_candidates_truncated")
+                                else "否"
+                            ),
+                            "候选稳定键": getattr(other, "stable_key", ""),
+                            "组成键": getattr(other, "composition_key", ""),
+                            "对应候选ID": candidate_id,
                             "对应方案": number,
                             "对应性质": "竞争关系，尚不能唯一确认",
                             "来源": source,
@@ -788,6 +812,7 @@ class Reporter:
                             "摘要": row.get("summary", ""),
                             "辅助文字": self._auxiliary_text(row),
                             "业务分组依据": other.evidence.get("business_basis", ""),
+                            **self._source_evidence_columns(row),
                         })
         return pd.DataFrame(rows)
 
@@ -802,11 +827,95 @@ class Reporter:
             )
         return ""
 
+    @staticmethod
+    def _source_evidence_columns(row: pd.Series) -> Dict[str, Any]:
+        """把金额和凭证证据展开成审计人员可直接查看的普通列。"""
+        def mapping_text(value: Any, *, exclude: Any = None) -> str:
+            if not isinstance(value, dict):
+                return ""
+            parts = []
+            for key in sorted(value, key=lambda item: str(item)):
+                if exclude is not None and str(key) == str(exclude):
+                    continue
+                item = value[key]
+                if item is None or (isinstance(item, str) and not item.strip()):
+                    continue
+                parts.append(
+                    f"{clean_excel_string(key)}={clean_excel_string(item)}"
+                )
+            return "；".join(parts)
+
+        amount_evidence = row.get("amount_evidence", {})
+        if not isinstance(amount_evidence, dict):
+            amount_evidence = {}
+        date_evidence = row.get("date_evidence", {})
+        if not isinstance(date_evidence, dict):
+            date_evidence = {}
+        scope_evidence = row.get("scope_evidence", {})
+        if not isinstance(scope_evidence, dict):
+            scope_evidence = {}
+        voucher_evidence = row.get("voucher_evidence", {})
+        if not isinstance(voucher_evidence, dict):
+            voucher_evidence = {}
+        amount = row.get("amount", None)
+        try:
+            standardized_amount = float(amount) if amount is not None else None
+        except (TypeError, ValueError):
+            standardized_amount = amount
+        inherited = voucher_evidence.get("inherited")
+        return {
+            "原日期列名": date_evidence.get("date_column", ""),
+            "原日期值": date_evidence.get("original_value"),
+            "其他业务日期列及原值": mapping_text(
+                date_evidence.get("related_date_values", {}),
+                exclude=date_evidence.get("date_column"),
+            ),
+            "采用金额口径": amount_evidence.get("amount_basis", ""),
+            "原始金额模式": amount_evidence.get("mode", ""),
+            "原借方列名": amount_evidence.get("debit_column", ""),
+            "原借方值": amount_evidence.get("debit_value"),
+            "原贷方列名": amount_evidence.get("credit_column", ""),
+            "原贷方值": amount_evidence.get("credit_value"),
+            "原金额列名": amount_evidence.get("amount_column", ""),
+            "原金额值": amount_evidence.get("amount_value"),
+            "原方向列名": amount_evidence.get("direction_column", ""),
+            "原方向值": amount_evidence.get("direction_value"),
+            "原始相关金额列及原值": mapping_text(
+                amount_evidence.get("related_amount_values", {})
+            ),
+            "标准化净额": standardized_amount,
+            "原账户列名": scope_evidence.get("account_column", ""),
+            "原账户值": scope_evidence.get("account_value", ""),
+            "原币种列名": scope_evidence.get("currency_column", ""),
+            "原币种值": scope_evidence.get("currency_value", ""),
+            "其他币种列及原值": mapping_text(
+                scope_evidence.get("related_currency_values", {}),
+                exclude=scope_evidence.get("currency_column"),
+            ),
+            "原凭证字列名": voucher_evidence.get("voucher_word_column", ""),
+            "原凭证字值": voucher_evidence.get("voucher_word_original_value"),
+            "解析后凭证字": voucher_evidence.get("voucher_word_resolved_value"),
+            "原凭证列名": voucher_evidence.get("voucher_column", ""),
+            "原凭证值": voucher_evidence.get("original_value"),
+            "解析后凭证号": voucher_evidence.get("resolved_value"),
+            "凭证是否继承": (
+                "是" if inherited is True else "否" if inherited is False else ""
+            ),
+        }
+
     def _build_match_component_table(self) -> pd.DataFrame:
         columns = [
             "匹配ID", "候选ID", "来源", "原文件行号", "日期", "金额", "收支方向",
-            "摘要", "辅助文字", "凭证号", "类型", "处理状态",
-            "纳入风险池",
+            "摘要", "辅助文字", "凭证字", "凭证号", "类型", "处理状态",
+            "纳入风险池", "候选稳定键", "组成键",
+            "原日期列名", "原日期值", "其他业务日期列及原值",
+            "采用金额口径", "原始金额模式", "原借方列名", "原借方值",
+            "原贷方列名", "原贷方值", "原金额列名", "原金额值",
+            "原方向列名", "原方向值", "原始相关金额列及原值", "标准化净额",
+            "原账户列名", "原账户值", "原币种列名", "原币种值",
+            "其他币种列及原值", "原凭证字列名",
+            "原凭证字值", "解析后凭证字", "原凭证列名",
+            "原凭证值", "解析后凭证号", "凭证是否继承",
         ]
         rows: list[dict[str, Any]] = []
         candidates = list(
@@ -833,6 +942,8 @@ class Reporter:
                             {
                                 "匹配ID": candidate.final_match_id,
                                 "候选ID": candidate.candidate_id,
+                                "候选稳定键": getattr(candidate, "stable_key", ""),
+                                "组成键": getattr(candidate, "composition_key", ""),
                                 "来源": source_name,
                                 "原文件行号": int(
                                     row.get(
@@ -847,6 +958,11 @@ class Reporter:
                                 ),
                                 "摘要": row.get("summary", ""),
                                 "辅助文字": self._auxiliary_text(row),
+                                "凭证字": (
+                                    row.get("voucher_word", "")
+                                    if source_name == "日记账"
+                                    else ""
+                                ),
                                 "凭证号": (
                                     row.get("voucher_no", "")
                                     if source_name == "日记账"
@@ -864,6 +980,7 @@ class Reporter:
                                     )
                                     else "否"
                                 ),
+                                **self._source_evidence_columns(row),
                             }
                         )
         else:
@@ -894,6 +1011,11 @@ class Reporter:
                             ),
                             "摘要": row.get("summary", ""),
                             "辅助文字": self._auxiliary_text(row),
+                            "凭证字": (
+                                row.get("voucher_word", "")
+                                if source_name == "日记账"
+                                else ""
+                            ),
                             "凭证号": (
                                 row.get("voucher_no", "")
                                 if source_name == "日记账"
@@ -904,6 +1026,9 @@ class Reporter:
                             ),
                             "处理状态": "自动确认",
                             "纳入风险池": "否",
+                            "候选稳定键": "",
+                            "组成键": "",
+                            **self._source_evidence_columns(row),
                         }
                     )
         return pd.DataFrame(rows, columns=columns)
@@ -1033,6 +1158,9 @@ class Reporter:
         )
         raw = self.raw_bank if source == "bank" else self.raw_journal
         unmatched = frame[~frame["matched"]]
+        evidence_columns = list(
+            self._source_evidence_columns(pd.Series(dtype="object")).keys()
+        )
         if raw is not None and not unmatched.empty:
             valid = unmatched[unmatched["original_idx"].map(lambda index: 0 <= int(index) - 1 < len(raw))]
             positions = [int(index) - 1 for index in valid["original_idx"]]
@@ -1043,6 +1171,12 @@ class Reporter:
                     label = "输入表的" + label
                 result = result.rename(columns={"原文件行号": label})
             result.insert(0, "原文件行号", valid.get("original_file_row", valid["original_idx"]).map(int).tolist())
+            evidence_rows = [
+                self._source_evidence_columns(row)
+                for _, row in valid.iterrows()
+            ]
+            for column in evidence_columns:
+                result[column] = [item[column] for item in evidence_rows]
             for column in result.columns:
                 text = str(column).lower()
                 if any(
@@ -1055,7 +1189,7 @@ class Reporter:
                         _restore_numeric_cells
                     )
             return result
-        columns = ["日期", "金额", "摘要", "原文件行号"]
+        columns = ["日期", "金额", "摘要", "原文件行号", *evidence_columns]
         if unmatched.empty:
             return pd.DataFrame(columns=columns)
         result = pd.DataFrame(
@@ -1069,6 +1203,12 @@ class Reporter:
                 ),
             }
         )
+        evidence_rows = [
+            self._source_evidence_columns(row)
+            for _, row in unmatched.iterrows()
+        ]
+        for column in evidence_columns:
+            result[column] = [item[column] for item in evidence_rows]
         return result.sort_values(
             ["日期", "金额"],
             kind="stable",
@@ -1091,6 +1231,18 @@ class Reporter:
             ("组合最大深度", config.max_dfs_depth),
             ("批量最少笔数", config.batch_min_count),
             ("最大候选数", config.max_candidates),
+            (
+                "组合搜索每来源节点上限",
+                config.combination_node_limit_per_source,
+            ),
+            (
+                "组合搜索单任务时间上限（秒）",
+                config.combination_task_timeout_seconds,
+            ),
+            (
+                "组合搜索全局时间上限（秒）",
+                config.combination_global_time_limit_seconds,
+            ),
             ("是否允许异号", "是" if config.allow_mixed_sign else "否"),
             ("日期格式", date_format),
             (
@@ -1114,11 +1266,51 @@ class Reporter:
             ("business_group_bank_rows", "完整业务组覆盖银行笔数"),
             ("business_group_journal_rows", "完整业务组覆盖序时账笔数"),
             ("generic_source_rows", "通用组合搜索来源笔数"),
+            ("fully_searched_source_rows", "组合搜索预算内完整来源笔数"),
             ("truncated_source_rows", "组合候选发生截断的来源笔数"),
+            ("depth_limited_source_rows", "组合搜索深度受限来源笔数"),
+            ("node_budget_exhausted_source_rows", "组合搜索节点预算耗尽来源笔数"),
+            ("task_timeout_source_rows", "组合搜索单任务超时来源笔数"),
+            ("global_timeout_unprocessed_source_rows", "组合搜索全局超时未处理来源笔数"),
+            ("worker_failure_source_rows", "组合搜索工作进程故障来源笔数"),
+            ("budget_exhausted_source_rows", "组合搜索预算耗尽来源笔数"),
             ("candidate_limit", "通用组合实际候选上限"),
         ):
             if key in search:
                 rows.append((label, search[key]))
+        if "search_budget" in search:
+            rows.append((
+                "组合搜索预算",
+                json.dumps(search["search_budget"], ensure_ascii=False, sort_keys=True),
+            ))
+        candidate_search = getattr(
+            self.matcher,
+            "run_parameters",
+            {},
+        ).get("candidate_search", {})
+        stage_labels = {
+            "business_group": "业务完整组",
+            "whitelist": "白名单",
+            "exact": "精确",
+            "tolerance": "容差",
+            "atomic_voucher": "完整凭证",
+            "generic_combination": "通用组合",
+        }
+        metric_labels = {
+            "examined": "候选检查数",
+            "retained": "候选保留数",
+            "truncated_source_rows": "候选截断来源笔数",
+        }
+        for stage, stage_label in stage_labels.items():
+            stage_stats = candidate_search.get(stage, {})
+            for metric, metric_label in metric_labels.items():
+                if metric in stage_stats:
+                    rows.append(
+                        (
+                            f"{stage_label}{metric_label}",
+                            stage_stats[metric],
+                        )
+                    )
         assistant = getattr(self.matcher, "llm_assistant", None)
         assistant_config = getattr(assistant, "config", None)
         rows.append(
@@ -1340,21 +1532,25 @@ class Reporter:
                         for item in differences
                     ]
                 )
-        continuity_rows = []
-        if bank_has_balance:
-            continuity_rows.extend(
-                self.check_balance_continuity(
-                    self.matcher.bank,
-                    source="银行流水",
+        overall_control = getattr(self.matcher, "overall_control", None)
+        if overall_control is not None:
+            continuity_rows = list(overall_control.continuity_anomalies)
+        else:
+            continuity_rows = []
+            if bank_has_balance:
+                continuity_rows.extend(
+                    self.check_balance_continuity(
+                        self.matcher.bank,
+                        source="银行流水",
+                    )
                 )
-            )
-        if journal_has_balance:
-            continuity_rows.extend(
-                self.check_balance_continuity(
-                    self.matcher.journal,
-                    source="日记账",
+            if journal_has_balance:
+                continuity_rows.extend(
+                    self.check_balance_continuity(
+                        self.matcher.journal,
+                        source="日记账",
+                    )
                 )
-            )
         if continuity_rows:
             tables["余额连续性异常"] = pd.DataFrame(continuity_rows)
         return tables
@@ -1438,14 +1634,45 @@ class Reporter:
             Decimal("0"),
         )
 
+        overall_control = getattr(self.matcher, "overall_control", None)
+        overall_limited = bool(
+            overall_control is not None and overall_control.scope_limited
+        )
+        scope_item_names = {
+            "日期范围",
+            "核对账户",
+            "核对币种",
+            "金额口径",
+            "金额方向",
+            "金额合计",
+            "总体余额控制",
+            "数据人口",
+        }
         range_items = (
-            [item for item in self.precheck_report.items if item.status == "疑点"]
-            if self.precheck_report is not None
+            [
+                item
+                for item in self.precheck_report.items
+                if item.status == "疑点" and item.name in scope_item_names
+            ]
+            if self.precheck_report is not None and overall_limited
             else []
         )
-        range_status = "范围受限" if range_items else (
-            "范围可用" if self.precheck_report is not None else "范围未验证"
+        range_status = (
+            "范围受限"
+            if overall_limited
+            else "范围可用"
+            if self.precheck_report is not None
+            else "范围未验证"
         )
+        balance_integrity_limited = bool(
+            getattr(self.matcher, "balance_integrity_limited", False)
+        )
+        if balance_integrity_limited:
+            system_conclusion = "已完成自动分析；总体余额控制异常，相关关系已降为疑点"
+        elif overall_limited:
+            system_conclusion = "已完成自动分析；总体资料尚未闭合，具体关系已按范围限制分流"
+        else:
+            system_conclusion = "核对已自动完成；疑点已分级列示，不依赖人工填写"
         high_or_unknown = (
             risk_counts.get("高风险", 0) + risk_counts.get("范围未知", 0)
         )
@@ -1464,8 +1691,104 @@ class Reporter:
             if balance_check_possible
             else "本次无双方可用余额，余额核对未实施"
         )
+        run_parameters = getattr(self.matcher, "run_parameters", {})
+        combination_search = run_parameters.get("combination_search", {})
+        candidate_search = run_parameters.get("candidate_search", {})
+        stage_labels = {
+            "business_group": "业务完整组",
+            "whitelist": "白名单",
+            "exact": "精确",
+            "tolerance": "容差",
+            "atomic_voucher": "完整凭证",
+            "generic_combination": "通用组合",
+        }
+        stage_truncations = {
+            stage: int(stats.get("truncated_source_rows", 0) or 0)
+            for stage, stats in candidate_search.items()
+            if isinstance(stats, dict)
+        }
+        generic_sources = int(
+            combination_search.get("generic_source_rows", 0) or 0
+        )
+        fully_searched = int(
+            combination_search.get("fully_searched_source_rows", 0) or 0
+        )
+        generic_truncated = int(
+            combination_search.get("truncated_source_rows", 0) or 0
+        )
+        budget_exhausted = int(
+            combination_search.get("budget_exhausted_source_rows", 0) or 0
+        )
+        depth_limited = int(
+            combination_search.get("depth_limited_source_rows", 0) or 0
+        )
+        node_exhausted = int(
+            combination_search.get("node_budget_exhausted_source_rows", 0) or 0
+        )
+        task_timeouts = int(
+            combination_search.get("task_timeout_source_rows", 0) or 0
+        )
+        global_timeouts = int(
+            combination_search.get(
+                "global_timeout_unprocessed_source_rows",
+                0,
+            ) or 0
+        )
+        worker_failures = int(
+            combination_search.get("worker_failure_source_rows", 0) or 0
+        )
+        has_ambiguity = any(
+            bool(getattr(candidate, "is_ambiguous", False))
+            for candidate in getattr(self.matcher, "candidates", ())
+        )
+        range_limited = bool(
+            budget_exhausted
+            or generic_truncated
+            or any(stage_truncations.values())
+        )
+        if range_limited:
+            search_completeness = "范围受限"
+        elif has_ambiguity:
+            search_completeness = "存在多解"
+        else:
+            search_completeness = "预算内完成"
+        search_coverage = (
+            f"通用来源{generic_sources}笔；"
+            f"预算内完整搜索{fully_searched}笔；"
+            f"预算受限{budget_exhausted}笔"
+        )
+        limitation_reasons = []
+        for stage, label in stage_labels.items():
+            if stage == "generic_combination":
+                continue
+            count = stage_truncations.get(stage, 0)
+            if count:
+                limitation_reasons.append(f"{label}截断{count}笔")
+        if generic_truncated:
+            limitation_reasons.append(
+                f"通用组合候选截断{generic_truncated}笔"
+            )
+        if depth_limited:
+            limitation_reasons.append(f"深度限制{depth_limited}笔")
+        if node_exhausted:
+            limitation_reasons.append(f"节点预算{node_exhausted}笔")
+        if task_timeouts:
+            limitation_reasons.append(f"单任务超时{task_timeouts}笔")
+        if global_timeouts:
+            limitation_reasons.append(f"全局超时未处理{global_timeouts}笔")
+        if worker_failures:
+            limitation_reasons.append(f"工作进程故障{worker_failures}笔")
+        if has_ambiguity:
+            limitation_reasons.append("存在多个可行对应关系")
+        search_reason = "；".join(limitation_reasons) or "未触发搜索限制"
+        search_explanation = (
+            f"候选搜索未穷尽；{search_reason}。"
+            "未找到对应不代表不存在组合。"
+            if range_limited or has_ambiguity
+            else "通用来源均在所列预算内完成。"
+        )
         rows = [
-            ("系统结论", "核对已自动完成；疑点已分级列示，不依赖人工填写"),
+            ("系统结论", system_conclusion),
             ("核对范围", range_status),
             ("范围说明", "；".join(item.name for item in range_items) or "未发现范围疑点"),
             ("银行有效交易笔数", len(self.matcher.bank)),
@@ -1476,7 +1799,10 @@ class Reporter:
             ("自动完成率说明", "表示程序完成分析，包含疑点归集，不等于核对一致比例。"),
             ("匹配率口径", "逐笔及组级比例以两侧有效行数之和为分母；分侧覆盖率以各侧有效行数为分母。仅计入零差额的自动确认或整组勾稽一致，疑点和自动归集不计入。"),
             ("金额覆盖率口径", "各侧已核对记录金额绝对值之和÷该侧全部有效记录金额绝对值之和，收支不抵销；分母为零时记为0。"),
-            ("组合搜索说明", f"通用搜索有{getattr(self.matcher, 'run_parameters', {}).get('combination_search', {}).get('truncated_source_rows', 0)}笔来源记录的候选发生数量截断；搜索另有深度边界，未找到对应不代表已穷尽所有组合。"),
+            ("组合搜索完整性", search_completeness),
+            ("组合搜索覆盖", search_coverage),
+            ("组合搜索受限原因", search_reason),
+            ("组合搜索说明", search_explanation),
             *coverage_rows,
             ("自动确认组数", status_counts.get("自动确认", 0)),
             ("自动确认金额", float(status_amounts.get("自动确认", Decimal("0")))),
@@ -1527,7 +1853,7 @@ class Reporter:
 
     def _build_issue_table(self) -> pd.DataFrame:
         columns = [
-            "系统结论", "风险等级", "判断依据", "建议动作", "事项类型",
+            "系统结论", "风险等级", "判断依据", "批次核查线索", "建议动作", "事项类型",
             "月份", "匹配类型", "银行笔数", "日记账笔数", "组金额", "差异金额",
             "银行原文件行号", "日记账原文件行号", "银行日期", "日记账日期",
             "银行金额", "日记账金额", "银行摘要", "日记账摘要",
@@ -1547,8 +1873,13 @@ class Reporter:
                 "系统结论": candidate.processing_status.value,
                 "风险等级": risk,
                 "判断依据": candidate.processing_reason,
+                "批次核查线索": candidate.evidence.get("batch_review_hint", ""),
                 "建议动作": self._suggested_action(risk),
-                "事项类型": "匹配或差异事项",
+                "事项类型": (
+                    "批次差异"
+                    if candidate.evidence.get("batch_difference")
+                    else "匹配或差异事项"
+                ),
                 "月份": min(candidate.bank_dates + candidate.journal_dates).strftime("%Y-%m")
                 if candidate.bank_dates or candidate.journal_dates else "",
                 "匹配类型": self._match_type_name(candidate.match_type),
@@ -1822,6 +2153,8 @@ class Reporter:
             tables["其他可能对应明细"] = alternatives
         if self.precheck_report is not None:
             tables["输入检查"] = self.precheck_report.to_dataframe()
+            tables["运行资料与映射"] = self.precheck_report.source_dataframe()
+            tables["数据人口处置"] = self.precheck_report.population_dataframe()
         tables["月度统计"] = monthly
         tables["每日统计"] = daily
         tables.update(
@@ -1866,16 +2199,34 @@ class Reporter:
     ) -> None:
         """生成组级清晰、可复核且防公式注入的 Excel 报告。"""
         del bank_path, journal_path
+        report_started = time.perf_counter()
         effective_config = config or self.matcher.config
+        table_started = time.perf_counter()
+        self._log("开始构造报告表格")
         tables = self.build_report_tables(
             effective_config,
             date_format=date_format,
+        )
+        total_rows = sum(len(table) for table in tables.values())
+        self._log(
+            f"报告表格构造完成：{len(tables):,} 个工作表，"
+            f"共 {total_rows:,} 行，耗时 {time.perf_counter() - table_started:.1f} 秒"
+        )
+        write_started = time.perf_counter()
+        self._log(
+            f"开始写入 Excel 工作簿：{len(tables):,} 个工作表，"
+            f"共 {total_rows:,} 行"
         )
         make_excel(
             list(tables.items()),
             output_path,
             theme="deep-navy",
         )
+        self._log(
+            f"工作簿初次写入完成，耗时 {time.perf_counter() - write_started:.1f} 秒"
+        )
+        presentation_started = time.perf_counter()
+        self._log("开始应用审计报告排版和复核标记")
         workbook = load_workbook(output_path)
         has_warning = bool(
             self.initial_balance_warning
@@ -1900,3 +2251,8 @@ class Reporter:
 
         self._apply_report_presentation(workbook)
         workbook.save(output_path)
+        self._log(
+            f"报告排版保存完成：排版耗时 "
+            f"{time.perf_counter() - presentation_started:.1f} 秒，"
+            f"报告总耗时 {time.perf_counter() - report_started:.1f} 秒"
+        )

@@ -117,11 +117,17 @@ def test_完整核对流程自动形成结论风险分级和待查事项(
         ignore_index=True,
     )
     unmatched = pd.read_excel(output_path, sheet_name="银行侧待查")
+    input_checks = pd.read_excel(output_path, sheet_name="输入检查")
 
     assert 0 <= _numeric_metric(summary, "逐笔精确匹配率") <= 1
     assert 0 <= _numeric_metric(summary, "自动完成率") <= 1
-    assert "自动确认" in set(groups["系统结论"])
-    assert "高风险" in set(pending["风险等级"])
+    assert not groups.empty
+    assert "自动确认" not in set(groups["系统结论"])
+    assert set(groups["系统结论"]) <= {"自动归集事项", "疑点事项"}
+    amount_control = input_checks.loc[input_checks["检查项目"] == "金额合计"]
+    assert len(amount_control) == 1
+    assert amount_control.iloc[0]["状态"] == "疑点"
+    assert set(pending["风险等级"]) == {"范围未知"}
     assert pending["系统结论"].notna().all()
     assert "银行独有记录" in set(unmatched["摘要"])
 

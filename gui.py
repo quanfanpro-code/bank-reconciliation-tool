@@ -22,6 +22,7 @@ from input_precheck import InputPrecheckBlockedError, InputPrecheckReport
 from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
+from matching_policy import COUNTERPARTY_FIELD_KEYWORDS
 
 
 # ─── 常量 ──────────────────────────────────────────────────────────────────────
@@ -48,13 +49,15 @@ AUXILIARY_COLUMN_KEYWORDS = (
     "摘要",
     "业务说明",
     "交易用途",
-    "对方户名",
+    *COUNTERPARTY_FIELD_KEYWORDS,
     "附言",
     "备注",
     "业务号",
     "业务编号",
     "批次号",
     "批次编号",
+    "银企批量号",
+    "银企批次号",
     "订单号",
     "合同号",
     "结算号",
@@ -121,6 +124,45 @@ def _auto_mapping_for_columns(
                     return label
         return None
 
+    def find_account():
+        normalized = {
+            label: label.strip().lower().replace("_", " ")
+            for label in labels
+        }
+        exact_names = (
+            "本方账号", "银行账号", "账号", "帐号", "卡号",
+            "account number", "account no", "account",
+        )
+        for name in exact_names:
+            for label, compact in normalized.items():
+                if compact == name:
+                    return label
+        excluded = (
+            "余额", "对方", "户名", "名称", "账户名",
+            "counterparty", "account name", "balance",
+        )
+        contained_names = (
+            "本方账号", "银行账号", "账号", "帐号", "卡号",
+            "account number", "account no",
+        )
+        for name in contained_names:
+            for label, compact in normalized.items():
+                if name in compact and not any(word in compact for word in excluded):
+                    return label
+        return None
+
+    def find_voucher_number():
+        value = find(["完整凭证号", "凭证号码", "凭证号", "voucher number", "voucher_no"])
+        if value:
+            return value
+        for label in labels:
+            compact = label.strip().lower()
+            if "凭证" in compact and not any(
+                keyword in compact for keyword in ("凭证字", "凭证类型", "凭证类别")
+            ):
+                return label
+        return None
+
     debit = find(
         ["借", "支出", "debit"]
         if is_bank
@@ -142,18 +184,31 @@ def _auto_mapping_for_columns(
     else:
         mode = "debit_credit"
 
+    amount_basis = ""
+    amount_labels = " ".join(
+        str(value) for value in (debit, credit, amount) if value
+    )
+    if "本位" in amount_labels:
+        amount_basis = "本位币"
+    elif "原币" in amount_labels:
+        amount_basis = "原币"
+
     return {
         "mode": mode,
         "date": find(["日期", "date", "交易时间", "time"]),
         "summary": find(
             ["摘要", "summary", "业务说明", "交易用途", "备注"]
         ),
-        "voucher": find(["凭证", "voucher"]),
+        "account": find_account(),
+        "currency": find(["原币币种", "币种", "currency", "币别"]),
+        "voucher_word": find(["凭证字", "凭证类型", "凭证类别"]),
+        "voucher": find_voucher_number(),
         "balance": find(["余额", "balance"]),
         "debit": debit,
         "credit": credit,
         "amount": amount,
         "direction": direction,
+        "amount_basis": amount_basis,
         "auxiliary_text_columns": auto_select_auxiliary_columns(labels),
     }
 
@@ -314,6 +369,17 @@ class ColumnMappingFrame(ctk.CTkFrame):
             values=["借贷分列", "单列金额+方向", "单列金额(含正负)"],
             width=180, command=self.refresh, state="readonly"
         ).pack(side=ctk.LEFT, padx=(4, 0))
+        ctk.CTkLabel(mode_row, text="金额口径:", width=72).pack(
+            side=ctk.LEFT, padx=(12, 0)
+        )
+        self.amount_basis_var = ctk.StringVar(value="(未指定)")
+        ctk.CTkComboBox(
+            mode_row,
+            variable=self.amount_basis_var,
+            values=["(未指定)", "本位币", "原币"],
+            width=105,
+            state="readonly",
+        ).pack(side=ctk.LEFT, padx=(4, 0))
 
         # 映射字段容器
         self.grid_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -435,6 +501,9 @@ class ColumnMappingFrame(ctk.CTkFrame):
 
         add("日期", "date")
         add("摘要", "summary")
+        add("本方账号", "account", True)
+        add("币种", "currency", True)
+        add("凭证字/类型", "voucher_word", True)
         add("凭证", "voucher", True)
         add("余额", "balance", True)
 
@@ -459,6 +528,10 @@ class ColumnMappingFrame(ctk.CTkFrame):
             if mode == "借贷分列"
             else ("single_amount_with_direction" if mode == "单列金额+方向" else "signed_amount")
         )
+        amount_basis = self.amount_basis_var.get()
+        m["amount_basis"] = (
+            "" if amount_basis == "(未指定)" else amount_basis
+        )
         m["auxiliary_text_columns"] = [
             column
             for column, variable in self.aux_vars.items()
@@ -477,6 +550,11 @@ class ColumnMappingFrame(ctk.CTkFrame):
         }
         self.mode_var.set(
             mode_names.get(mapping.get("mode"), "借贷分列")
+        )
+        self.amount_basis_var.set(
+            mapping.get("amount_basis")
+            if mapping.get("amount_basis") in {"本位币", "原币"}
+            else "(未指定)"
         )
         self.refresh()
         for key, value in mapping.items():
@@ -1772,7 +1850,13 @@ class ReconciliationApp(ctk.CTk):
             if not ok:
                 return False, message
 
-        for optional_key, optional_label in (("voucher", "凭证列"), ("balance", "余额列")):
+        for optional_key, optional_label in (
+            ("account", "本方账号列"),
+            ("currency", "币种列"),
+            ("voucher_word", "凭证字/类型列"),
+            ("voucher", "凭证列"),
+            ("balance", "余额列"),
+        ):
             if self._is_mapping_selected(mapping.get(optional_key)):
                 ok, message = ensure_column(optional_key, optional_label)
                 if not ok:
@@ -2090,6 +2174,11 @@ class ReconciliationApp(ctk.CTk):
             self.log(f"{'=' * 50}")
         except InputPrecheckBlockedError as exc:
             message = str(exc)
+            if exc.report_path:
+                message += f"\n\n输入问题报告：{exc.report_path}"
+                self.log(f"输入问题报告已保存至：{exc.report_path}")
+            elif exc.report_write_error:
+                message += f"\n\n输入问题报告写入失败：{exc.report_write_error}"
             self.log(f"输入预检查未通过：{message}")
             self.after(
                 0,
