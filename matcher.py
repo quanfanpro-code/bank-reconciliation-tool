@@ -56,6 +56,10 @@ from matching_policy import (
     score_text_fields,
 )
 from utils import normalize_summary
+from 业务分组 import (
+    row_business, business_evidence, complete_groups, has_business_conflict,
+    relationship_priority, candidate_sort_key,
+)
 
 # ==========================================
 # 辅助函数
@@ -196,9 +200,10 @@ def _meet_in_middle_solve(values: List[int], dates: List[pd.Timestamp], indices:
             return
         
         key = current_sum
-        if key not in left_subsets:
-            left_subsets[key] = []
-        left_subsets[key].append((list(path_idxs), list(path_dates)))
+        # 同一合计只保留笔数最少的一解，避免同额记录产生笛卡尔展开。
+        existing = left_subsets.get(key)
+        if existing is None or (len(path_idxs), tuple(path_idxs)) < (len(existing[0]), tuple(existing[0])):
+            left_subsets[key] = (list(path_idxs), list(path_dates))
         subset_count[0] += 1
         
         if subset_count[0] > MAX_SUBSETS:
@@ -220,22 +225,24 @@ def _meet_in_middle_solve(values: List[int], dates: List[pd.Timestamp], indices:
     if subset_count[0] > MAX_SUBSETS:
         return None
     
-    all_solutions = []
+    best_solution = None
     
     def dfs_right(start_idx, current_sum, path_idxs, path_dates):
+        nonlocal best_solution
         if len(path_idxs) > max_depth:
             return
         
         needed = target - current_sum
         if needed in left_subsets:
-            for left_idxs, left_dts in left_subsets[needed]:
-                combined_idxs = left_idxs + path_idxs
-                combined_dates = left_dts + path_dates
-                
-                if len(combined_idxs) > max_depth:
-                    continue
-                
-                all_solutions.append((combined_idxs, combined_dates))
+            left_idxs, left_dts = left_subsets[needed]
+            combined_idxs = left_idxs + path_idxs
+            combined_dates = left_dts + path_dates
+            if len(combined_idxs) <= max_depth and (
+                best_solution is None or
+                (len(combined_idxs), tuple(combined_idxs)) <
+                (len(best_solution[0]), tuple(best_solution[0]))
+            ):
+                best_solution = (combined_idxs, combined_dates)
         
         for i in range(start_idx, len(right_values)):
             val = right_values[i]
@@ -250,12 +257,10 @@ def _meet_in_middle_solve(values: List[int], dates: List[pd.Timestamp], indices:
     
     dfs_right(0, 0, [], [])
     
-    if not all_solutions:
+    if best_solution is None:
         return None
-    
-    all_solutions.sort(key=lambda x: len(x[0]))
-    
-    best_idxs, best_dates = all_solutions[0]
+
+    best_idxs, best_dates = best_solution
     
     if len(best_idxs) <= DFS_CONFIDENCE_HIGH_THRESHOLD:
         confidence = '高'
@@ -524,7 +529,8 @@ def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[List[int]], 
     # 解包配置
     max_depth = config.max_dfs_depth
     allow_mixed_sign = config.allow_mixed_sign
-    max_candidates = config.max_candidates
+    # ponytail: 通用子集最多30笔；更大批次通过业务完整组直接求和。
+    max_candidates = min(config.max_candidates, 30)
     date_window = config.dfs_date_window
     allow_zero_match = config.allow_zero_match
     allow_greedy_fallback = config.allow_greedy_fallback
@@ -660,21 +666,14 @@ def select_non_conflicting_candidates(
     """按统一分数稳定排序，确保任何一笔记录只被一个候选占用。"""
     ordered = sorted(
         candidates,
-        key=lambda item: (
-            0 if item.evidence.get("closed_group_fallback") else 1,
-            -item.scores.total,
-            item.metrics.total_diff_li,
-            item.date_span_days,
-            len(item.bank_idxs) + len(item.journal_idxs),
-            item.bank_idxs,
-            item.journal_idxs,
-            item.candidate_id,
-        ),
+        key=candidate_sort_key,
     )
     used_bank: Set[int] = set()
     used_journal: Set[int] = set()
     selected: List[MatchCandidate] = []
     for candidate in ordered:
+        if has_business_conflict(candidate) and candidate.metrics.total_diff_li:
+            continue
         if used_bank.intersection(candidate.bank_idxs):
             continue
         if used_journal.intersection(candidate.journal_idxs):
@@ -767,6 +766,10 @@ class Matcher:
         self._execution_config = replace(self.config, random_seed=actual_seed)
         self._collecting_candidates = False
         self.stopping = False
+        self._business_rows = {
+            "bank": {int(index): row_business(row) for index, row in self.bank.iterrows()},
+            "journal": {int(index): row_business(row) for index, row in self.journal.iterrows()},
+        }
         
     def _get_memory_usage_gb(self) -> float:
         if PSUTIL_AVAILABLE:
@@ -896,6 +899,10 @@ class Matcher:
             rule_matched=bool(evidence.pop("is_rule_matched", False)),
             evidence=dict(evidence),
         )
+        candidate.evidence.update(business_evidence(
+            [self._business_rows["bank"][index] for index in bank_tuple],
+            [self._business_rows["journal"][index] for index in journal_tuple],
+        ))
         self._score_existing_candidate(candidate)
         self.candidates.append(candidate)
         self._candidate_ids.add(candidate_id)
@@ -903,25 +910,36 @@ class Matcher:
 
     def _refresh_candidate_ambiguity(self) -> None:
         """候选全部生成后，再识别真正存在多个去向的记录。"""
-        bank_options: Dict[int, Set[Tuple[int, ...]]] = {}
-        journal_options: Dict[int, Set[Tuple[int, ...]]] = {}
-        for candidate in self.candidates:
-            for bank_index in candidate.bank_idxs:
-                bank_options.setdefault(bank_index, set()).add(candidate.journal_idxs)
-            for journal_index in candidate.journal_idxs:
-                journal_options.setdefault(journal_index, set()).add(candidate.bank_idxs)
-
-        for candidate in self.candidates:
-            if candidate.evidence.get("resolves_full_group", False):
-                candidate.is_ambiguous = False
-            else:
-                candidate.is_ambiguous = any(
-                    len(bank_options[index]) > 1 for index in candidate.bank_idxs
-                ) or any(
-                    len(journal_options[index]) > 1
-                    for index in candidate.journal_idxs
-                )
-            self._score_existing_candidate(candidate)
+        for group in self._group_ambiguous_candidates():
+            for candidate in group:
+                alternatives = []
+                for other in group:
+                    if has_business_conflict(other):
+                        continue
+                    other_priority = relationship_priority(other)
+                    own_priority = relationship_priority(candidate)
+                    if candidate.evidence.get("business_strength", 0) <= 1:
+                        # 无业务身份依据时，零差只能排序，不能证明别的去向不存在。
+                        other_priority, own_priority = other_priority[:-1], own_priority[:-1]
+                    if other_priority < own_priority:
+                        continue
+                    if (candidate.bank_idxs, candidate.journal_idxs) == (other.bank_idxs, other.journal_idxs):
+                        continue
+                    if not (set(candidate.bank_idxs) & set(other.bank_idxs) or
+                            set(candidate.journal_idxs) & set(other.journal_idxs)):
+                        continue
+                    # 完整且无冲突的组可以包含内部逐笔多解，但不能吞掉组外竞争。
+                    if (candidate.evidence.get("resolves_full_group")
+                            and not has_business_conflict(candidate)
+                            and (candidate.metrics.total_diff_li == 0
+                                 or candidate.evidence.get("complete_business_id"))
+                            and set(other.bank_idxs) <= set(candidate.bank_idxs)
+                            and set(other.journal_idxs) <= set(candidate.journal_idxs)):
+                        continue
+                    alternatives.append(other.candidate_id)
+                candidate.evidence["alternative_candidate_ids"] = sorted(alternatives)
+                candidate.is_ambiguous = bool(alternatives)
+                self._score_existing_candidate(candidate)
 
     def _group_ambiguous_candidates(
         self,
@@ -975,6 +993,7 @@ class Matcher:
             for candidate in self.candidates
             if candidate.metrics.total_diff_li == 0
             and not candidate.evidence.get("closed_group_fallback")
+            and not has_business_conflict(candidate)
         ]
         for group in self._group_ambiguous_candidates(exact_candidates):
             if len(group) < 2:
@@ -1007,16 +1026,7 @@ class Matcher:
 
     @staticmethod
     def _candidate_sort_key(candidate: MatchCandidate) -> Tuple[Any, ...]:
-        return (
-            0 if candidate.evidence.get("closed_group_fallback") else 1,
-            -candidate.scores.total,
-            candidate.metrics.total_diff_li,
-            candidate.date_span_days,
-            len(candidate.bank_idxs) + len(candidate.journal_idxs),
-            candidate.bank_idxs,
-            candidate.journal_idxs,
-            candidate.candidate_id,
-        )
+        return candidate_sort_key(candidate)
 
     def _llm_candidate_limit(self) -> int:
         configured = getattr(self.llm_assistant, "candidate_limit", None)
@@ -1432,6 +1442,7 @@ class Matcher:
 
     def run(self) -> List[Dict[str, Any]]:
         candidate_steps = [
+            ("业务完整组匹配", self.match_business_groups),
             ("白名单规则匹配", self.match_whitelist_rules),
             ("精确匹配", self.match_exact_1to1),
             ("日期容差匹配", self.match_tolerance),
@@ -1459,6 +1470,50 @@ class Matcher:
             self._commit_selected_candidates()
             
         return self.matches
+
+    def match_business_groups(self) -> None:
+        groups = {side: complete_groups(rows, self.config.dfs_date_window)
+                  for side, rows in self._business_rows.items()}
+        journal_by_amount = {}
+        journal_by_id = {}
+        for _, indices in groups["journal"]:
+            total = sum(int(self.journal.at[i, "amount_decimal"]) for i in indices)
+            journal_by_amount.setdefault(total, []).append(indices)
+            for identifier in set().union(*(self._business_rows["journal"][i]["ids"] for i in indices)):
+                journal_by_id.setdefault(identifier, []).append(indices)
+        for _, bank_idxs in groups["bank"]:
+            if self.stopping:
+                return
+            total = sum(int(self.bank.at[i, "amount_decimal"]) for i in bank_idxs)
+            if not total and not self.config.allow_zero_match:
+                continue
+            rows = [self._business_rows["bank"][i] for i in bank_idxs]
+            possible = set(journal_by_amount.get(total, []))
+            for identifier in set().union(*(row["ids"] for row in rows)):
+                possible.update(journal_by_id.get(identifier, []))
+            for journal_idxs in sorted(possible):
+                others = [self._business_rows["journal"][i] for i in journal_idxs]
+                evidence = business_evidence(rows, others)
+                if evidence["business_conflicts"] or not evidence["business_strength"]:
+                    continue
+                if len(bank_idxs) == len(journal_idxs) == 1 and (
+                        not evidence["shared_business_id"] or
+                        total == int(self.journal.at[journal_idxs[0], "amount_decimal"])):
+                    continue
+                if {row["sign"] for row in rows + others} not in ({1}, {-1}, {0}):
+                    continue
+                if (evidence["business_strength"] <= 1
+                        and len(bank_idxs) == len(self.bank)
+                        and len(journal_idxs) == len(self.journal)):
+                    # 全表普通摘要组沿用日/月总额类型，保持现有报告分类。
+                    continue
+                dates = [row["date"] for row in rows + others]
+                if (max(dates) - min(dates)).days > self.config.dfs_date_window:
+                    continue
+                self._add_candidate(bank_idxs, journal_idxs, "business_group", "业务完整组",
+                                    resolves_full_group=True, is_rule_matched=True,
+                                    complete_business_id=evidence["shared_business_id"])
+        self._commit_if_standalone()
 
     def match_exact_1to1(self) -> None:
         """为同日同金额记录生成一对一候选，不在本阶段抢占记录。"""
@@ -1707,6 +1762,22 @@ class Matcher:
         add_run(run, run_summary)
 
     def match_dfs_combinations(self) -> None:
+        self._combination_covered = {"bank": set(), "journal": set()}
+        for candidate in self.candidates:
+            if (candidate.evidence.get("resolves_full_group")
+                    and candidate.evidence.get("business_strength", 0) >= 2
+                    and (candidate.metrics.total_diff_li == 0
+                         or candidate.evidence.get("complete_business_id"))
+                    and not has_business_conflict(candidate)):
+                self._combination_covered["bank"].update(candidate.bank_idxs)
+                self._combination_covered["journal"].update(candidate.journal_idxs)
+        self.run_parameters["combination_search"] = {
+            "business_group_bank_rows": len(self._combination_covered["bank"]),
+            "business_group_journal_rows": len(self._combination_covered["journal"]),
+            "generic_source_rows": 0,
+            "truncated_source_rows": 0,
+            "candidate_limit": min(self.config.max_candidates, 30),
+        }
         self._dfs_one_to_many('bank', 'journal')
         self._dfs_one_to_many('journal', 'bank')
         self._commit_if_standalone()
@@ -1718,6 +1789,10 @@ class Matcher:
         else:
             sources = self.journal
             targets_df = self.bank
+
+        covered = getattr(self, "_combination_covered", {"bank": set(), "journal": set()})
+        sources = sources.loc[~sources.index.isin(covered[source_type])]
+        targets_df = targets_df.loc[~targets_df.index.isin(covered[target_type])]
             
         if sources.empty or targets_df.empty: return
 
@@ -1743,6 +1818,8 @@ class Matcher:
         source_amounts = sources['amount_decimal'].to_dict()
         
         for s_idx in source_indices:
+            if self.stopping:
+                return
             target_val = source_amounts[s_idx]
             s_date = source_dates[s_idx]
 
@@ -1753,8 +1830,19 @@ class Matcher:
             start_pos = np.searchsorted(tgt_dates, date_min_np, side='left')
             end_pos = np.searchsorted(tgt_dates, date_max_np, side='right')
 
-            window_view_dict = tgt_view_dict[start_pos:end_pos]
-            window_dates = tgt_dates[start_pos:end_pos]
+            source_profile = self._business_rows[source_type][int(s_idx)]
+            window_view_dict = [item for item in tgt_view_dict[start_pos:end_pos]
+                                if not business_evidence(
+                                    [source_profile] if source_type == "bank" else [self._business_rows[target_type][int(item["index"])]],
+                                    [self._business_rows[target_type][int(item["index"])]] if source_type == "bank" else [source_profile],
+                                )["business_conflicts"]]
+            window_dates = np.array([item["date"] for item in window_view_dict], dtype="datetime64[ns]")
+            if len(window_view_dict) < 2:
+                continue
+            coverage = self.run_parameters.get("combination_search")
+            if coverage is not None:
+                coverage["generic_source_rows"] += 1
+                coverage["truncated_source_rows"] += int(len(window_view_dict) > coverage["candidate_limit"])
             filtered_targets_data = {'dates': window_dates, 'view_dict': window_view_dict}
             tasks.append(
                 (

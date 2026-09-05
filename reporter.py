@@ -471,6 +471,7 @@ class Reporter:
             "monthly_total": "月总额",
             "cross_month_total": "跨月多对多",
             "closed_candidate_group": "整组勾稽",
+            "business_group": "业务完整组",
         }
         return names.get(match_type, match_type)
 
@@ -479,6 +480,10 @@ class Reporter:
         candidates = list(
             getattr(self.matcher, "selected_candidates", [])
         )
+        candidate_by_id = {
+            item.candidate_id: item
+            for item in getattr(self.matcher, "candidates", [])
+        }
         for candidate in candidates:
             all_dates = candidate.bank_dates + candidate.journal_dates
             bank_total_li = (
@@ -508,6 +513,8 @@ class Reporter:
                     "风险等级": candidate.risk_level.value,
                     "系统结论": candidate.processing_status.value,
                     "判断依据": candidate.processing_reason,
+                    "业务分组依据": candidate.evidence.get("business_basis", ""),
+                    "其他可能对应": self._alternative_composition(candidate, candidate_by_id),
                     "建议动作": self._suggested_action(candidate.risk_level.value),
                     "处理原因": candidate.processing_reason,
                     "综合可信度": candidate.scores.total,
@@ -710,7 +717,7 @@ class Reporter:
 
     def _build_match_group_table(self) -> pd.DataFrame:
         columns = [
-            "系统结论", "风险等级", "判断依据", "建议动作", "匹配ID",
+            "系统结论", "风险等级", "判断依据", "业务分组依据", "其他可能对应", "建议动作", "匹配ID",
             "类型", "银行笔数", "日记账笔数", "银行合计", "日记账合计",
             "总差额", "最早日期", "最晚日期", "候选ID", "阶段", "最终状态", "处理原因",
             "综合可信度", "金额分", "日期分", "文字分", "结构分",
@@ -729,6 +736,60 @@ class Reporter:
             )
         )
         return pd.DataFrame(rows, columns=columns)
+
+    def _alternative_composition(self, candidate: Any, candidate_by_id: dict) -> str:
+        """展示仍有可能的对应关系，行号直接指向两份原始文件。"""
+        candidate_ids = candidate.evidence.get("alternative_candidate_ids", ())
+        if len(candidate_ids) > 10:
+            return f"另有{len(candidate_ids)}套可能对应；完整组成见“其他可能对应明细”，按匹配ID查找。"
+        descriptions = []
+        for candidate_id in candidate_ids:
+            other = candidate_by_id.get(candidate_id)
+            if other is None:
+                continue
+            sides = []
+            for label, frame, indexes in (
+                ("银行", self.matcher.bank, other.bank_idxs),
+                ("序时账", self.matcher.journal, other.journal_idxs),
+            ):
+                row_numbers = (
+                    "、".join(str(int(frame.loc[index].get("original_file_row", frame.loc[index].get("original_idx", index)))) for index in indexes)
+                    if len(indexes) <= 30 else f"共{len(indexes)}笔，逐行见“其他可能对应明细”"
+                )
+                sides.append(f"{label}原文件行：{row_numbers}")
+            descriptions.append("；".join(sides))
+        return "\n".join(descriptions)
+
+    def _build_alternative_component_table(self) -> pd.DataFrame:
+        """每套竞争关系逐笔列出，不受一个Excel单元格长度限制。"""
+        candidates = {c.candidate_id: c for c in getattr(self.matcher, "candidates", [])}
+        rows = []
+        for selected in getattr(self.matcher, "selected_candidates", []):
+            for number, candidate_id in enumerate(selected.evidence.get("alternative_candidate_ids", ()), 1):
+                other = candidates.get(candidate_id)
+                if other is None:
+                    continue
+                for source, frame, indexes in (
+                    ("银行流水", self.matcher.bank, other.bank_idxs),
+                    ("银行存款序时账", self.matcher.journal, other.journal_idxs),
+                ):
+                    for index in indexes:
+                        row = frame.loc[index]
+                        amount = float(row["amount"])
+                        rows.append({
+                            "匹配ID": selected.final_match_id or selected.candidate_id,
+                            "对应方案": number,
+                            "对应性质": "竞争关系，尚不能唯一确认",
+                            "来源": source,
+                            "原文件行号": int(row.get("original_file_row", row.get("original_idx", index))),
+                            "日期": row.get("date", ""),
+                            "金额": abs(amount),
+                            "收支方向": "收入" if amount > 0 else "支出" if amount < 0 else "零金额",
+                            "摘要": row.get("summary", ""),
+                            "辅助文字": self._auxiliary_text(row),
+                            "业务分组依据": other.evidence.get("business_basis", ""),
+                        })
+        return pd.DataFrame(rows)
 
     @staticmethod
     def _auxiliary_text(row: pd.Series) -> str:
@@ -973,12 +1034,15 @@ class Reporter:
         raw = self.raw_bank if source == "bank" else self.raw_journal
         unmatched = frame[~frame["matched"]]
         if raw is not None and not unmatched.empty:
-            positions = [
-                int(index) - 1
-                for index in unmatched["original_idx"]
-                if 0 <= int(index) - 1 < len(raw)
-            ]
+            valid = unmatched[unmatched["original_idx"].map(lambda index: 0 <= int(index) - 1 < len(raw))]
+            positions = [int(index) - 1 for index in valid["original_idx"]]
             result = raw.iloc[positions].copy()
+            if "原文件行号" in result.columns:
+                label = "输入表的原文件行号"
+                while label in result.columns:
+                    label = "输入表的" + label
+                result = result.rename(columns={"原文件行号": label})
+            result.insert(0, "原文件行号", valid.get("original_file_row", valid["original_idx"]).map(int).tolist())
             for column in result.columns:
                 text = str(column).lower()
                 if any(
@@ -1045,6 +1109,16 @@ class Reporter:
             ),
             ("运行时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ]
+        search = getattr(self.matcher, "run_parameters", {}).get("combination_search", {})
+        for key, label in (
+            ("business_group_bank_rows", "完整业务组覆盖银行笔数"),
+            ("business_group_journal_rows", "完整业务组覆盖序时账笔数"),
+            ("generic_source_rows", "通用组合搜索来源笔数"),
+            ("truncated_source_rows", "组合候选发生截断的来源笔数"),
+            ("candidate_limit", "通用组合实际候选上限"),
+        ):
+            if key in search:
+                rows.append((label, search[key]))
         assistant = getattr(self.matcher, "llm_assistant", None)
         assistant_config = getattr(assistant, "config", None)
         rows.append(
@@ -1315,10 +1389,28 @@ class Reporter:
             item
             for item in candidates
             if item.metrics.total_diff_li == 0 and item not in row_level
+            and item.processing_status.value in {"自动确认", "整组勾稽一致"}
         ]
 
+        def side_indexes(items: list[Any], side: str) -> set[int]:
+            return {index for item in items for index in getattr(item, f"{side}_idxs")}
+
         def covered(items: list[Any]) -> int:
-            return sum(len(item.bank_idxs) + len(item.journal_idxs) for item in items)
+            return len(side_indexes(items, "bank")) + len(side_indexes(items, "journal"))
+
+        confirmed = row_level + group_level
+        coverage_rows = []
+        for label, side, frame in (
+            ("银行", "bank", self.matcher.bank),
+            ("序时账", "journal", self.matcher.journal),
+        ):
+            indexes = side_indexes(confirmed, side)
+            total_amount = sum((abs(int(value)) for value in frame["amount_decimal"]), 0)
+            confirmed_amount = sum(abs(int(frame.loc[index, "amount_decimal"])) for index in indexes)
+            coverage_rows.extend([
+                (f"{label}已核对笔数覆盖率", len(indexes) / len(frame) if len(frame) else 0.0),
+                (f"{label}已核对金额覆盖率", confirmed_amount / total_amount if total_amount else 0.0),
+            ])
 
         status_counts: Dict[str, int] = {}
         risk_counts: Dict[str, int] = {}
@@ -1381,6 +1473,11 @@ class Reporter:
             ("逐笔精确匹配率", covered(row_level) / total_rows if total_rows else 0.0),
             ("组级勾稽率", covered(group_level) / total_rows if total_rows else 0.0),
             ("自动完成率", 1.0 if total_rows else 0.0),
+            ("自动完成率说明", "表示程序完成分析，包含疑点归集，不等于核对一致比例。"),
+            ("匹配率口径", "逐笔及组级比例以两侧有效行数之和为分母；分侧覆盖率以各侧有效行数为分母。仅计入零差额的自动确认或整组勾稽一致，疑点和自动归集不计入。"),
+            ("金额覆盖率口径", "各侧已核对记录金额绝对值之和÷该侧全部有效记录金额绝对值之和，收支不抵销；分母为零时记为0。"),
+            ("组合搜索说明", f"通用搜索有{getattr(self.matcher, 'run_parameters', {}).get('combination_search', {}).get('truncated_source_rows', 0)}笔来源记录的候选发生数量截断；搜索另有深度边界，未找到对应不代表已穷尽所有组合。"),
+            *coverage_rows,
             ("自动确认组数", status_counts.get("自动确认", 0)),
             ("自动确认金额", float(status_amounts.get("自动确认", Decimal("0")))),
             ("整组勾稽组数", status_counts.get("整组勾稽一致", 0)),
@@ -1420,6 +1517,12 @@ class Reporter:
                 ("期初余额差额", float(warning.diff)),
                 ("期初余额状态", "不一致" if warning.has_warning else "一致"),
             ]
+        if not candidates and any(
+            frame["match_id"].fillna("").ne("").any()
+            for frame in (self.matcher.bank, self.matcher.journal)
+        ):
+            unavailable = "旧结果未保留核对状态依据，无法计算"
+            rows = [(name, unavailable if name.endswith("覆盖率") or name in {"逐笔精确匹配率", "组级勾稽率"} else value) for name, value in rows]
         return pd.DataFrame(rows, columns=["项目", "数值"])
 
     def _build_issue_table(self) -> pd.DataFrame:
@@ -1521,7 +1624,11 @@ class Reporter:
             "银行金额", "日记账金额", "调整凭证号", "责任人", "处理日期", "匹配ID",
         }
         amount_keywords = ("金额", "合计", "收入", "支出", "净额", "差额", "余额", "组金额")
-        percent_headers = {"逐笔精确匹配率", "组级勾稽率", "自动完成率"}
+        percent_headers = {
+            "逐笔精确匹配率", "组级勾稽率", "自动完成率",
+            "银行已核对笔数覆盖率", "银行已核对金额覆盖率",
+            "序时账已核对笔数覆盖率", "序时账已核对金额覆盖率",
+        }
         for sheet in workbook.worksheets:
             if sheet.title in technical_sheets:
                 sheet.sheet_state = "hidden"
@@ -1542,7 +1649,7 @@ class Reporter:
                 if sheet.title == "疑点事项" and cell.value in issue_hidden_columns:
                     sheet.column_dimensions[cell.column_letter].hidden = True
                 width = 14
-                if cell.value in {"系统结论", "判断依据", "建议动作", "摘要", "银行摘要", "日记账摘要", "说明"}:
+                if cell.value in {"系统结论", "判断依据", "业务分组依据", "其他可能对应", "建议动作", "摘要", "银行摘要", "日记账摘要", "说明"}:
                     width = 28
                 sheet.column_dimensions[cell.column_letter].width = width
                 header = str(cell.value or "")
@@ -1556,6 +1663,10 @@ class Reporter:
                         item.alignment = Alignment(vertical="top", wrap_text=True)
                         if any(keyword in header for keyword in amount_keywords):
                             item.number_format = '#,##0.00'
+                        if isinstance(item.value, str) and not sheet.column_dimensions[cell.column_letter].hidden:
+                            # 中文通常占两字符宽，按可见列估算换行，避免依据文字被固定行高遮住。
+                            lines = sum(max(1, (sum(2 if ord(c) > 127 else 1 for c in line) + width - 1) // width) for line in item.value.split("\n"))
+                            sheet.row_dimensions[item.row].height = min(409, max(sheet.row_dimensions[item.row].height or 20, lines * 16 + 4))
             if sheet.title == "核对结论":
                 headers = {cell.value: cell.column for cell in sheet[1] if cell.value is not None}
                 item_column = headers.get("项目", first_business_column)
@@ -1570,9 +1681,8 @@ class Reporter:
                     if sheet.cell(row=row, column=item_column).value in percent_headers:
                         sheet.cell(row=row, column=value_column).number_format = "0.00%"
                     value = sheet.cell(row=row, column=value_column).value
-                    sheet.row_dimensions[row].height = (
-                        32 if len(str(value or "")) > 20 else 20
-                    )
+                    text_width = sum(2 if ord(c) > 127 else 1 for c in str(value or ""))
+                    sheet.row_dimensions[row].height = min(409, max(32 if len(str(value or "")) > 20 else 20, ((text_width + 51) // 52) * 16 + 4))
             if sheet.title == "输入检查":
                 headers = {
                     cell.value: cell.column
@@ -1707,6 +1817,9 @@ class Reporter:
             if not groups.empty else groups.copy(),
             "匹配组成": self._build_match_component_table(),
         }
+        alternatives = self._build_alternative_component_table()
+        if not alternatives.empty:
+            tables["其他可能对应明细"] = alternatives
         if self.precheck_report is not None:
             tables["输入检查"] = self.precheck_report.to_dataframe()
         tables["月度统计"] = monthly

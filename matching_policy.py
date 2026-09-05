@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from difflib import SequenceMatcher
+from dataclasses import replace
 import re
 import unicodedata
 
@@ -261,6 +262,8 @@ def score_candidate(
         journal_fields,
         llm_semantic_score=llm_semantic_score,
     )
+    if "business_conflicts" in candidate.evidence:
+        text_evidence = replace(text_evidence, conflicting_fields=tuple(candidate.evidence["business_conflicts"]))
     scores = ScoreBreakdown(
         amount=_amount_score(candidate, config),
         date=_date_score(candidate, config),
@@ -339,7 +342,10 @@ def route_candidate(
         reasons.append("跨月多对多")
 
     has_relationship_risk = bool(reasons)
-    if candidate.evidence.get("resolves_full_group", False):
+    if (candidate.evidence.get("resolves_full_group", False)
+            and candidate.metrics.total_diff_li == 0
+            and not candidate.is_ambiguous
+            and not (candidate.text_evidence and candidate.text_evidence.conflicting_fields)):
         status = ProcessingStatus.GROUP_RECONCILED
         reasons.insert(0, "交易组收支分别闭合")
     elif candidate.metrics.total_diff_li > 0:

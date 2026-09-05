@@ -51,6 +51,15 @@ AUXILIARY_COLUMN_KEYWORDS = (
     "对方户名",
     "附言",
     "备注",
+    "业务号",
+    "业务编号",
+    "批次号",
+    "批次编号",
+    "订单号",
+    "合同号",
+    "结算号",
+    "交易流水号",
+    "回单号",
 )
 EXCLUDED_DEFAULT_AUXILIARY_KEYWORDS = (
     "账号",
@@ -1227,7 +1236,7 @@ class ReconciliationApp(ctk.CTk):
 
         # 日记账行
         self._build_file_row(
-            card, 2, "日记账:", self.journal_path, self.journal_skip,
+            card, 2, "序时账:", self.journal_path, self.journal_skip,
             self.journal_header_rows,
                              lambda: self.browse("journal"), lambda: self.auto_detect("journal"))
 
@@ -1354,7 +1363,7 @@ class ReconciliationApp(ctk.CTk):
             )
         ctk.CTkLabel(
             card,
-            text="超过重要性水平的组始终进入人工复核。",
+            text="按重要性水平对疑点分级，核对自动完成。",
             text_color=("gray40", "gray70"),
             wraplength=260,
             justify="left",
