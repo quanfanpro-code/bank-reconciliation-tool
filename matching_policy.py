@@ -357,23 +357,29 @@ def route_candidate(
 ) -> tuple[ProcessingStatus, RiskLevel, str]:
     """自动确定关系状态和风险等级，业务疑点不阻断处理。"""
     reasons: list[str] = []
+    hard_conflict = False
     if candidate.text_evidence and candidate.text_evidence.conflicting_fields:
         fields = "、".join(candidate.text_evidence.conflicting_fields)
         reasons.append(f"关键文字字段冲突：{fields}")
+        hard_conflict = True
     if candidate.is_ambiguous:
         reasons.append("候选歧义")
     if candidate.is_cross_month_many_to_many:
         reasons.append("跨月多对多")
+        hard_conflict = True
     if candidate.evidence.get("total_only_without_boundary"):
         reasons.append("仅日月总额闭合，缺少可证明完整范围的业务组边界")
+        hard_conflict = True
     if candidate.evidence.get("batch_boundary_uncertain"):
         reasons.append("同日同用途存在多个可能批次，资料不足以证明批次边界")
+        hard_conflict = True
     is_complete_group = bool(candidate.evidence.get("resolves_full_group", False))
     if (
         candidate.evidence.get("represents_full_observed_group")
         and not is_complete_group
     ):
         reasons.append("已保留完整组成，但缺少足以证明跨双方范围闭合的业务证据")
+        hard_conflict = True
     if (
         candidate.metrics.total_diff_li == 0
         and not is_complete_group
@@ -400,6 +406,7 @@ def route_candidate(
             "总体资料尚未闭合"
             + (f"：{control_reasons}" if control_reasons else "")
         )
+        hard_conflict = True
 
     has_relationship_risk = bool(reasons)
     if (is_complete_group
@@ -409,6 +416,18 @@ def route_candidate(
             and not (candidate.text_evidence and candidate.text_evidence.conflicting_fields)):
         status = ProcessingStatus.GROUP_RECONCILED
         reasons.insert(0, "交易组收支分别闭合")
+    elif (
+        candidate.metrics.total_diff_li == 0
+        and has_relationship_risk
+        and not hard_conflict
+        and candidate.metrics.group_amount_li
+        <= PrecisionEngine.to_integer_li(config.clearly_trivial_threshold)
+    ):
+        return (
+            ProcessingStatus.AUTO_CONFIRMED,
+            RiskLevel.NORMAL,
+            "金额明显微小自动确认（原疑点：" + "；".join(reasons) + "）",
+        )
     elif candidate.metrics.total_diff_li > 0:
         status = ProcessingStatus.AUTO_CLASSIFIED
         reasons.insert(0, "存在可量化金额差异")
@@ -428,6 +447,41 @@ def route_candidate(
         unquantifiable=overall_scope_limited,
     )
     return status, risk, "；".join(reasons)
+
+
+def apply_medium_risk_sampling(
+    candidates: Sequence[MatchCandidate],
+) -> dict[str, int]:
+    """中风险疑点按最早交易日期排序等距抽样，样本量与高风险候选数一致。"""
+    universe = [
+        candidate
+        for candidate in candidates
+        if candidate.risk_level is RiskLevel.MEDIUM
+        and candidate.processing_status
+        in {ProcessingStatus.FLAGGED, ProcessingStatus.AUTO_CLASSIFIED}
+    ]
+    high_count = sum(
+        1 for candidate in candidates if candidate.risk_level is RiskLevel.HIGH
+    )
+    total = len(universe)
+    sample_size = min(total, high_count)
+    universe.sort(
+        key=lambda candidate: (
+            (0, min(candidate.bank_dates + candidate.journal_dates))
+            if (candidate.bank_dates or candidate.journal_dates)
+            else (1, "")
+        )
+    )
+    picked = (
+        {int(index * total / sample_size) for index in range(sample_size)}
+        if sample_size
+        else set()
+    )
+    for index, candidate in enumerate(universe):
+        candidate.evidence["medium_sampling"] = (
+            "抽中待核查" if index in picked else "未抽中留存备查"
+        )
+    return {"medium_total": total, "sampled": sample_size}
 
 
 def bucket_distribution(amounts_li: Sequence[int]) -> tuple[int, ...]:

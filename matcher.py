@@ -52,6 +52,7 @@ from llm_assistant import (
 )
 from matching_policy import (
     _critical_field_category,
+    apply_medium_risk_sampling,
     apply_monthly_difference_pools,
     build_sensitive_field_signals,
     build_group_metrics,
@@ -1054,6 +1055,7 @@ class Matcher:
         self.selected_candidates: List[MatchCandidate] = []
         self.llm_records: List[LLMDecisionRecord] = []
         self.difference_pools: List[DifferencePoolResult] = []
+        self.medium_sampling_stats: Dict[str, int] = {}
         self.business_events: List[BusinessEvent] = []
         self.business_clues: List[BusinessClue] = []
         self._candidate_ids: Set[str] = set()
@@ -2313,6 +2315,10 @@ class Matcher:
             if match is not None:
                 match["risk_level"] = candidate.risk_level.value
                 match["processing_reason"] = candidate.processing_reason
+
+        self.medium_sampling_stats = apply_medium_risk_sampling(
+            self.selected_candidates,
+        )
 
     def _commit_if_standalone(self) -> None:
         """兼容直接调用单个匹配阶段的旧用法。"""

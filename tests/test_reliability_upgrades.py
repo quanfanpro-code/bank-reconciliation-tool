@@ -1,4 +1,4 @@
-﻿"""匹配可靠性补强测试。"""
+"""匹配可靠性补强测试。"""
 
 from decimal import Decimal
 from pathlib import Path
@@ -90,12 +90,15 @@ def test_明显微小金额差异和关键冲突一并自动披露():
 
 
 def test_金额一致但存在候选歧义时自动形成疑点():
-    candidate = _exact_candidate(is_ambiguous=True)
+    candidate = _exact_candidate(
+        is_ambiguous=True,
+        metrics=build_group_metrics([200_000_000], [200_000_000]),
+    )
 
     status, risk, reason = route_candidate(candidate, MatcherConfig())
 
     assert status is ProcessingStatus.FLAGGED
-    assert risk is RiskLevel.LOW
+    assert risk is RiskLevel.MEDIUM
     assert "候选歧义" in reason
 
 

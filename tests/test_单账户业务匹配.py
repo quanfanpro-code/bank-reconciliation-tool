@@ -102,7 +102,7 @@ def test_不同期间同凭证号不能作为一个业务组():
 
 
 def test_同额两对一仍有竞争组成():
-    m = 核对([记录(100, "收款", "甲公司"), 记录(100, "收款", "甲公司")], [记录(100, "收款", "甲公司")])
+    m = 核对([记录(60000, "收款", "甲公司"), 记录(60000, "收款", "甲公司")], [记录(60000, "收款", "甲公司")])
     c = m.selected_candidates[0]
     assert c.processing_status is ProcessingStatus.FLAGGED
     assert c.evidence["alternative_candidate_ids"]
@@ -153,9 +153,9 @@ def test_完整工资组不再进入通用子集搜索且记录覆盖范围():
 
 
 def test_同日同额两批工资对无批次汇总保留整批竞争():
-    银行 = [记录(-400, "8月工资", "张三", "A"), 记录(-600, "8月工资", "李四", "A"),
-            记录(-300, "8月工资", "王五", "B"), 记录(-700, "8月工资", "赵六", "B")]
-    m = 核对(银行, [记录(-1000, "8月工资", "工资")])
+    银行 = [记录(-4000, "8月工资", "张三", "A"), 记录(-6000, "8月工资", "李四", "A"),
+            记录(-3000, "8月工资", "王五", "B"), 记录(-7000, "8月工资", "赵六", "B")]
+    m = 核对(银行, [记录(-10000, "8月工资", "工资")])
     assert len(m.selected_candidates) == 1
     c = m.selected_candidates[0]
     assert c.processing_status is ProcessingStatus.FLAGGED
@@ -250,7 +250,7 @@ def test_跨年工资未明示年份时不能凭交易年制造冲突():
 
 @pytest.mark.parametrize("摘要", ["转账", "银行转账", "转账支出", "网上转账"])
 def test_宽泛转账摘要不能排除同额竞争(摘要):
-    m = 核对([记录(-1000, 摘要)], [记录(-990, 摘要), 记录(-1000, "支付货款")])
+    m = 核对([记录(-60000, 摘要)], [记录(-59000, 摘要), 记录(-60000, "支付货款")])
     c = m.selected_candidates[0]
     assert c.journal_idxs == (1,)
     assert c.processing_status is ProcessingStatus.FLAGGED

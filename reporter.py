@@ -1855,6 +1855,18 @@ class Reporter:
             ("高风险事项金额", float(risk_amounts.get("高风险", Decimal("0")))),
             ("范围未知事项数", risk_counts.get("范围未知", 0)),
             ("范围未知事项金额", float(risk_amounts.get("范围未知", Decimal("0")))),
+            *(
+                [
+                    ("中风险抽样总数", _sampling_stats["medium_total"]),
+                    ("中风险抽中待核查数", _sampling_stats["sampled"]),
+                ]
+                if (
+                    _sampling_stats := getattr(
+                        self.matcher, "medium_sampling_stats", None
+                    )
+                )
+                else []
+            ),
             ("银行侧待查笔数", len(bank_unmatched)),
             ("银行侧待查金额", float(bank_unmatched_amount)),
             ("日记账侧待查笔数", len(journal_unmatched)),
@@ -1904,12 +1916,20 @@ class Reporter:
                 and risk not in {"高风险", "范围未知"}
             ):
                 continue
+            sampling_mark = candidate.evidence.get("medium_sampling", "")
+            action = self._suggested_action(risk)
+            reason_text = candidate.processing_reason
+            if risk == "中风险" and sampling_mark == "抽中待核查":
+                reason_text += "；中风险等距抽样：抽中（样本量与高风险笔数一致）"
+            elif risk == "中风险" and sampling_mark == "未抽中留存备查":
+                action = "等距抽样未抽中，随同低风险留存备查，本次不留人工"
+                reason_text += "；中风险等距抽样：未抽中"
             row = {
                 "系统结论": candidate.processing_status.value,
                 "风险等级": risk,
-                "判断依据": candidate.processing_reason,
+                "判断依据": reason_text,
                 "批次核查线索": candidate.evidence.get("batch_review_hint", ""),
-                "建议动作": self._suggested_action(risk),
+                "建议动作": action,
                 "事项类型": (
                     "批次差异"
                     if candidate.evidence.get("batch_difference")
