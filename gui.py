@@ -1,4 +1,4 @@
-"""
+﻿"""
 银行流水核对工具 v3.0 — 卡片化 GUI
 
 布局结构（grid）：
@@ -6,6 +6,7 @@
 """
 
 import os
+import json
 import threading
 import queue
 from decimal import Decimal, InvalidOperation
@@ -272,7 +273,7 @@ def build_matcher_config(
 
 
 def build_llm_config(values: Mapping[str, object]) -> LLMConfig:
-    """校验并构造只保存在当前会话内的大模型配置。"""
+    """校验并构造大模型连接配置。"""
     enabled = _as_bool(values.get("enabled"), False)
     mode = str(values.get("mode", "online")).strip().lower() or "online"
     protocol = (
@@ -309,8 +310,8 @@ def build_llm_config(values: Mapping[str, object]) -> LLMConfig:
         timeout = float(timeout_text or "30")
     except ValueError as exc:
         raise ValueError("大模型超时必须是数字") from exc
-    if not 1 <= timeout <= 300:
-        raise ValueError("大模型超时必须在1到300秒之间")
+    if not 1 <= timeout <= 600:
+        raise ValueError("大模型超时必须在1到600秒之间")
     try:
         candidate_limit = int(limit_text or "5")
     except ValueError as exc:
@@ -699,7 +700,7 @@ class ColumnMappingDialog(ctk.CTkToplevel):
 
 
 class LLMConfigDialog(ctk.CTkToplevel):
-    """大模型会话配置窗口，密钥不写入任何配置文件。"""
+    """大模型会话配置窗口；启动时可由本机默认配置预填。"""
 
     def __init__(self, parent, current: LLMConfig):
         super().__init__(parent)
@@ -1262,11 +1263,21 @@ class ReconciliationApp(ctk.CTk):
         self.matcher = None
         self.theme_mode = "system"
         self.llm_config = LLMConfig()
+        self.project_store = LocalProjectStore()
+        default_path = self.project_store.root / "大模型默认配置.json"
+        try:
+            default_values = json.loads(default_path.read_text(encoding="utf-8-sig"))
+            if not isinstance(default_values, dict):
+                raise ValueError("默认配置结构不正确")
+            self.llm_config = build_llm_config(default_values)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError):
+            self.log("大模型默认配置读取失败，当前已关闭；可在配置与测试中重新填写。")
         self.bank_columns = []
         self.journal_columns = []
         self.bank_mapping_state = {}
         self.journal_mapping_state = {}
-        self.project_store = LocalProjectStore()
         self.last_report_path = None
 
         self._init_ui()
@@ -1412,7 +1423,8 @@ class ReconciliationApp(ctk.CTk):
             value=defaults["batch_min_count"]
         )
         self.date_fmt_var = ctk.StringVar(value="auto")
-        self.llm_status_var = ctk.StringVar(value="大模型辅助：关闭")
+        self.llm_status_var = ctk.StringVar()
+        self._refresh_llm_status()
 
         # 首页只保留用户确认过的三个核心策略
         params = [
@@ -1668,6 +1680,10 @@ class ReconciliationApp(ctk.CTk):
         if dialog.result is None:
             return
         self.llm_config = dialog.result
+        self._refresh_llm_status()
+
+    def _refresh_llm_status(self):
+        """启动加载和当前会话修改使用相同的启用状态显示。"""
         if self.llm_config.enabled:
             mode_name = (
                 "本地 LM Studio"
@@ -1675,7 +1691,7 @@ class ReconciliationApp(ctk.CTk):
                 else "在线 API"
             )
             self.llm_status_var.set(
-                f"大模型辅助：已启用（{mode_name}）"
+                f"大模型辅助：已启用（{mode_name} · {self.llm_config.model}）"
             )
         else:
             self.llm_status_var.set("大模型辅助：关闭")
