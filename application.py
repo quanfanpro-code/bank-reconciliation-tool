@@ -23,6 +23,7 @@ from input_precheck import (
 from llm_assistant import LLMConfig, LLMAssistant
 from matcher import Matcher
 from reporter import Reporter
+from 项目记录 import LocalProjectStore
 
 
 def _map_matcher_progress(value: float) -> float:
@@ -166,6 +167,7 @@ def run_reconciliation(
     precheck_warning_callback: Optional[
         Callable[[InputPrecheckReport], bool]
     ] = None,
+    project_store: Optional[LocalProjectStore] = None,
 ) -> Path:
     """读取、标准化、匹配并生成 Excel 报告。
 
@@ -399,4 +401,35 @@ def run_reconciliation(
         f"全部完成：报告生成耗时 {time.perf_counter() - report_started:.1f} 秒，"
         f"总耗时 {time.perf_counter() - total_started:.1f} 秒"
     )
+    history_started = time.perf_counter()
+    log("开始保存列映射模板和核对项目历史")
+    store = project_store or LocalProjectStore()
+    store.save_mapping_template(
+        "bank",
+        raw_bank.columns,
+        bank_mapping,
+        f"银行流水-{Path(bank_path).stem}",
+    )
+    store.save_mapping_template(
+        "journal",
+        raw_journal.columns,
+        journal_mapping,
+        f"银行存款序时账-{Path(journal_path).stem}",
+    )
+    store.save_project(
+        bank_path=bank_path,
+        journal_path=journal_path,
+        report_path=destination,
+        bank_mapping=bank_mapping,
+        journal_mapping=journal_mapping,
+        parameters=matcher_config,
+        result_counts={
+            "bank_rows": len(bank),
+            "journal_rows": len(journal),
+            "selected_groups": len(matcher.selected_candidates),
+            "business_events": len(matcher.business_events),
+            "business_clues": len(matcher.business_clues),
+        },
+    )
+    log(f"项目历史保存完成，耗时 {time.perf_counter() - history_started:.1f} 秒")
     return destination

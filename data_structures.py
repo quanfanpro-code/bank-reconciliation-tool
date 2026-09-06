@@ -153,6 +153,33 @@ class MatchCandidate:
     composition_key: str = ""
 
 
+@dataclass(frozen=True)
+class BusinessEvent:
+    """退款、退汇、冲销或重付形成的同侧完整业务链。"""
+
+    event_id: str
+    source: str
+    event_type: str
+    row_idxs: tuple[int, ...]
+    net_amount_li: int
+    relationship_formula: str
+    evidence_basis: str
+    is_cross_period: bool = False
+    review_status: str = "业务链已识别"
+
+
+@dataclass(frozen=True)
+class BusinessClue:
+    """证据不足以确认，但必须保留给审计人员的重复或冲销线索。"""
+
+    clue_id: str
+    source: str
+    clue_type: str
+    row_idxs: tuple[int, ...]
+    reason: str
+    impact_amount_li: int = 0
+
+
 @dataclass
 class DifferenceComponent:
     """一笔候选拆入某个自然月差异池的组成。"""

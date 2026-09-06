@@ -5,11 +5,12 @@
   输入卡片 | 参数配置卡片 → 列映射卡片（可折叠）→ 执行卡片 → 日志卡片
 """
 
+import os
 import threading
 import queue
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -23,6 +24,9 @@ from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
 from matching_policy import COUNTERPARTY_FIELD_KEYWORDS
+from 底稿筛选 import FilterCriteria, export_filtered_workpaper
+from 输入模板 import generate_input_templates
+from 项目记录 import LocalProjectStore
 
 
 # ─── 常量 ──────────────────────────────────────────────────────────────────────
@@ -1246,7 +1250,7 @@ class ReconciliationApp(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("银行流水核对工具 v3.0")
+        self.title("银行流水核对工具 v3.2")
         self.geometry("1200x850")
         self.minsize(960, 700)
 
@@ -1262,6 +1266,8 @@ class ReconciliationApp(ctk.CTk):
         self.journal_columns = []
         self.bank_mapping_state = {}
         self.journal_mapping_state = {}
+        self.project_store = LocalProjectStore()
+        self.last_report_path = None
 
         self._init_ui()
 
@@ -1718,6 +1724,23 @@ class ReconciliationApp(ctk.CTk):
         )
         self.btn_stop.grid(row=0, column=2, sticky="e", padx=(CONTENT_GAP, 6), pady=PAD_CARD[1])
 
+        ctk.CTkButton(
+            card, text="打开最近报告", width=110, height=40,
+            fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
+            command=self.open_latest_report,
+        ).grid(row=0, column=3, sticky="e", padx=(0, 6), pady=PAD_CARD[1])
+        self.btn_filter = ctk.CTkButton(
+            card, text="筛选导出", width=95, height=40,
+            fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
+            command=self.export_filtered_report,
+        )
+        self.btn_filter.grid(row=0, column=4, sticky="e", padx=(0, 6), pady=PAD_CARD[1])
+        ctk.CTkButton(
+            card, text="生成模板", width=95, height=40,
+            fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
+            command=self.create_input_templates,
+        ).grid(row=0, column=5, sticky="e", padx=(0, 6), pady=PAD_CARD[1])
+
         # 弱按钮：切换主题（原页眉卡片控件挪入执行区）
         ctk.CTkButton(
             card, text="切换主题", width=90, height=40,
@@ -1726,7 +1749,7 @@ class ReconciliationApp(ctk.CTk):
             text_color=("gray40", "gray70"),
             hover_color=("#E8E8E8", "#3A3A3A"),
             command=self.toggle_theme
-        ).grid(row=0, column=3, sticky="e", padx=(0, PAD_CARD[0]), pady=PAD_CARD[1])
+        ).grid(row=0, column=6, sticky="e", padx=(0, PAD_CARD[0]), pady=PAD_CARD[1])
 
         card.grid_columnconfigure(1, weight=1)
 
@@ -2035,6 +2058,13 @@ class ReconciliationApp(ctk.CTk):
                 columns,
                 is_bank=False,
             )
+        saved = self.project_store.load_mapping_template(target, columns)
+        if saved and isinstance(saved.get("mapping"), dict):
+            if target == "bank":
+                self.bank_mapping_state = dict(saved["mapping"])
+            else:
+                self.journal_mapping_state = dict(saved["mapping"])
+            self.log(f"已自动套用列映射模板：{saved.get('name', '')}")
         if self.bank_columns and self.journal_columns:
             self.mapping_status_var.set("已自动识别，可打开检查")
         else:
@@ -2050,6 +2080,101 @@ class ReconciliationApp(ctk.CTk):
         else:
             self.theme_mode = "system"
         ctk.set_appearance_mode(self.theme_mode)
+
+    def open_latest_report(self):
+        try:
+            projects = self.project_store.list_projects()
+            if not projects:
+                messagebox.showinfo("项目历史", "尚无已保存的核对项目。", parent=self)
+                return
+            report = self.project_store.resolve_report(projects[0]["project_id"])
+            os.startfile(str(report))
+        except Exception as exc:
+            messagebox.showerror("无法打开", str(exc), parent=self)
+
+    def export_filtered_report(self):
+        source = filedialog.askopenfilename(title="选择全量核对报告", filetypes=[("Excel", "*.xlsx")])
+        if not source:
+            return
+        business_type = simpledialog.askstring("筛选业务类型", "输入业务类型；留空表示全部，例如：手续费净额", parent=self) or ""
+        status = simpledialog.askstring("筛选结论状态", "输入结论状态；多个条件用分号分隔，留空表示全部", parent=self) or ""
+        reason = simpledialog.askstring("筛选差异原因", "输入判断依据中应包含的文字；多个条件用分号分隔，留空表示全部", parent=self) or ""
+        start_date = simpledialog.askstring("开始日期", "输入开始日期，例如2026-01-01；留空不限", parent=self) or ""
+        end_date = simpledialog.askstring("结束日期", "输入结束日期，例如2026-12-31；留空不限", parent=self) or ""
+        include_text = simpledialog.askstring("包含文字", "摘要、对方或依据中应包含的文字；多个条件用分号分隔，留空不限", parent=self) or ""
+        exclude_text = simpledialog.askstring("排除文字", "摘要、对方或依据中要排除的文字；多个条件用分号分隔，留空不限", parent=self) or ""
+        coverage_text = simpledialog.askstring("累计覆盖比例", "输入0到100；留空表示不按覆盖比例筛选", parent=self) or ""
+        coverage = None
+        if coverage_text.strip():
+            try:
+                coverage = float(coverage_text) / 100
+            except ValueError:
+                messagebox.showerror("筛选条件", "累计覆盖比例必须是0到100之间的数字。", parent=self)
+                return
+            if not 0 <= coverage <= 1:
+                messagebox.showerror("筛选条件", "累计覆盖比例必须是0到100之间的数字。", parent=self)
+                return
+        output = filedialog.asksaveasfilename(title="另存筛选底稿", defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
+        if not output:
+            return
+        criteria = FilterCriteria(
+            coverage_ratio=coverage,
+            business_types=(business_type.strip(),) if business_type.strip() else (),
+            statuses=tuple(value.strip() for value in status.split("；") if value.strip()),
+            reasons=tuple(value.strip() for value in reason.split("；") if value.strip()),
+            start_date=start_date.strip() or None,
+            end_date=end_date.strip() or None,
+            include_text=tuple(value.strip() for value in include_text.split("；") if value.strip()),
+            exclude_text=tuple(value.strip() for value in exclude_text.split("；") if value.strip()),
+        )
+        self.btn_filter.configure(state="disabled", text="筛选中…")
+        self._set_progress(0.0)
+        self.log("开始筛选导出，窗口可以继续响应；较长步骤每15秒报告一次运行状态。")
+
+        def worker():
+            done = threading.Event()
+            current_stage = ["准备筛选"]
+
+            def report_progress(value):
+                self._set_progress(value)
+
+            def report_log(message):
+                current_stage[0] = str(message)
+                self.log(message)
+
+            def heartbeat():
+                while not done.wait(15):
+                    self.log(f"筛选仍在运行：{current_stage[0]}")
+
+            threading.Thread(target=heartbeat, daemon=True).start()
+            try:
+                result = export_filtered_workpaper(
+                    source,
+                    output,
+                    criteria,
+                    progress_callback=report_progress,
+                    log_callback=report_log,
+                )
+                self.log(f"筛选底稿已保存：{result}")
+                self._safe_ui(os.startfile, str(result))
+            except Exception as exc:
+                self._safe_ui(messagebox.showerror, "筛选导出失败", str(exc), parent=self)
+            finally:
+                done.set()
+                self._safe_ui(self.btn_filter.configure, state="normal", text="筛选导出")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def create_input_templates(self):
+        folder = filedialog.askdirectory(title="选择模板保存文件夹")
+        if not folder:
+            return
+        try:
+            paths = generate_input_templates(folder)
+            self.log("输入模板已生成：" + "；".join(str(path) for path in paths))
+            os.startfile(str(Path(folder)))
+        except Exception as exc:
+            messagebox.showerror("模板生成失败", str(exc), parent=self)
 
     # ─── 执行核对 ─────────────────────────────────────────────────────────
 
@@ -2168,7 +2293,9 @@ class ReconciliationApp(ctk.CTk):
                     matcher,
                 ),
                 precheck_warning_callback=self._confirm_precheck_warnings,
+                project_store=getattr(self, "project_store", None),
             )
+            self.last_report_path = output_path
             self.log(f"\n{'=' * 50}")
             self.log(f"✅ 核对完成！报告已保存至: {output_path}")
             self.log(f"{'=' * 50}")

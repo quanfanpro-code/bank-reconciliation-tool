@@ -452,6 +452,7 @@ class Reporter:
             "cross_month_total": "跨月多对多",
             "closed_candidate_group": "整组勾稽",
             "business_group": "业务完整组",
+            "fee_net": "手续费净额",
         }
         return names.get(match_type, match_type)
 
@@ -510,6 +511,9 @@ class Reporter:
                     ),
                     "建议动作": self._suggested_action(candidate.risk_level.value),
                     "处理原因": candidate.processing_reason,
+                    "关系公式": candidate.evidence.get("relationship_formula", ""),
+                    "公式差额": float(PrecisionEngine.from_integer_li(candidate.evidence.get("formula_difference_li", candidate.metrics.total_diff_li))),
+                    "费用金额": float(PrecisionEngine.from_integer_li(candidate.evidence.get("fee_amount_li", 0))),
                     "综合可信度": candidate.scores.total,
                     "金额分": candidate.scores.amount,
                     "日期分": candidate.scores.date,
@@ -718,6 +722,7 @@ class Reporter:
             "银行收入", "银行支出", "银行净额", "日记账收入",
             "日记账支出", "日记账净额", "组金额", "收入差额",
             "支出差额", "银_日期", "账_日期", "文字支持", "文字冲突",
+            "关系公式", "公式差额", "费用金额",
             "大模型判断", "差异池ID", "是否使用大模型",
             "纳入风险池",
         ]
@@ -1311,6 +1316,23 @@ class Reporter:
                             stage_stats[metric],
                         )
                     )
+        selection = getattr(self.matcher, "run_parameters", {}).get(
+            "selection_optimization", {}
+        )
+        for key, label in (
+            ("component_count", "竞争组数量"),
+            ("exact_components", "整体最优完整求解组数"),
+            ("fallback_components", "确定性降级组数"),
+            ("largest_component_candidates", "最大竞争组候选数"),
+            ("exact_component_limit", "整体最优候选数上限"),
+            ("stopped", "整体求解是否收到中止信号"),
+            ("search_fully_exhausted", "整体求解是否全部穷尽"),
+        ):
+            if key in selection:
+                value = selection[key]
+                if isinstance(value, bool):
+                    value = "是" if value else "否"
+                rows.append((label, value))
         assistant = getattr(self.matcher, "llm_assistant", None)
         assistant_config = getattr(assistant, "config", None)
         rows.append(
@@ -1931,6 +1953,50 @@ class Reporter:
             )
         return pd.DataFrame(rows, columns=columns)
 
+    def _build_business_event_table(self) -> pd.DataFrame:
+        rows = []
+        for event in getattr(self.matcher, "business_events", []):
+            frame = self.matcher.bank if event.source == "bank" else self.matcher.journal
+            source_name = "银行流水" if event.source == "bank" else "银行存款序时账"
+            for sequence, index in enumerate(event.row_idxs, 1):
+                row = frame.loc[index]
+                rows.append({
+                    "业务链ID": event.event_id,
+                    "业务类型": event.event_type,
+                    "来源": source_name,
+                    "链内顺序": sequence,
+                    "原文件行号": int(row.get("original_file_row", row.get("original_idx", index))),
+                    "日期": row.get("date", ""),
+                    "金额": float(row.get("amount", 0)),
+                    "摘要": row.get("summary", ""),
+                    "关系公式": event.relationship_formula,
+                    "最终净影响": float(PrecisionEngine.from_integer_li(event.net_amount_li)),
+                    "业务依据": event.evidence_basis,
+                    "是否跨期": "是" if event.is_cross_period else "否",
+                    "系统结论": event.review_status,
+                })
+        return pd.DataFrame(rows, columns=["业务链ID", "业务类型", "来源", "链内顺序", "原文件行号", "日期", "金额", "摘要", "关系公式", "最终净影响", "业务依据", "是否跨期", "系统结论"])
+
+    def _build_business_clue_table(self) -> pd.DataFrame:
+        rows = []
+        for clue in getattr(self.matcher, "business_clues", []):
+            frame = self.matcher.bank if clue.source == "bank" else self.matcher.journal
+            source_name = "银行流水" if clue.source == "bank" else "银行存款序时账"
+            for index in clue.row_idxs:
+                row = frame.loc[index]
+                rows.append({
+                    "线索ID": clue.clue_id,
+                    "线索类型": clue.clue_type,
+                    "来源": source_name,
+                    "原文件行号": int(row.get("original_file_row", row.get("original_idx", index))),
+                    "日期": row.get("date", ""),
+                    "金额": float(row.get("amount", 0)),
+                    "摘要": row.get("summary", ""),
+                    "判断依据": clue.reason,
+                    "处理说明": "保留全部原始记录，结合回单、凭证和对方资料核查",
+                })
+        return pd.DataFrame(rows, columns=["线索ID", "线索类型", "来源", "原文件行号", "日期", "金额", "摘要", "判断依据", "处理说明"])
+
     @staticmethod
     def _decorate_unmatched(table: pd.DataFrame, side: str) -> pd.DataFrame:
         result = table.copy()
@@ -2147,6 +2213,10 @@ class Reporter:
             "整组勾稽": groups.loc[~row_mask].reset_index(drop=True)
             if not groups.empty else groups.copy(),
             "匹配组成": self._build_match_component_table(),
+            "退款冲销重付": self._build_business_event_table(),
+            "手续费及净额": groups.loc[groups["类型"] == "手续费净额"].reset_index(drop=True) if not groups.empty else groups.copy(),
+            "截止性差异": self._build_business_event_table().loc[lambda frame: frame["是否跨期"] == "是"].reset_index(drop=True),
+            "重复线索": self._build_business_clue_table(),
         }
         alternatives = self._build_alternative_component_table()
         if not alternatives.empty:

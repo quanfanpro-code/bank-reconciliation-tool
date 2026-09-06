@@ -38,7 +38,7 @@ except ImportError:
 # 本地模块导入
 from precision_engine import PrecisionEngine
 from data_structures import (
-    DifferencePoolResult, LLMDecisionRecord, MatcherConfig,
+    BusinessClue, BusinessEvent, DifferencePoolResult, LLMDecisionRecord, MatcherConfig,
     MatchCandidate, OverallControlResult,
     ProcessingStatus,
     WorkerExceptionLogger,
@@ -66,6 +66,7 @@ from 业务分组 import (
     row_business, business_evidence, complete_groups, has_business_conflict,
     relationship_priority, candidate_sort_key,
 )
+from 业务事件 import business_identity, detect_same_side_events, has_fee_evidence, rows_share_business
 
 # ==========================================
 # 辅助函数
@@ -813,32 +814,173 @@ def _process_single_source(args: Tuple) -> Optional[Tuple[int, List[List[int]], 
 
 def select_non_conflicting_candidates(
     candidates: List[MatchCandidate],
+    *,
+    diagnostics: Optional[Dict[str, Any]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    exact_component_limit: int = 18,
 ) -> List[MatchCandidate]:
-    """按统一分数稳定排序，确保任何一笔记录只被一个候选占用。"""
-    ordered = sorted(
-        candidates,
-        key=candidate_sort_key,
-    )
-    used_bank: Set[int] = set()
-    used_journal: Set[int] = set()
-    selected: List[MatchCandidate] = []
-    for candidate in ordered:
-        if candidate.evidence.get("selection_ineligible"):
-            continue
-        if (
+    """按共享源行分组，在小组内整体寻找最优的不重叠关系组合。"""
+    stats: Dict[str, Any] = {
+        "component_count": 0,
+        "exact_components": 0,
+        "fallback_components": 0,
+        "largest_component_candidates": 0,
+        "stopped": False,
+        "search_fully_exhausted": True,
+        "exact_component_limit": int(exact_component_limit),
+    }
+    eligible = [
+        candidate for candidate in candidates
+        if not candidate.evidence.get("selection_ineligible")
+        and not (
             has_business_conflict(candidate)
             and candidate.metrics.total_diff_li
             and not candidate.evidence.get("atomic_voucher_group")
-        ):
+        )
+    ]
+
+    def components(items: List[MatchCandidate]) -> List[List[MatchCandidate]]:
+        if not items:
+            return []
+        parent = list(range(len(items)))
+
+        def find(position: int) -> int:
+            while parent[position] != position:
+                parent[position] = parent[parent[position]]
+                position = parent[position]
+            return position
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        bank_owner: Dict[int, int] = {}
+        journal_owner: Dict[int, int] = {}
+        for position, candidate in enumerate(items):
+            for index in candidate.bank_idxs:
+                union(position, bank_owner.setdefault(int(index), position))
+            for index in candidate.journal_idxs:
+                union(position, journal_owner.setdefault(int(index), position))
+        grouped: Dict[int, List[MatchCandidate]] = {}
+        for position, candidate in enumerate(items):
+            grouped.setdefault(find(position), []).append(candidate)
+        return sorted(
+            grouped.values(),
+            key=lambda group: min(item.candidate_id for item in group),
+        )
+
+    def objective(items: List[MatchCandidate]) -> tuple[Any, ...]:
+        full_strong_rows = sum(
+            len(item.bank_idxs) + len(item.journal_idxs)
+            for item in items
+            if item.evidence.get("resolves_full_group")
+            and (
+                item.evidence.get("complete_business_id")
+                or item.evidence.get("complete_business_group")
+                or item.evidence.get("shared_transaction_id")
+                or item.evidence.get("salary_group")
+                or item.match_type == "fee_net"
+            )
+        )
+        strong_rows = sum(
+            (len(item.bank_idxs) + len(item.journal_idxs))
+            * min(4, int(item.evidence.get("business_strength", 0)))
+            for item in items
+        )
+        covered_rows = sum(len(item.bank_idxs) + len(item.journal_idxs) for item in items)
+        zero_diff_rows = sum(
+            len(item.bank_idxs) + len(item.journal_idxs)
+            for item in items
+            if item.metrics.total_diff_li == 0
+        )
+        unambiguous_rows = sum(
+            len(item.bank_idxs) + len(item.journal_idxs)
+            for item in items
+            if not item.is_ambiguous
+        )
+        return (
+            full_strong_rows,
+            int(bool(items)),
+            unambiguous_rows,
+            zero_diff_rows,
+            covered_rows,
+            strong_rows,
+            sum(item.scores.total for item in items),
+            -sum(item.metrics.total_diff_li for item in items),
+            -len(items),
+        )
+
+    def greedy(group: List[MatchCandidate]) -> List[MatchCandidate]:
+        chosen: List[MatchCandidate] = []
+        used_bank: Set[int] = set()
+        used_journal: Set[int] = set()
+        for candidate in sorted(group, key=candidate_sort_key):
+            if used_bank.intersection(candidate.bank_idxs) or used_journal.intersection(candidate.journal_idxs):
+                continue
+            chosen.append(candidate)
+            used_bank.update(candidate.bank_idxs)
+            used_journal.update(candidate.journal_idxs)
+        return chosen
+
+    selected: List[MatchCandidate] = []
+    groups = components(eligible)
+    stats["component_count"] = len(groups)
+    for group in groups:
+        stats["largest_component_candidates"] = max(stats["largest_component_candidates"], len(group))
+        if should_stop and should_stop():
+            stats["stopped"] = True
+            stats["search_fully_exhausted"] = False
+            selected.extend(greedy(group))
+            stats["fallback_components"] += 1
             continue
-        if used_bank.intersection(candidate.bank_idxs):
+        if len(group) > max(1, int(exact_component_limit)):
+            selected.extend(greedy(group))
+            stats["fallback_components"] += 1
+            stats["search_fully_exhausted"] = False
             continue
-        if used_journal.intersection(candidate.journal_idxs):
-            continue
-        selected.append(candidate)
-        used_bank.update(candidate.bank_idxs)
-        used_journal.update(candidate.journal_idxs)
-    return selected
+        ordered = sorted(group, key=candidate_sort_key)
+        best: List[MatchCandidate] = []
+        best_objective = objective(best)
+
+        def stable_choice_key(items: List[MatchCandidate]) -> tuple[Any, ...]:
+            return tuple(candidate_sort_key(item) for item in sorted(items, key=candidate_sort_key))
+
+        def search(position: int, chosen: List[MatchCandidate], used_bank: Set[int], used_journal: Set[int]) -> None:
+            nonlocal best, best_objective
+            if should_stop and should_stop():
+                stats["stopped"] = True
+                return
+            if position >= len(ordered):
+                score = objective(chosen)
+                if score > best_objective or (
+                    score == best_objective
+                    and (not best or stable_choice_key(chosen) < stable_choice_key(best))
+                ):
+                    best, best_objective = list(chosen), score
+                return
+            candidate = ordered[position]
+            if not used_bank.intersection(candidate.bank_idxs) and not used_journal.intersection(candidate.journal_idxs):
+                search(
+                    position + 1,
+                    [*chosen, candidate],
+                    used_bank.union(candidate.bank_idxs),
+                    used_journal.union(candidate.journal_idxs),
+                )
+            search(position + 1, chosen, used_bank, used_journal)
+
+        search(0, [], set(), set())
+        if stats["stopped"]:
+            stats["search_fully_exhausted"] = False
+            selected.extend(greedy(group))
+            stats["fallback_components"] += 1
+        else:
+            selected.extend(best)
+            stats["exact_components"] += 1
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(stats)
+    return sorted(selected, key=candidate_sort_key)
 
 
 class Matcher:
@@ -912,6 +1054,8 @@ class Matcher:
         self.selected_candidates: List[MatchCandidate] = []
         self.llm_records: List[LLMDecisionRecord] = []
         self.difference_pools: List[DifferencePoolResult] = []
+        self.business_events: List[BusinessEvent] = []
+        self.business_clues: List[BusinessClue] = []
         self._candidate_ids: Set[str] = set()
         self._candidate_index_keys: Set[str] = set()
         self._stable_id_counts: Dict[str, int] = {}
@@ -967,6 +1111,92 @@ class Matcher:
             "bank": [],
             "journal": [],
         }
+
+    def match_special_business_events(self) -> None:
+        """识别同侧业务链、重复线索和有明确费用证据的净额关系。"""
+        self.business_events = []
+        self.business_clues = []
+        for source, frame in (("bank", self.bank), ("journal", self.journal)):
+            events, clues = detect_same_side_events(
+                frame,
+                source,
+                self.config.dfs_date_window,
+            )
+            self.business_events.extend(events)
+            self.business_clues.extend(clues)
+
+        self._reset_candidate_search_stage("special_business")
+        for left_name, left, right_name, right in (
+            ("bank", self.bank, "journal", self.journal),
+            ("journal", self.journal, "bank", self.bank),
+        ):
+            fee_indexes = [int(index) for index, row in left.iterrows() if has_fee_evidence(row)]
+            fee_set = set(fee_indexes)
+            main_indexes = [int(index) for index in left.index if int(index) not in fee_set]
+            main_by_id: Dict[str, List[int]] = {}
+            main_by_party: Dict[str, List[int]] = {}
+            for index in main_indexes:
+                business_id, party = business_identity(left.loc[index])
+                if business_id:
+                    main_by_id.setdefault(business_id, []).append(index)
+                if party:
+                    main_by_party.setdefault(party, []).append(index)
+            right_by_amount: Dict[int, List[int]] = {}
+            for index, row in right.iterrows():
+                right_by_amount.setdefault(int(row["amount_decimal"]), []).append(int(index))
+            for fee_idx in fee_indexes:
+                fee_row = left.loc[fee_idx]
+                fee_amount = int(fee_row["amount_decimal"])
+                fee_business_id, fee_party = business_identity(fee_row)
+                scoped_main_indexes = set(main_by_id.get(fee_business_id, ())) if fee_business_id else set()
+                if fee_party:
+                    scoped_main_indexes.update(main_by_party.get(fee_party, ()))
+                for main_idx in sorted(scoped_main_indexes):
+                    main_row = left.loc[main_idx]
+                    if fee_amount * int(main_row["amount_decimal"]) >= 0:
+                        continue
+                    if abs((pd.Timestamp(main_row["date"]) - pd.Timestamp(fee_row["date"])).days) > self.config.tolerance_days:
+                        continue
+                    shared_fee, fee_basis = rows_share_business(main_row, fee_row)
+                    if not shared_fee:
+                        continue
+                    target = int(main_row["amount_decimal"]) + fee_amount
+                    for other_idx in right_by_amount.get(target, ()):
+                        other_row = right.loc[other_idx]
+                        if abs((pd.Timestamp(other_row["date"]) - pd.Timestamp(main_row["date"])).days) > self.config.tolerance_days:
+                            continue
+                        shared_other, other_basis = rows_share_business(main_row, other_row)
+                        if not shared_other:
+                            continue
+                        bank_idxs = [main_idx, fee_idx] if left_name == "bank" else [int(other_idx)]
+                        journal_idxs = [main_idx, fee_idx] if left_name == "journal" else [int(other_idx)]
+                        main_positive = int(main_row["amount_decimal"]) > 0
+                        if left_name == "journal" and main_positive:
+                            formula = "银行实收＝账面应收－手续费"
+                        elif left_name == "bank" and main_positive:
+                            formula = "账面实收＝银行入账总额－手续费"
+                        elif left_name == "journal":
+                            formula = "银行实付＝账面应付＋手续费"
+                        else:
+                            formula = "账面实付＝银行扣款总额＋手续费"
+                        candidate = self._add_candidate(
+                            bank_idxs,
+                            journal_idxs,
+                            "fee_net",
+                            "手续费净额",
+                            resolves_full_group=True,
+                            complete_business_id=True,
+                            complete_business_group=True,
+                            represents_full_observed_group=True,
+                            business_strength=3,
+                            relationship_formula=formula,
+                            fee_amount_li=abs(fee_amount),
+                            formula_difference_li=0,
+                            business_basis=f"{fee_basis}；{other_basis}；费用文字明确",
+                        )
+                        if candidate is not None:
+                            candidate.metrics = replace(candidate.metrics, total_diff_li=0)
+                            self._score_existing_candidate(candidate)
 
     def _reset_candidate_search_stage(self, stage: str) -> Dict[str, int]:
         """重置一个候选阶段的可披露计数。"""
@@ -1962,7 +2192,13 @@ class Matcher:
         self._add_closed_candidate_groups()
         self._refresh_candidate_ambiguity()
         self._apply_llm_assistance()
-        self.selected_candidates = select_non_conflicting_candidates(self.candidates)
+        selection_diagnostics: Dict[str, Any] = {}
+        self.selected_candidates = select_non_conflicting_candidates(
+            self.candidates,
+            diagnostics=selection_diagnostics,
+            should_stop=lambda: self.stopping,
+        )
+        self.run_parameters["selection_optimization"] = selection_diagnostics
         final_id_counts: Dict[str, int] = {}
         for candidate in self.selected_candidates:
             base_final_id = f"M-{candidate.composition_key[:16].upper()}"
@@ -2239,6 +2475,7 @@ class Matcher:
 
     def run(self) -> List[Dict[str, Any]]:
         candidate_steps = [
+            ("退款冲销重付、重复与手续费净额", self.match_special_business_events),
             ("业务完整组匹配", self.match_business_groups),
             ("白名单规则匹配", self.match_whitelist_rules),
             ("精确匹配", self.match_exact_1to1),
