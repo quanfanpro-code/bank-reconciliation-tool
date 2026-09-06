@@ -937,13 +937,22 @@ def _overall_balance_item(control: OverallControlResult) -> PrecheckItem:
         + "；相关候选不得无保留自动确认。"
         if control.scope_limited
         else (
-            "余额连续性或期初加期间净发生额等于期末余额的控制存在异常，"
-            "相关候选不得无保留自动确认。"
-            if balance_anomaly
+            "余额在断档窗口（"
+            + "、".join(
+                f"{window[0]:%Y-%m-%d}至{window[1]:%Y-%m-%d}"
+                for window in control.affected_windows
+            )
+            + "）未闭合，仅断档窗口内候选不得无保留自动确认。"
+            if balance_anomaly and control.affected_windows
             else (
-                "至少一侧未提供逐笔余额，程序未据此降低单笔关系，但总体余额核对范围受限。"
-                if missing_side
-                else "双方余额连续性及期初、期间发生额、期末余额控制通过。"
+                "余额连续性或期初加期间净发生额等于期末余额的控制存在异常，"
+                "相关候选不得无保留自动确认。"
+                if balance_anomaly
+                else (
+                    "至少一侧未提供逐笔余额，程序未据此降低单笔关系，但总体余额核对范围受限。"
+                    if missing_side
+                    else "双方余额连续性及期初、期间发生额、期末余额控制通过。"
+                )
             )
         )
     )

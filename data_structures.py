@@ -320,6 +320,7 @@ class OverallControlResult:
     initial_balance_diff: Optional[Decimal] = None
     ending_balance_diff: Optional[Decimal] = None
     continuity_anomalies: tuple[Dict[str, Any], ...] = ()
+    affected_windows: tuple[tuple[Any, Any], ...] = ()
     scope_limited: bool = False
     reasons: tuple[str, ...] = ()
 

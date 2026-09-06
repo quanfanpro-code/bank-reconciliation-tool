@@ -387,6 +387,8 @@ def check_balance_continuity(
                         '预期余额': expected,
                         '实际余额': balance,
                         '差额': difference,
+                        '窗口起': row['date'],
+                        '窗口止': row['date'],
                     })
             previous = balance
             pending = Decimal('0')
@@ -432,6 +434,7 @@ def check_balance_continuity(
         return True
 
     previous_closing: Optional[Decimal] = None
+    previous_anchor_day = None
     pending_net = Decimal('0')
     # ponytail: 日界按"日初开盘=当日首个余额行倒推"勾稽；日内逐行勾稽若不稳，
     # 再按余额排序重试一次，排序后能闭合视为文件行序噪声（同日行顺序不代表过账
@@ -460,6 +463,8 @@ def check_balance_continuity(
                 day_closing = balance
         if day_unreliable:
             previous_closing = day_closing
+            if day_closing is not None:
+                previous_anchor_day = day
             pending_net = Decimal('0')
             continue
         if day_closing is None:
@@ -482,6 +487,8 @@ def check_balance_continuity(
                     '预期余额': expected,
                     '实际余额': anchor_balance,
                     '差额': difference,
+                    '窗口起': previous_anchor_day,
+                    '窗口止': day,
                 })
         day_rows_list = list(day_rows.iterrows())
         intra = chain_anomalies([row for _, row in day_rows_list], opening)
@@ -490,6 +497,7 @@ def check_balance_continuity(
             intra = []
         anomalies.extend(intra)
         previous_closing = opening + day_net if opening is not None else day_closing
+        previous_anchor_day = day
         pending_net = Decimal('0')
     return anomalies
 
@@ -603,7 +611,42 @@ def build_overall_controls(
             structural.append(amount_reason)
     side_reasons = (*bank_balance[6], *journal_balance[6])
     reasons.extend(side_reasons)
-    structural.extend(side_reasons)
+    all_anomalies = bank_balance[5] + journal_balance[5]
+    windows: List[tuple[Any, Any]] = []
+    localizable = bool(all_anomalies)
+    for anomaly in all_anomalies:
+        window_start, window_end = anomaly.get("窗口起"), anomaly.get("窗口止")
+        if window_start is None or window_end is None:
+            localizable = False
+            break
+        windows.append((
+            pd.Timestamp(window_start).normalize(),
+            pd.Timestamp(window_end).normalize(),
+        ))
+    if localizable:
+        record_days = {
+            day
+            for frame in (bank, journal)
+            if not frame.empty and "date" in frame.columns
+            for day in pd.to_datetime(frame["date"], errors="coerce").dt.normalize().dropna()
+        }
+        covered_days = {
+            day
+            for window_start, window_end in windows
+            for day in record_days
+            if window_start <= day <= window_end
+        }
+        if not record_days or len(covered_days) * 2 > len(record_days):
+            # 窗口覆盖过半说明余额链名存实亡，回退整体降级
+            localizable = False
+    if localizable:
+        # 断档能定位到具体窗口：连续性原因只披露，不限制总体范围
+        structural.extend(
+            reason for reason in side_reasons
+            if "连续性" not in reason and "期初加净发生额" not in reason
+        )
+    else:
+        structural.extend(side_reasons)
     if initial_balance_diff is not None and initial_balance_diff > tolerance:
         reasons.append(f"双方期初余额相差{initial_balance_diff}")
     if ending_balance_diff is not None and ending_balance_diff > tolerance:
@@ -635,6 +678,7 @@ def build_overall_controls(
         initial_balance_diff=initial_balance_diff,
         ending_balance_diff=ending_balance_diff,
         continuity_anomalies=bank_balance[5] + journal_balance[5],
+        affected_windows=tuple(windows) if localizable else (),
         scope_limited=bool(structural),
         reasons=tuple(reasons),
     )

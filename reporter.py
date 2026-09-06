@@ -1689,7 +1689,20 @@ class Reporter:
         balance_integrity_limited = bool(
             getattr(self.matcher, "balance_integrity_limited", False)
         )
-        if balance_integrity_limited:
+        affected_windows = (
+            tuple(overall_control.affected_windows)
+            if overall_control is not None
+            else ()
+        )
+        if balance_integrity_limited and not overall_limited and affected_windows:
+            break_days = "、".join(
+                f"{window[1]:%Y-%m-%d}" for window in affected_windows
+            )
+            system_conclusion = (
+                f"已完成自动分析；余额在{break_days}断档，"
+                "仅断档窗口内关系降为疑点，其余关系按证据正常确认"
+            )
+        elif balance_integrity_limited:
             system_conclusion = "已完成自动分析；总体余额控制异常，相关关系已降为疑点"
         elif overall_limited:
             system_conclusion = "已完成自动分析；总体资料尚未闭合，具体关系已按范围限制分流"

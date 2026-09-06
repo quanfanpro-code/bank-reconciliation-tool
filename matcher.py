@@ -1623,6 +1623,28 @@ class Matcher:
             candidate.evidence["overall_control_reasons"] = list(
                 self.overall_control.reasons
             )
+        elif self.overall_control is not None and self.overall_control.affected_windows:
+            candidate_days = [
+                pd.Timestamp(self.bank.loc[index, "date"]).normalize()
+                for index in bank_tuple
+                if pd.notna(self.bank.loc[index, "date"])
+            ] + [
+                pd.Timestamp(self.journal.loc[index, "date"]).normalize()
+                for index in journal_tuple
+                if pd.notna(self.journal.loc[index, "date"])
+            ]
+            hit_windows = [
+                window
+                for window in self.overall_control.affected_windows
+                if any(window[0] <= day <= window[1] for day in candidate_days)
+            ]
+            if hit_windows:
+                candidate.evidence["overall_scope_limited"] = True
+                candidate.evidence["overall_control_reasons"] = [
+                    f"余额连续性在{window[1]:%Y-%m-%d}断档，仅断档窗口"
+                    f"（{window[0]:%Y-%m-%d}至{window[1]:%Y-%m-%d}）内关系降级"
+                    for window in hit_windows
+                ]
         self._score_existing_candidate(candidate)
         self.candidates.append(candidate)
         self._candidate_ids.add(candidate_id)
