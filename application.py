@@ -308,7 +308,7 @@ def run_reconciliation(
         )
 
     precheck_started = time.perf_counter()
-    log("开始执行账户、币种、期间、金额和数据人口检查")
+    log("开始执行账户、币种、期间、金额和数据入口检查")
     precheck_report = build_input_precheck(
         raw_bank=raw_bank,
         raw_journal=raw_journal,

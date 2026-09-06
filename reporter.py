@@ -1668,7 +1668,7 @@ class Reporter:
             "金额方向",
             "金额合计",
             "总体余额控制",
-            "数据人口",
+            "数据入口",
         }
         range_items = (
             [
@@ -1997,13 +1997,35 @@ class Reporter:
                 })
         return pd.DataFrame(rows, columns=["线索ID", "线索类型", "来源", "原文件行号", "日期", "金额", "摘要", "判断依据", "处理说明"])
 
-    @staticmethod
-    def _decorate_unmatched(table: pd.DataFrame, side: str) -> pd.DataFrame:
+    def _business_chain_rows(self, source: str) -> dict[int, list[str]]:
+        """原文件行号 → 所属同侧业务链事件号，用于待查表交叉引用。"""
+        frame = self.matcher.bank if source == "bank" else self.matcher.journal
+        lookup: dict[int, list[str]] = {}
+        for event in getattr(self.matcher, "business_events", []):
+            if event.source != source:
+                continue
+            for index in event.row_idxs:
+                row = frame.loc[index]
+                file_row = int(row.get("original_file_row", row.get("original_idx", index)))
+                lookup.setdefault(file_row, []).append(event.event_id)
+        return lookup
+
+    def _decorate_unmatched(self, table: pd.DataFrame, side: str) -> pd.DataFrame:
         result = table.copy()
         result.insert(0, "建议动作", "结合对侧记录和截止期继续核查")
         result.insert(0, "判断依据", "程序未找到足以建立关系的候选")
         result.insert(0, "风险等级", "范围未知")
         result.insert(0, "系统结论", f"{side}未找到候选")
+        chain_rows = self._business_chain_rows("bank" if side == "银行侧" else "journal")
+        if chain_rows and "原文件行号" in result.columns:
+            linked = result["原文件行号"].map(
+                lambda value: chain_rows.get(int(value)) if pd.notna(value) else None
+            )
+            mask = linked.notna()
+            result.loc[mask, "判断依据"] = linked[mask].map(
+                lambda ids: f"已纳入同侧业务链{'、'.join(ids)}，组成和净影响见退款冲销重付表"
+            )
+            result.loc[mask, "建议动作"] = "按业务链整体核查退回、冲销或重付凭证，不单行核对"
         return result
 
     def _apply_report_presentation(self, workbook: Any) -> None:
@@ -2050,11 +2072,14 @@ class Reporter:
                     width = 28
                 sheet.column_dimensions[cell.column_letter].width = width
                 header = str(cell.value or "")
+                # 空表只有表头：不触碰第2行，避免凭空造出一行全空单元格。
+                if sheet.max_row < 2:
+                    continue
                 for data_cell in sheet.iter_cols(
                     min_col=cell.column,
                     max_col=cell.column,
                     min_row=2,
-                    max_row=max(2, sheet.max_row),
+                    max_row=sheet.max_row,
                 ):
                     for item in data_cell:
                         item.alignment = Alignment(vertical="top", wrap_text=True)
@@ -2224,7 +2249,7 @@ class Reporter:
         if self.precheck_report is not None:
             tables["输入检查"] = self.precheck_report.to_dataframe()
             tables["运行资料与映射"] = self.precheck_report.source_dataframe()
-            tables["数据人口处置"] = self.precheck_report.population_dataframe()
+            tables["数据入口处置"] = self.precheck_report.population_dataframe()
         tables["月度统计"] = monthly
         tables["每日统计"] = daily
         tables.update(

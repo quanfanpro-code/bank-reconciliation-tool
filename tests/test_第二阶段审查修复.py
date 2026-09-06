@@ -247,7 +247,7 @@ def test_同一源行多种解析错误只计一行且人口分类闭合():
         bank_mapping=映射(), journal_mapping=映射(),
         bank_structure=TableStructure(0, 1, list(银行.columns), 10),
         journal_structure=TableStructure(0, 1, list(账.columns), 10), parse_errors=异常)
-    项 = next(项 for 项 in 检查.items if 项.name == "数据人口")
+    项 = next(项 for 项 in 检查.items if 项.name == "数据入口")
     assert "解析异常1行" in 项.bank_result, 项.bank_result
     for 文本 in ["原始2行", "有效交易1行", "非交易0行", "其他排除0行"]:
         assert 文本 in 项.bank_result
@@ -427,7 +427,7 @@ def test_回单号或交易流水号明确不同必须成为关键冲突(银行�
         assert 候选.processing_status.value == "自动确认"
 
 
-def test_超过一千条解析异常仍完整保留供数据人口唯一分类():
+def test_超过一千条解析异常仍完整保留供数据入口唯一分类():
     收集器 = ParseErrorCollector()
     for 行号 in range(2, 1007):
         收集器.record_amount_error(行号, "金额不明", "bank", "借方金额")

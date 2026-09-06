@@ -1,4 +1,4 @@
-﻿import pandas as pd
+import pandas as pd
 
 from data_loader import DataLoader, ParseErrorCollector
 from data_structures import MatcherConfig, ProcessingStatus, RiskLevel
@@ -59,7 +59,7 @@ def test_被日期解析异常排除的有金额原行必须降低具体关系�
     )
 
     assert 预检.overall_control.scope_limited is True
-    assert any("数据人口" in 原因 and "解析异常" in 原因 for 原因 in 预检.overall_control.reasons)
+    assert any("数据入口" in 原因 and "解析异常" in 原因 for 原因 in 预检.overall_control.reasons)
 
     匹配器 = Matcher(
         银行,
@@ -75,4 +75,4 @@ def test_被日期解析异常排除的有金额原行必须降低具体关系�
     assert 候选.processing_status is ProcessingStatus.FLAGGED
     assert 候选.risk_level is RiskLevel.UNKNOWN
     assert "总体资料尚未闭合" in 候选.processing_reason
-    assert "数据人口存在解析异常" in 候选.processing_reason
+    assert "数据入口存在解析异常" in 候选.processing_reason

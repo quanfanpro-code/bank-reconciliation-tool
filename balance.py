@@ -358,37 +358,139 @@ def check_balance_continuity(
 
     tolerance = PrecisionEngine.from_integer_li(tolerance_li)
     anomalies: List[Dict[str, Any]] = []
-    previous_balance: Optional[Decimal] = None
-    accumulated_net = Decimal('0')
-    for _, row in work.iterrows():
-        day = row['date']
-        net = _decimal_value(row['amount'])
-        balance = _decimal_value(row['balance'])
-        if net is None:
-            # 缺金额的区间无法可靠勾稽；下个余额只作为新基准。
-            previous_balance = balance
-            accumulated_net = Decimal('0')
+
+    def chain_anomalies(rows: List[Any], opening: Optional[Decimal]) -> List[Dict[str, Any]]:
+        """从日初开盘余额起逐行勾稽；每行余额行都重新作基准。"""
+        found: List[Dict[str, Any]] = []
+        previous = opening
+        pending = Decimal('0')
+        for row in rows:
+            net = _decimal_value(row['amount'])
+            balance = _decimal_value(row['balance'])
+            if net is None:
+                previous = balance
+                pending = Decimal('0')
+                continue
+            if balance is None:
+                pending += net
+                continue
+            if previous is not None:
+                expected = previous + pending + net
+                difference = abs(balance - expected)
+                if difference > tolerance:
+                    found.append({
+                        '来源': source,
+                        '日期': row['date'],
+                        '原文件行号': row.get('original_file_row', row.get('original_idx')),
+                        '基准余额': previous,
+                        '区间净额': pending + net,
+                        '预期余额': expected,
+                        '实际余额': balance,
+                        '差额': difference,
+                    })
+            previous = balance
+            pending = Decimal('0')
+        return found
+
+    def greedy_chain_ok(rows: List[Any], opening: Optional[Decimal]) -> bool:
+        """当日余额存在某种行序能全部闭合时返回 True（用于识别日内行序噪声）。
+
+        每步在剩余行中找"上笔余额＋无余额行累计净额＋本行净额＝本行余额"的行；
+        找不到即判无法闭合。 ponytail: 贪心取首个可行行，同额多解时可能误判
+        无法闭合（保守方向，只会多报不会漏报）。
+        """
+        remaining = [
+            row for row in rows if _decimal_value(row['balance']) is not None
+        ]
+        pending = sum(
+            (
+                _decimal_value(row['amount'])
+                for row in rows
+                if _decimal_value(row['balance']) is None
+                and _decimal_value(row['amount']) is not None
+            ),
+            Decimal('0'),
+        )
+        previous = opening
+        if previous is None:
+            if not remaining:
+                return True
+            previous = _decimal_value(remaining.pop(0)['balance'])
+        while remaining:
+            for position, row in enumerate(remaining):
+                net = _decimal_value(row['amount'])
+                balance = _decimal_value(row['balance'])
+                if net is not None and abs(
+                    balance - (previous + pending + net)
+                ) <= tolerance:
+                    remaining.pop(position)
+                    previous = balance
+                    pending = Decimal('0')
+                    break
+            else:
+                return False
+        return True
+
+    previous_closing: Optional[Decimal] = None
+    pending_net = Decimal('0')
+    # ponytail: 日界按"日初开盘=当日首个余额行倒推"勾稽；日内逐行勾稽若不稳，
+    # 再按余额排序重试一次，排序后能闭合视为文件行序噪声（同日行顺序不代表过账
+    # 顺序）。混合方向且排序也无法闭合的日内错误仍按原行披露。升级路径：按凭证
+    # 号码或流水号重排日内顺序。
+    for day, day_rows in work.groupby('date', sort=True):
+        day_net = Decimal('0')
+        day_unreliable = False
+        anchor_balance: Optional[Decimal] = None
+        anchor_cum_net = Decimal('0')
+        anchor_row = None
+        day_closing: Optional[Decimal] = None
+        for _, row in day_rows.iterrows():
+            net = _decimal_value(row['amount'])
+            balance = _decimal_value(row['balance'])
+            if net is None:
+                # 缺金额的天无法可靠勾稽；当日余额只作为新基准。
+                day_unreliable = True
+            else:
+                day_net += net
+            if balance is not None:
+                if anchor_balance is None and not day_unreliable:
+                    anchor_balance = balance
+                    anchor_cum_net = day_net
+                    anchor_row = row
+                day_closing = balance
+        if day_unreliable:
+            previous_closing = day_closing
+            pending_net = Decimal('0')
             continue
-        if balance is None:
-            accumulated_net += net
+        if day_closing is None:
+            pending_net += day_net
             continue
-        if previous_balance is not None:
-            period_net = accumulated_net + net
-            expected = previous_balance + period_net
-            difference = abs(balance - expected)
+        opening = (
+            anchor_balance - anchor_cum_net if anchor_balance is not None else None
+        )
+        if previous_closing is not None and anchor_balance is not None:
+            period_net = pending_net + anchor_cum_net
+            expected = previous_closing + period_net
+            difference = abs(anchor_balance - expected)
             if difference > tolerance:
                 anomalies.append({
                     '来源': source,
                     '日期': day,
-                    '原文件行号': row.get('original_file_row', row.get('original_idx')),
-                    '基准余额': previous_balance,
+                    '原文件行号': anchor_row.get('original_file_row', anchor_row.get('original_idx')),
+                    '基准余额': previous_closing,
                     '区间净额': period_net,
                     '预期余额': expected,
-                    '实际余额': balance,
+                    '实际余额': anchor_balance,
                     '差额': difference,
                 })
-        previous_balance = balance
-        accumulated_net = Decimal('0')
+        day_rows_list = list(day_rows.iterrows())
+        intra = chain_anomalies([row for _, row in day_rows_list], opening)
+        if intra and greedy_chain_ok([row for _, row in day_rows_list], opening):
+            # 存在一种行序使当日全部余额闭合：原序异常是行序噪声，不按错误披露。
+            intra = []
+        anomalies.extend(intra)
+        previous_closing = opening + day_net if opening is not None else day_closing
+        pending_net = Decimal('0')
     return anomalies
 
 
@@ -478,20 +580,30 @@ def build_overall_controls(
         else None
     )
     reasons = []
+    structural = []
     if period_status != "通过":
-        reasons.append(
+        period_reason = (
             "双方起止日期无法确认"
             if period_status == "无法计算"
             else "双方起止日期不一致"
         )
+        reasons.append(period_reason)
+        # 起止日期不一致通常是正常未达期间，属核对发现而非范围受限
+        if period_status == "无法计算":
+            structural.append(period_reason)
     if amount_status != "通过":
-        reasons.append(
+        amount_reason = (
             "双方收支金额无法确认"
             if amount_status == "无法计算"
             else "双方收入或支出合计不一致"
         )
-    reasons.extend(bank_balance[6])
-    reasons.extend(journal_balance[6])
+        reasons.append(amount_reason)
+        # 合计不一致正是核对要量化的对象，不构成范围受限
+        if amount_status == "无法计算":
+            structural.append(amount_reason)
+    side_reasons = (*bank_balance[6], *journal_balance[6])
+    reasons.extend(side_reasons)
+    structural.extend(side_reasons)
     if initial_balance_diff is not None and initial_balance_diff > tolerance:
         reasons.append(f"双方期初余额相差{initial_balance_diff}")
     if ending_balance_diff is not None and ending_balance_diff > tolerance:
@@ -523,6 +635,6 @@ def build_overall_controls(
         initial_balance_diff=initial_balance_diff,
         ending_balance_diff=ending_balance_diff,
         continuity_anomalies=bank_balance[5] + journal_balance[5],
-        scope_limited=bool(reasons),
+        scope_limited=bool(structural),
         reasons=tuple(reasons),
     )

@@ -193,7 +193,7 @@ def write_input_problem_report(
     tables = [
             ("输入检查", safe_table(report.to_dataframe())),
             ("运行资料与映射", safe_table(report.source_dataframe())),
-            ("数据人口处置", safe_table(report.population_dataframe())),
+            ("数据入口处置", safe_table(report.population_dataframe())),
         ]
     if report.parse_errors:
         errors = pd.DataFrame(report.parse_errors).rename(columns={
@@ -1374,12 +1374,12 @@ def build_input_precheck(
         population_control_reasons = []
         if bank_parse_errors or journal_parse_errors:
             population_control_reasons.append(
-                "数据人口存在解析异常："
+                "数据入口存在解析异常："
                 f"银行流水{bank_parse_errors}行，银行日记账{journal_parse_errors}行"
             )
         if bank_unexplained or journal_unexplained:
             population_control_reasons.append(
-                "数据人口存在其他排除："
+                "数据入口存在其他排除："
                 f"银行流水{bank_unexplained}行，银行日记账{journal_unexplained}行"
             )
         combined_reasons = tuple(
@@ -1418,7 +1418,7 @@ def build_input_precheck(
         )
     items.append(
         PrecheckItem(
-            "数据人口",
+            "数据入口",
             population_summary("银行流水"),
             population_summary("银行日记账"),
             "存在未完全解释的行" if population_risk else "行数去向可解释",
