@@ -159,7 +159,9 @@ def test_验收Excel在可见结论和隐藏运行参数逐项披露搜索预算
     参数表 = 工作簿["运行参数"]
     结论表 = 工作簿["核对结论"]
     assert 参数表.sheet_state == "hidden"
-    assert 结论表.sheet_state == "visible"
+    assert 结论表.sheet_state == "hidden"
+    assert 工作簿["核对概览"].sheet_state == "visible"
+    assert any("未能检查全部组合" in str(cell.value) for row in 工作簿["核对概览"] for cell in row)
 
     参数 = _工作表键值(参数表, "参数名称", "参数值")
     assert 参数["组合搜索每来源节点上限"] == 1234

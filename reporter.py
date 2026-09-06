@@ -1,4 +1,4 @@
-"""
+﻿"""
 Reporter 模块 — 核对结果报表生成器
 
 使用 make_excel deep-navy 主题输出 Excel，再通过 openpyxl 后处理添加条件格式。
@@ -31,6 +31,7 @@ from balance import (
     check_balance_continuity as check_row_balance_continuity,
 )
 from make_excel import make_excel
+from 报告阅读 import build_source_records, build_readable_tables, apply_readable_presentation
 from llm_assistant import redact_sensitive_text, sanitize_url
 
 
@@ -2338,6 +2339,12 @@ class Reporter:
             config,
             date_format,
         )
+        tables["阅读来源记录"] = build_source_records(
+            self.matcher.bank, self.matcher.journal,
+            tables.get("运行资料与映射"),
+        )
+        readable = build_readable_tables(tables)
+        tables = {**readable, **{name: frame for name, frame in tables.items() if name not in readable}}
         return {
             name: self._safe_table(frame)
             for name, frame in tables.items()
@@ -2404,7 +2411,9 @@ class Reporter:
                 self._postprocess_diff_columns(workbook[sheet_name])
 
         self._apply_report_presentation(workbook)
+        apply_readable_presentation(workbook)
         workbook.save(output_path)
+        workbook.close()
         self._log(
             f"报告排版保存完成：排版耗时 "
             f"{time.perf_counter() - presentation_started:.1f} 秒，"
