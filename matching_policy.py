@@ -412,8 +412,7 @@ def route_candidate(
     if (is_complete_group
             and candidate.metrics.total_diff_li == 0
             and not candidate.is_ambiguous
-            and not overall_scope_limited
-            and not (candidate.text_evidence and candidate.text_evidence.conflicting_fields)):
+            and not hard_conflict):
         status = ProcessingStatus.GROUP_RECONCILED
         reasons.insert(0, "交易组收支分别闭合")
     elif (

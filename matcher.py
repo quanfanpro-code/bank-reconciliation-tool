@@ -1605,6 +1605,8 @@ class Matcher:
             date_span_days=date_span_days,
             is_cross_month_many_to_many=bool(
                 evidence.pop("is_cross_month_many_to_many", False)
+                or (len(bank_tuple) > 1 and len(journal_tuple) > 1
+                    and len({(day.year, day.month) for day in all_dates}) > 1)
             ),
             is_ambiguous=bool(evidence.pop("is_ambiguous", False)),
             rule_matched=bool(evidence.pop("is_rule_matched", False)),

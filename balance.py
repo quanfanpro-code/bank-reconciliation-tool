@@ -7,6 +7,46 @@ from precision_engine import PrecisionEngine
 from utils import clean_amount
 
 
+def _closed_day_balances(pairs, opening_hint=None):
+    """仅在全部金额、余额构成一条完整链时返回首尾，不按文件行序猜测。
+
+    每行是“余额减金额→余额”的一条边；用出入度和连通性证明全部边可走完。
+    精确闭合才采用，缺值或不闭合交回原有容差诊断；时间、空间均为 O(n)。
+    """
+    edges, degrees = {}, {}
+    count = 0
+    for amount, balance in pairs:
+        amount, balance = _decimal_value(amount), _decimal_value(balance)
+        if amount is None or balance is None:
+            return None
+        before = balance - amount
+        edges.setdefault(before, []).append(balance)
+        degrees[before] = degrees.get(before, 0) + 1
+        degrees[balance] = degrees.get(balance, 0) - 1
+        count += 1
+    if not count:
+        return None
+    starts = [value for value, degree in degrees.items() if degree == 1]
+    ends = [value for value, degree in degrees.items() if degree == -1]
+    if any(abs(degree) > 1 for degree in degrees.values()):
+        return None
+    if len(starts) == len(ends) == 1:
+        opening, closing = starts[0], ends[0]
+    elif not starts and not ends and opening_hint in edges:
+        opening = closing = opening_hint
+    else:
+        return None
+    stack, visited = [opening], 0
+    while stack:
+        outgoing = edges.get(stack[-1])
+        if outgoing:
+            stack.append(outgoing.pop())
+            visited += 1
+        else:
+            stack.pop()
+    return (opening, closing) if visited == count else None
+
+
 class BalanceRecalculator:
     """余额重算器 - 按日期重新计算每日余额"""
 
@@ -130,6 +170,14 @@ class BalanceRecalculator:
                     return debit - credit
                 raise ValueError(f"未知数据来源: {source_type}")
             return None
+
+        first_day = work['__parsed_date__'].min()
+        first_rows = work.loc[work['__parsed_date__'].dt.normalize() == first_day.normalize()] if pd.notna(first_day) else work.iloc[:0]
+        closed = _closed_day_balances(
+            [(_row_net(row), _parse(row[balance_col])) for _, row in first_rows.iterrows()]
+        )
+        if closed is not None:
+            return closed[0]
 
         cumulative = Decimal('0')
         for _, row in work.iterrows():
@@ -436,10 +484,7 @@ def check_balance_continuity(
     previous_closing: Optional[Decimal] = None
     previous_anchor_day = None
     pending_net = Decimal('0')
-    # ponytail: 日界按"日初开盘=当日首个余额行倒推"勾稽；日内逐行勾稽若不稳，
-    # 再按余额排序重试一次，排序后能闭合视为文件行序噪声（同日行顺序不代表过账
-    # 顺序）。混合方向且排序也无法闭合的日内错误仍按原行披露。升级路径：按凭证
-    # 号码或流水号重排日内顺序。
+    # 完整余额链先确定可信首尾；缺值或无法闭合时保留原行诊断和容差。
     for day, day_rows in work.groupby('date', sort=True):
         day_net = Decimal('0')
         day_unreliable = False
@@ -470,6 +515,17 @@ def check_balance_continuity(
         if day_closing is None:
             pending_net += day_net
             continue
+        closed = _closed_day_balances(
+            zip(day_rows['amount'], day_rows['balance']),
+            previous_closing + pending_net if previous_closing is not None else None,
+        )
+        if closed is not None:
+            for _, row in day_rows.iterrows():
+                if _decimal_value(row['balance']) - _decimal_value(row['amount']) == closed[0]:
+                    anchor_row = row
+                    anchor_balance = _decimal_value(row['balance'])
+                    anchor_cum_net = _decimal_value(row['amount'])
+                    break
         opening = (
             anchor_balance - anchor_cum_net if anchor_balance is not None else None
         )
@@ -491,7 +547,7 @@ def check_balance_continuity(
                     '窗口止': day,
                 })
         day_rows_list = list(day_rows.iterrows())
-        intra = chain_anomalies([row for _, row in day_rows_list], opening)
+        intra = [] if closed is not None else chain_anomalies([row for _, row in day_rows_list], opening)
         if intra and greedy_chain_ok([row for _, row in day_rows_list], opening):
             # 存在一种行序使当日全部余额闭合：原序异常是行序噪声，不按错误披露。
             intra = []
@@ -523,11 +579,21 @@ def _balance_control(
     parsed_balances = work['balance'].map(_decimal_value)
     last_balance_position = parsed_balances.last_valid_index()
     ending_balance = parsed_balances.loc[last_balance_position]
+    last_day = pd.to_datetime(work['date'], errors='coerce').dt.normalize().max()
+    last_rows = work.loc[pd.to_datetime(work['date'], errors='coerce').dt.normalize() == last_day]
     initial_balance = BalanceRecalculator.extract_initial_balance(work)
     _, _, net = _amount_totals(work)
     expected_ending = initial_balance + net
-    difference = abs(ending_balance - expected_ending)
     anomalies = tuple(check_balance_continuity(work, tolerance_li, source))
+    # 日界已逐日验证，才可用累计净额给末日零净额闭环提供锚点。
+    _, _, last_net = _amount_totals(last_rows)
+    closed = _closed_day_balances(
+        zip(last_rows['amount'], last_rows['balance']),
+        expected_ending - last_net if not anomalies else None,
+    )
+    if closed is not None:
+        ending_balance = closed[1]
+    difference = abs(ending_balance - expected_ending)
     tolerance = PrecisionEngine.from_integer_li(tolerance_li)
     reasons = []
     if parsed_balances.notna().sum() < 2:
@@ -641,10 +707,13 @@ def build_overall_controls(
             localizable = False
     if localizable:
         # 断档能定位到具体窗口：连续性原因只披露，不限制总体范围
-        structural.extend(
-            reason for reason in side_reasons
-            if "连续性" not in reason and "期初加净发生额" not in reason
-        )
+        localized_reasons = {
+            reason
+            for side in (bank_balance, journal_balance) if side[5]
+            for reason in side[6]
+            if "处余额连续性异常" in reason or "期初加净发生额" in reason
+        }
+        structural.extend(reason for reason in side_reasons if reason not in localized_reasons)
     else:
         structural.extend(side_reasons)
     if initial_balance_diff is not None and initial_balance_diff > tolerance:

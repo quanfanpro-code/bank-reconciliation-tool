@@ -183,6 +183,12 @@ def run_reconciliation(
         if output_path is not None
         else _default_output_path(bank_path, journal_path)
     )
+    for source_path in (Path(bank_path), Path(journal_path)):
+        if destination.resolve() == source_path.resolve() or (
+            destination.exists() and source_path.exists()
+            and destination.samefile(source_path)
+        ):
+            raise ValueError("报告不能覆盖原始输入文件，请另存为新文件")
     total_started = time.perf_counter()
     if progress_callback:
         progress_callback(0.0)
@@ -395,41 +401,45 @@ def run_reconciliation(
         journal_path=journal_path,
         date_format=date_format,
     )
+    report_elapsed = time.perf_counter() - report_started
+    history_started = time.perf_counter()
+    log("开始保存列映射模板和核对项目历史")
+    try:
+        store = project_store or LocalProjectStore()
+        store.save_mapping_template(
+            "bank",
+            raw_bank.columns,
+            bank_mapping,
+            f"银行流水-{Path(bank_path).stem}",
+        )
+        store.save_mapping_template(
+            "journal",
+            raw_journal.columns,
+            journal_mapping,
+            f"银行存款序时账-{Path(journal_path).stem}",
+        )
+        store.save_project(
+            bank_path=bank_path,
+            journal_path=journal_path,
+            report_path=destination,
+            bank_mapping=bank_mapping,
+            journal_mapping=journal_mapping,
+            parameters=matcher_config,
+            result_counts={
+                "bank_rows": len(bank),
+                "journal_rows": len(journal),
+                "selected_groups": len(matcher.selected_candidates),
+                "business_events": len(matcher.business_events),
+                "business_clues": len(matcher.business_clues),
+            },
+        )
+        log(f"项目历史保存完成，耗时 {time.perf_counter() - history_started:.1f} 秒")
+    except (OSError, ValueError, TypeError) as exc:
+        log(f"报告已保存至：{destination}；列映射模板或项目历史未保存：{exc}")
     if progress_callback:
         progress_callback(1.0)
     log(
-        f"全部完成：报告生成耗时 {time.perf_counter() - report_started:.1f} 秒，"
+        f"全部完成：报告生成耗时 {report_elapsed:.1f} 秒，"
         f"总耗时 {time.perf_counter() - total_started:.1f} 秒"
     )
-    history_started = time.perf_counter()
-    log("开始保存列映射模板和核对项目历史")
-    store = project_store or LocalProjectStore()
-    store.save_mapping_template(
-        "bank",
-        raw_bank.columns,
-        bank_mapping,
-        f"银行流水-{Path(bank_path).stem}",
-    )
-    store.save_mapping_template(
-        "journal",
-        raw_journal.columns,
-        journal_mapping,
-        f"银行存款序时账-{Path(journal_path).stem}",
-    )
-    store.save_project(
-        bank_path=bank_path,
-        journal_path=journal_path,
-        report_path=destination,
-        bank_mapping=bank_mapping,
-        journal_mapping=journal_mapping,
-        parameters=matcher_config,
-        result_counts={
-            "bank_rows": len(bank),
-            "journal_rows": len(journal),
-            "selected_groups": len(matcher.selected_candidates),
-            "business_events": len(matcher.business_events),
-            "business_clues": len(matcher.business_clues),
-        },
-    )
-    log(f"项目历史保存完成，耗时 {time.perf_counter() - history_started:.1f} 秒")
     return destination

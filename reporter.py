@@ -2010,6 +2010,31 @@ class Reporter:
                 })
         return pd.DataFrame(rows, columns=["业务链ID", "业务类型", "来源", "链内顺序", "原文件行号", "日期", "金额", "摘要", "关系公式", "最终净影响", "业务依据", "是否跨期", "系统结论"])
 
+    def _build_cutoff_table(self, events: pd.DataFrame) -> pd.DataFrame:
+        """保留跨期业务链，并独立披露所有跨月对应关系，包括小额自动确认。"""
+        rows = []
+        for candidate in getattr(self.matcher, "selected_candidates", []):
+            dates = candidate.bank_dates + candidate.journal_dates
+            if len({(day.year, day.month) for day in dates}) <= 1:
+                continue
+            row = {
+                "事项类型": "跨期对应关系",
+                "匹配ID": candidate.final_match_id,
+                "候选ID": candidate.candidate_id,
+                "业务类型": self._match_type_name(candidate.match_type),
+                "是否跨期": "是",
+                "系统结论": candidate.processing_status.value,
+                "业务依据": candidate.processing_reason,
+                "建议动作": "核查两侧入账期间及截止性；金额对应不代表期间正确",
+            }
+            row.update(self._candidate_snapshots(candidate))
+            rows.append(row)
+        cross_events = events.loc[events["是否跨期"] == "是"].copy()
+        cross_events["事项类型"] = "跨期业务链"
+        if not rows:
+            return cross_events.reset_index(drop=True)
+        return pd.concat([pd.DataFrame(rows), cross_events], ignore_index=True).fillna("")
+
     def _build_business_clue_table(self) -> pd.DataFrame:
         rows = []
         for clue in getattr(self.matcher, "business_clues", []):
@@ -2248,6 +2273,7 @@ class Reporter:
         )
         daily, monthly = self._build_daily_and_monthly_tables()
         groups = self._build_match_group_table()
+        events = self._build_business_event_table()
         row_mask = (
             (groups["银行笔数"] == 1) & (groups["日记账笔数"] == 1)
             if not groups.empty
@@ -2271,9 +2297,9 @@ class Reporter:
             "整组勾稽": groups.loc[~row_mask].reset_index(drop=True)
             if not groups.empty else groups.copy(),
             "匹配组成": self._build_match_component_table(),
-            "退款冲销重付": self._build_business_event_table(),
+            "退款冲销重付": events,
             "手续费及净额": groups.loc[groups["类型"] == "手续费净额"].reset_index(drop=True) if not groups.empty else groups.copy(),
-            "截止性差异": self._build_business_event_table().loc[lambda frame: frame["是否跨期"] == "是"].reset_index(drop=True),
+            "截止性差异": self._build_cutoff_table(events),
             "重复线索": self._build_business_clue_table(),
         }
         alternatives = self._build_alternative_component_table()
