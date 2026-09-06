@@ -71,3 +71,38 @@ def test_配置损坏时启动提示且不泄露内容(tmp_path,monkeypatch,cont
         assert all('私人密钥' not in msg and content not in msg for msg in messages)
     finally:
         app.destroy()
+
+
+@pytest.mark.parametrize('has_local',[False,True])
+def test_EXE内置配置无需本机文件且优先于本机配置(tmp_path,monkeypatch,has_local):
+    import sys
+    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path/'local'))
+    if has_local:
+        _配置(tmp_path/'local',monkeypatch,{'enabled':False,'model':'旧本机模型'})
+    bundle=tmp_path/'bundle'
+    bundle.mkdir()
+    (bundle/'大模型默认配置.json').write_text(json.dumps({'enabled':True,'mode':'online','protocol':'chat_completions','base_url':'http://example.test/v1','model':'内置模型','api_key':'内置测试密钥','timeout_seconds':600}),encoding='utf-8-sig')
+    monkeypatch.setattr(gui,'__file__',str(bundle/'gui.py'))
+    monkeypatch.setattr(sys,'frozen',True,raising=False)
+    app=gui.ReconciliationApp()
+    try:
+        app.withdraw()
+        assert app.llm_config.enabled
+        assert app.llm_config.model=='内置模型'
+        assert app.llm_config.api_key=='内置测试密钥'
+        assert app._collect_run_state()['llm_config']==app.llm_config
+        assert '内置模型' in app.llm_status_var.get()
+    finally:
+        app.destroy()
+
+
+def test_源码运行不读取旁边同名包内配置(tmp_path,monkeypatch):
+    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path/'local'))
+    (tmp_path/'大模型默认配置.json').write_text(json.dumps({'enabled':True,'base_url':'http://example.test/v1','model':'不应加载'}),encoding='utf-8-sig')
+    monkeypatch.setattr(gui,'__file__',str(tmp_path/'gui.py'))
+    app=gui.ReconciliationApp()
+    try:
+        app.withdraw()
+        assert not app.llm_config.enabled
+    finally:
+        app.destroy()

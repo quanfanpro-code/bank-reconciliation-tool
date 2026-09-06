@@ -6,6 +6,7 @@
 """
 
 import os
+import sys
 import json
 import threading
 import queue
@@ -1266,6 +1267,9 @@ class ReconciliationApp(ctk.CTk):
         self.project_store = LocalProjectStore()
         default_path = self.project_store.root / "大模型默认配置.json"
         try:
+            bundled_path = Path(__file__).with_name("大模型默认配置.json")
+            if getattr(sys, "frozen", False) and bundled_path.is_file():
+                default_path = bundled_path
             default_values = json.loads(default_path.read_text(encoding="utf-8-sig"))
             if not isinstance(default_values, dict):
                 raise ValueError("默认配置结构不正确")
