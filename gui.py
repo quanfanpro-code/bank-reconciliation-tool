@@ -2087,7 +2087,7 @@ class ReconciliationApp(ctk.CTk):
             if not projects:
                 messagebox.showinfo("项目历史", "尚无已保存的核对项目。", parent=self)
                 return
-            report = self.project_store.resolve_report(projects[0]["project_id"])
+            report = self.project_store.resolve_report(projects[0]["project_id"], verify_hash=False)
             os.startfile(str(report))
         except Exception as exc:
             messagebox.showerror("无法打开", str(exc), parent=self)

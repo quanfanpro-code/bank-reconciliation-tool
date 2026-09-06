@@ -1,4 +1,4 @@
-from decimal import Decimal
+﻿from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import pandas as pd
 from data_structures import DailyBalance, BalanceDiff, OverallControlResult
@@ -45,6 +45,41 @@ def _closed_day_balances(pairs, opening_hint=None):
         else:
             stack.pop()
     return (opening, closing) if visited == count else None
+
+
+def daily_balance_points(frame: pd.DataFrame) -> dict[pd.Timestamp, Optional[Decimal]]:
+    """返回实际交易日的原始期末余额；日内链尾无法证明时保留 None。
+
+    日期归一到当天零点，不补无交易日。净零闭环只采用前日可信余额及
+    中间无余额日的已知净额作锚；日界断档不改写原余额，仍由连续性检查披露。
+    """
+    if frame.empty or 'date' not in frame.columns:
+        return {}
+    work = frame.copy()
+    work['date'] = pd.to_datetime(work['date'], errors='coerce').dt.normalize()
+    work = work.dropna(subset=['date'])
+    if not {'amount', 'balance'} <= set(work.columns):
+        return {pd.Timestamp(day): None for day in sorted(work['date'].unique())}
+
+    points = {}
+    previous_closing = None
+    pending_net = Decimal('0')
+    for day, day_rows in work.groupby('date', sort=True):
+        pairs = [(_decimal_value(amount), _decimal_value(balance))
+                 for amount, balance in zip(day_rows['amount'], day_rows['balance'])]
+        opening_hint = previous_closing + pending_net if previous_closing is not None else None
+        closed = _closed_day_balances(pairs, opening_hint)
+        points[pd.Timestamp(day)] = closed[1] if closed is not None else None
+        if closed is not None:
+            previous_closing = closed[1]
+            pending_net = Decimal('0')
+        elif all(amount is not None and balance is None for amount, balance in pairs):
+            pending_net += sum((amount for amount, _ in pairs), Decimal('0'))
+        else:
+            # 当日有余额但无法证明完整链时，不把文件末行或重算余额传给后日闭环。
+            previous_closing = None
+            pending_net = Decimal('0')
+    return points
 
 
 class BalanceRecalculator:

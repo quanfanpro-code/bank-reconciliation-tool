@@ -1,4 +1,4 @@
-from decimal import Decimal
+﻿from decimal import Decimal
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -401,7 +401,7 @@ def test_外来表头不能被Excel当作公式执行(tmp_path):
     assert "'=1+1" in {cell.value for cell in headers}
 
 
-def test_可选后续状态用公式联动首页处理进度(tmp_path):
+def test_人工核对结果用公式联动首页处理进度(tmp_path):
     output = tmp_path / "progress.xlsx"
     _pending_reporter().generate_report(str(output), config=MatcherConfig())
     workbook = load_workbook(output, data_only=False)
@@ -417,9 +417,13 @@ def test_可选后续状态用公式联动首页处理进度(tmp_path):
         for row in range(2, sheet.max_row + 1)
     }
 
-    for item in ("待处理事项数", "已关注事项数", "已处理事项数", "无需处理事项数"):
+    # 用户将旧的后续状态改为实际核对结果，进度引用完整复核总体。
+    for item in ("待处理事项数", "已处理事项数", "人工全查未核对数", "人工抽样未核对数"):
         assert rows[item].data_type == "f"
-        assert "疑点事项" in rows[item].value
+        assert "复核事项索引" in rows[item].value
+    for item in ("已关注事项数", "无需处理事项数"):
+        assert sheet.row_dimensions[rows[item].row].hidden
+    workbook.close()
 
 
 def test_输入检查排在统计表之前且运行参数位于技术表区():

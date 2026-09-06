@@ -1,4 +1,4 @@
-"""
+﻿"""
 Reporter 模块 — 核对结果报表生成器
 
 使用 make_excel deep-navy 主题输出 Excel，再通过 openpyxl 后处理添加条件格式。
@@ -26,11 +26,13 @@ from input_precheck import InputPrecheckReport
 from matcher import Matcher
 from utils import round_decimal, clean_excel_string
 from balance import (
+    daily_balance_points,
     BalanceRecalculator,
     BalanceReconciler,
     check_balance_continuity as check_row_balance_continuity,
 )
 from make_excel import make_excel
+from 复核报表 import build_review_tables, apply_review_presentation
 from llm_assistant import redact_sensitive_text, sanitize_url
 
 
@@ -169,9 +171,13 @@ class Reporter:
             stats = pd.merge(pd.DataFrame({'date': date_range}), stats, on='date', how='left').fillna(0)
             stats['expense_amount'] = stats['expense_amount'].abs()
             if has_bal:
-                bal = df.sort_values(['date', 'original_idx']).groupby('date')['balance'].last()
-                stats = pd.merge(stats, bal, on='date', how='left')
-                stats['balance'] = stats['balance'].ffill()
+                points = daily_balance_points(df)
+                values, previous = [], None
+                for day in stats['date']:
+                    if day in points:
+                        previous = points[day]
+                    values.append(previous)
+                stats['balance'] = pd.Series(values, dtype=object)
                 stats['balance_missing'] = stats['balance'].isna()
             return stats
 
@@ -183,7 +189,7 @@ class Reporter:
         # 四舍五入与差额计算
         cols = [c for c in df.columns if 'amount' in c or 'net' in c or ('balance' in c and 'missing' not in c)]
         for c in cols:
-            df[c] = df[c].apply(round_decimal)
+            df[c] = df[c].apply(lambda value: round_decimal(value) if pd.notna(value) else None)
 
         df['income_count_diff'] = df['income_count_bank'] - df['income_count_journal']
         df['income_amount_diff'] = (df['income_amount_bank'] - df['income_amount_journal']).apply(round_decimal)
@@ -191,7 +197,7 @@ class Reporter:
         df['expense_amount_diff'] = (df['expense_amount_bank'] - df['expense_amount_journal']).apply(round_decimal)
 
         if 'balance_bank' in df.columns and 'balance_journal' in df.columns:
-            df['balance_diff'] = (df['balance_bank'] - df['balance_journal']).apply(round_decimal)
+            df['balance_diff'] = [round_decimal(b - j) if pd.notna(b) and pd.notna(j) else None for b, j in zip(df['balance_bank'], df['balance_journal'])]
 
         return df
 
@@ -210,19 +216,17 @@ class Reporter:
         bal_cols = [c for c in ['balance_bank', 'balance_journal'] if c in last.columns]
         if bal_cols:
             df_m = pd.merge(df_m, last[['month'] + bal_cols], on='month', how='left')
-            for c in bal_cols:
-                df_m[c] = df_m[c].ffill()
 
         cols = [c for c in df_m.columns if 'amount' in c or 'net' in c or 'balance' in c]
         for c in cols:
-            df_m[c] = df_m[c].apply(round_decimal)
+            df_m[c] = df_m[c].apply(lambda value: round_decimal(value) if pd.notna(value) else None)
 
         df_m['income_count_diff'] = df_m['income_count_bank'] - df_m['income_count_journal']
         df_m['income_amount_diff'] = (df_m['income_amount_bank'] - df_m['income_amount_journal']).apply(round_decimal)
         df_m['expense_count_diff'] = df_m['expense_count_bank'] - df_m['expense_count_journal']
         df_m['expense_amount_diff'] = (df_m['expense_amount_bank'] - df_m['expense_amount_journal']).apply(round_decimal)
         if 'balance_bank' in df_m.columns and 'balance_journal' in df_m.columns:
-            df_m['balance_diff'] = (df_m['balance_bank'] - df_m['balance_journal']).apply(round_decimal)
+            df_m['balance_diff'] = [round_decimal(b - j) if pd.notna(b) and pd.notna(j) else None for b, j in zip(df_m['balance_bank'], df_m['balance_journal'])]
 
         df_m = df_m[self._get_ordered_columns(df_m, 'month')]
         # Period 类型转为字符串
@@ -2338,6 +2342,7 @@ class Reporter:
             config,
             date_format,
         )
+        tables.update(build_review_tables(self, tables))
         return {
             name: self._safe_table(frame)
             for name, frame in tables.items()
@@ -2404,6 +2409,9 @@ class Reporter:
                 self._postprocess_diff_columns(workbook[sheet_name])
 
         self._apply_report_presentation(workbook)
+        apply_review_presentation(workbook)
+        if "核对结论" in workbook:
+            self._postprocess_summary(workbook["核对结论"], has_warning)
         workbook.save(output_path)
         self._log(
             f"报告排版保存完成：排版耗时 "

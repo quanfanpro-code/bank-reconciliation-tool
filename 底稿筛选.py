@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 from make_excel import make_excel
 
@@ -69,6 +72,128 @@ def _filter_groups(frame: pd.DataFrame, criteria: FilterCriteria) -> pd.DataFram
     return selected.reset_index(drop=True)
 
 
+def _worksheet_frame(sheet) -> pd.DataFrame:
+    """读取原单元格值，保留稳定事项编号，不使用可能已失效的公式缓存。"""
+    columns = {cell.column - 1: cell.value for cell in sheet[1] if cell.value is not None}
+    return pd.DataFrame(
+        [{name: row[position] for position, name in columns.items()}
+         for row in sheet.iter_rows(min_row=2, values_only=True)],
+        columns=list(columns.values()),
+    )
+
+
+def _review_groups(book) -> pd.DataFrame:
+    groups = _worksheet_frame(book['复核事项索引'])
+    details = _worksheet_frame(book['核对明细'])
+    texts = {}
+    if not details.empty:
+        texts = details.assign(_检索=_combined_text(details)).groupby('事项编号')['_检索'].agg('|'.join).to_dict()
+    choices, remarks = {}, {}
+    for name in ('人工全查', '人工抽样'):
+        if name not in book:
+            continue
+        for row in _worksheet_frame(book[name]).to_dict('records'):
+            item_id = row.get('事项编号')
+            if pd.isna(item_id) or row.get('行别') != '核对事项':
+                continue
+            choice = row.get('人工核对结果')
+            choices[str(item_id)] = '' if pd.isna(choice) else str(choice).strip()
+            remarks[str(item_id)] = '|'.join(str(row[column]) for column in ('核对原因', '银行记录', '序时账记录', '备注') if column in row and pd.notna(row[column]))
+    groups['事项编号'] = groups['事项编号'].astype(str)
+    groups['_组成检索文字'] = groups['事项编号'].map(texts).fillna('')
+    groups['_人工检索文字'] = groups['事项编号'].map(remarks).fillna('')
+    groups['人工核对结果'] = groups['事项编号'].map(choices).fillna('')
+    # 已经选择时按该实际结果筛选，不能继续使用生成时的程序状态或旧缓存。
+    groups['最终状态'] = groups['人工核对结果'].where(groups['人工核对结果'] != '', groups['程序结论'])
+    if '匹配ID' not in groups:
+        groups['匹配ID'] = groups['事项编号']
+    else:
+        groups['匹配ID'] = groups['匹配ID'].fillna(groups['事项编号'])
+    return groups
+
+
+def _describe_criteria(criteria: FilterCriteria) -> str:
+    parts = []
+    for value, label in ((criteria.start_date, '起始日期'), (criteria.end_date, '截止日期')):
+        if value:
+            parts.append(label + '：' + str(value))
+    for values, label in ((criteria.include_text, '包含文字'), (criteria.exclude_text, '排除文字'),
+                          (criteria.business_types, '业务类型'), (criteria.statuses, '核对结果'), (criteria.reasons, '判断依据')):
+        if values:
+            parts.append(label + '：' + '、'.join(str(value) for value in values))
+    if criteria.coverage_ratio is not None:
+        parts.append(f'条件内目标金额覆盖比例：{criteria.coverage_ratio:.2%}')
+    return '；'.join(parts) or '全部事项'
+
+
+def _export_review_view(book, source, output, criteria, progress, log) -> Path:
+    """另存原簿并隐藏非选中整组；不删除原行、不移动公式及人工填写单元格。"""
+    groups = _review_groups(book)
+    selected = _filter_groups(groups, criteria)
+    selected_ids = set(selected['事项编号'])
+    progress(0.4)
+    log(f'事项筛选完成：{len(selected)}/{len(groups)} 项')
+    item_sheets = {'核对明细', '人工全查', '人工抽样', '月度差异组成', '其他对应供选择'}
+    full_sheets = {'核对结论', '月度核对', '每日统计'}
+    for sheet in book:
+        if sheet.title in item_sheets:
+            header = {cell.value: cell.column for cell in sheet[1] if cell.value}
+            if '事项编号' not in header:
+                sheet.sheet_state = 'hidden'
+                continue
+            owner = None
+            for row in range(2, sheet.max_row + 1):
+                item_id = sheet.cell(row, header['事项编号']).value
+                if item_id:
+                    owner = str(item_id)
+                elif sheet.title not in ('人工全查', '人工抽样'):
+                    owner = None
+                sheet.row_dimensions[row].hidden = owner not in selected_ids
+                sheet.row_dimensions[row].collapsed = False
+            sheet.auto_filter.filterColumn = []
+            sheet.sheet_state = 'visible' if sheet.title in ('核对明细', '人工全查', '人工抽样') or any(not sheet.row_dimensions[row].hidden for row in range(2, sheet.max_row + 1)) else 'hidden'
+        else:
+            sheet.sheet_state = 'visible' if sheet.title in full_sheets else 'hidden'
+    amounts = lambda frame: pd.to_numeric(frame.get('组金额', pd.Series(dtype=float)), errors='coerce').abs().fillna(0).sum()
+    total_amount, selected_amount = amounts(groups), amounts(selected)
+    explanation = [
+        ('项目', '数值'), ('全量报告', str(source)),
+        ('全量事项数', len(groups)), ('筛选事项数', len(selected)),
+        ('全量事项金额', float(total_amount)), ('筛选事项金额', float(selected_amount)),
+        ('实际金额覆盖比例', float(selected_amount / total_amount) if total_amount else 0.0),
+        ('筛选条件', _describe_criteria(criteria)),
+        ('口径说明', '本文件为筛选视图；月度、每日及核对结论仍为全量口径。原记录、候选组成和公式全部保留，非选中行仅隐藏，用于公式计算；筛选事项金额取双方收支绝对金额合计的较大值，收付不能抵销。'),
+        ('人工结果口径', '状态筛选采用人工全查、人工抽样中的实际选择；未选择时采用程序结论。人工结果和备注原样保留，打开Excel后公式自动重算。'),
+    ]
+    sheet = book['筛选说明'] if '筛选说明' in book else book.create_sheet('筛选说明', 0)
+    for row in sheet:
+        for cell in row:
+            cell.value = None
+    for row_number, row in enumerate(explanation, 1):
+        for column, value in enumerate(row, 1):
+            cell = sheet.cell(row_number, column, value)
+            cell.font = Font(name='微软雅黑', size=11, bold=row_number == 1, color='FFFFFF' if row_number == 1 else '243746')
+            cell.fill = PatternFill('solid', fgColor='24445B' if row_number == 1 else 'FFFFFF')
+            cell.alignment = Alignment(wrap_text=True, vertical='top')
+    sheet.column_dimensions['A'].width = 26
+    sheet.column_dimensions['B'].width = 110
+    sheet.row_dimensions[9].height = 72
+    sheet.row_dimensions[10].height = 48
+    sheet['B7'].number_format = '0.00%'
+    sheet.freeze_panes = 'B2'
+    sheet.sheet_state = 'visible'
+    book.active = book.index(sheet)
+    book.calculation.calcMode = 'auto'
+    book.calculation.fullCalcOnLoad = True
+    book.calculation.forceFullCalc = True
+    progress(0.65)
+    log(f'开始写入筛选底稿：保留 {len(book.sheetnames)} 个工作表及全部计算上下文')
+    book.save(output)
+    progress(1.0)
+    log(f'筛选导出完成：{output}')
+    return output
+
+
 def export_filtered_workpaper(
     source_path: str | Path,
     output_path: str | Path,
@@ -81,10 +206,15 @@ def export_filtered_workpaper(
     log = log_callback or (lambda _message: None)
     source = Path(source_path).resolve()
     output = Path(output_path).resolve()
-    if source == output:
+    if source == output or (output.exists() and source.samefile(output)):
         raise ValueError("筛选版必须另存为新文件，不能覆盖全量报告")
     progress(0.0)
     log(f"开始读取全量报告：{source.name}")
+    with closing(load_workbook(source, data_only=False)) as book:
+        if '复核事项索引' in book and '核对明细' in book:
+            progress(0.2)
+            log(f'全量报告读取完成：{len(book.sheetnames)} 个工作表')
+            return _export_review_view(book, source, output, criteria, progress, log)
     sheets = pd.read_excel(source, sheet_name=None)
     progress(0.2)
     log(f"全量报告读取完成：{len(sheets)} 个工作表")
