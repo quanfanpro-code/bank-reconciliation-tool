@@ -133,7 +133,7 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
     selected_ids = set(selected['事项编号'])
     progress(0.4)
     log(f'事项筛选完成：{len(selected)}/{len(groups)} 项')
-    item_sheets = {'核对明细', '人工全查', '人工抽样', '月度差异组成', '其他对应供选择'}
+    item_sheets = {'核对明细', '人工全查', '人工抽样', '月度差异组成', '其他对应供选择', '逐笔核对', '整组核对', '未对应记录'}
     full_sheets = {'核对结论', '月度核对', '每日统计'}
     for sheet in book:
         if sheet.title in item_sheets:
@@ -154,6 +154,10 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
             sheet.sheet_state = 'visible' if sheet.title in ('核对明细', '人工全查', '人工抽样') or any(not sheet.row_dimensions[row].hidden for row in range(2, sheet.max_row + 1)) else 'hidden'
         else:
             sheet.sheet_state = 'visible' if sheet.title in full_sheets else 'hidden'
+    if '逐笔核对' in book:
+        from 报告展示 import 阅读表
+        for sheet in book:
+            sheet.sheet_state = 'visible' if sheet.title in 阅读表 else 'hidden'
     amounts = lambda frame: pd.to_numeric(frame.get('组金额', pd.Series(dtype=float)), errors='coerce').abs().fillna(0).sum()
     total_amount, selected_amount = amounts(groups), amounts(selected)
     explanation = [

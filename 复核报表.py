@@ -9,6 +9,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from 复核事项 import build_review_items
+from 报告展示 import build_display_tables, format_display_sheets
 
 
 主表 = ('核对结论', '月度核对', '核对明细', '人工全查', '人工抽样', '每日统计')
@@ -137,7 +138,7 @@ def build_review_tables(reporter, tables):
     for name in ('核对明细','人工全查','人工抽样','月度差异组成','其他对应供选择'):
         result[name].insert(0,'核对编号',result[name]['事项编号'].map(display_numbers))
     result['核对明细'].insert(result['核对明细'].columns.get_loc('当前对应'),'当前核对编号','')
-    return result
+    return build_display_tables(result)
 
 
 def apply_review_presentation(book):
@@ -273,6 +274,7 @@ def apply_review_presentation(book):
             sheet.cell(row,hs['当前核对结论'],f'=IF({remaining}>0,"本月原记录仍有未对应；详见核对明细","本月原记录均已建立对应，原始差额保留")')
     _summary_formulas(book,sheets,headers,rng)
     _format_sheets(book)
+    format_display_sheets(book)
 
 
 def _summary_formulas(book,sheets,headers,rng):
