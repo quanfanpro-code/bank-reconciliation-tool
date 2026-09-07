@@ -4,16 +4,18 @@
 包含高级配置参数和界面输入项的有效性校验函数。
 """
 
+import math
+
 
 def _validate_int(value: str, name: str, allow_zero: bool = False) -> tuple[bool, str]:
     """校验整数参数。"""
     stripped = value.strip()
     if not stripped:
         return False, f"❌ {name}不能为空"
-    if not stripped.lstrip("-").isdigit():
+    try:
+        int_value = int(stripped)
+    except ValueError:
         return False, f"❌ {name}必须为整数，当前值: '{value}'"
-
-    int_value = int(stripped)
     if allow_zero:
         if int_value < 0:
             return False, f"❌ {name}不能为负数，当前值: {int_value}"
@@ -33,6 +35,8 @@ def _validate_float(value: str, name: str, must_positive: bool = True, allow_zer
         float_value = float(stripped)
     except ValueError:
         return False, f"❌ {name}必须为数字，当前值: '{value}'"
+    if not math.isfinite(float_value):
+        return False, f"❌ {name}必须为有限数字"
 
     if must_positive:
         if allow_zero:
@@ -92,9 +96,11 @@ def validate_config_params(
     seed_stripped = random_seed.strip()
     if not seed_stripped:
         return False, "❌ 随机种子不能为空"
-    if not seed_stripped.lstrip("-").isdigit():
+    try:
+        seed_value = int(seed_stripped)
+    except ValueError:
         return False, f"❌ 随机种子必须为整数，当前值: '{random_seed}'"
-    if int(seed_stripped) < -1:
+    if seed_value < -1:
         return False, f"❌ 随机种子不能小于 -1，当前值: {seed_stripped}"
 
     # 上限校验（须覆盖 readme/GUI 默认值：窗口 31、深度 30，防止默认值被自己拒绝）

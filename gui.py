@@ -1262,6 +1262,7 @@ class ReconciliationApp(ctk.CTk):
         self.log_lock = threading.Lock()
         self.after(100, self.process_log_queue)
         self.matcher = None
+        self.cancel_event = threading.Event()
         self.theme_mode = "system"
         self.llm_config = LLMConfig()
         self.project_store = LocalProjectStore()
@@ -2260,13 +2261,18 @@ class ReconciliationApp(ctk.CTk):
 
         self._set_stop_enabled(True)
         self._set_start_enabled(False)
+        self.matcher = None
+        self.cancel_event = threading.Event()
         threading.Thread(target=self.run_process, args=(run_state,), daemon=True).start()
 
     def stop_process(self):
+        if not hasattr(self, "cancel_event"):
+            self.cancel_event = threading.Event()
+        self.cancel_event.set()
         if self.matcher:
             self.matcher.set_stopping(True)
-            self.log("正在停止任务...")
-            self._set_stop_enabled(False)
+        self.log("正在停止任务，将在当前读写步骤结束后取消...")
+        self._set_stop_enabled(False)
 
     def _confirm_precheck_warnings(
         self,
@@ -2291,6 +2297,8 @@ class ReconciliationApp(ctk.CTk):
         return decision["continue"]
 
     def run_process(self, run_state):
+        if not hasattr(self, "cancel_event"):
+            self.cancel_event = threading.Event()
         try:
             self.log("开始处理...")
             output_path = run_reconciliation(
@@ -2314,6 +2322,7 @@ class ReconciliationApp(ctk.CTk):
                 ),
                 precheck_warning_callback=self._confirm_precheck_warnings,
                 project_store=getattr(self, "project_store", None),
+                cancel_requested=self.cancel_event.is_set,
             )
             self.last_report_path = output_path
             self.log(f"\n{'=' * 50}")

@@ -77,6 +77,9 @@ def parse_date(date_val: Any, date_format: str = "auto") -> Optional[pd.Timestam
     str_val = str(date_val).strip()
     if not str_val:
         return None
+    # Excel 数值列遇到空格后可能以浮点形式读出八位日期。
+    if re.fullmatch(r'\d{8}\.0+', str_val):
+        str_val = str_val.split('.')[0]
 
     # 如果用户指定了格式，优先使用该格式
     if date_format != "auto":
@@ -152,11 +155,12 @@ def clean_amount(amount_val: Any, allow_suffix_sign: bool = True) -> Optional[De
     if pd.isna(amount_val):
         return Decimal('0.00')
 
-    if isinstance(amount_val, (int, float)):
-        return Decimal(str(amount_val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
-    if isinstance(amount_val, Decimal):
-        return amount_val.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    if isinstance(amount_val, (int, float, Decimal)):
+        try:
+            number = Decimal(str(amount_val))
+            return number.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if number.is_finite() else None
+        except InvalidOperation:
+            return None
 
     str_val = str(amount_val).strip()
 
@@ -198,6 +202,8 @@ def clean_amount(amount_val: Any, allow_suffix_sign: bool = True) -> Optional[De
             * Decimal(str(sign))
             * Decimal(str(sign_suffix))
         )
+        if not result.is_finite():
+            return None
         return result.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     except (ValueError, TypeError, InvalidOperation):
         return None

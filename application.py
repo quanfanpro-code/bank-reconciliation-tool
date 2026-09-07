@@ -168,6 +168,7 @@ def run_reconciliation(
         Callable[[InputPrecheckReport], bool]
     ] = None,
     project_store: Optional[LocalProjectStore] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> Path:
     """读取、标准化、匹配并生成 Excel 报告。
 
@@ -189,6 +190,14 @@ def run_reconciliation(
             and destination.samefile(source_path)
         ):
             raise ValueError("报告不能覆盖原始输入文件，请另存为新文件")
+    if destination.exists():
+        raise FileExistsError("报告文件已存在，请另存为新文件，避免覆盖人工核对结果")
+    matcher = None
+
+    def check_cancelled() -> None:
+        if (cancel_requested and cancel_requested()) or (matcher is not None and matcher.stopping):
+            raise InterruptedError("核对任务已取消")
+
     total_started = time.perf_counter()
     if progress_callback:
         progress_callback(0.0)
@@ -197,6 +206,7 @@ def run_reconciliation(
     journal_structure: Optional[TableStructure] = None
     load_started = time.perf_counter()
     log("开始读取银行流水和银行存款序时账")
+    check_cancelled()
     try:
         bank_structure = _adopt_structure(
             bank_path,
@@ -241,6 +251,7 @@ def run_reconciliation(
         )
         raise _blocked_error_with_report(report, destination) from exc
 
+    check_cancelled()
     if progress_callback:
         progress_callback(0.1)
     bank = pd.DataFrame()
@@ -302,6 +313,7 @@ def run_reconciliation(
         )
         raise _blocked_error_with_report(report, destination) from exc
 
+    check_cancelled()
     error_summary = collector.get_summary()
     if error_summary["总计"] > 0:
         log(
@@ -342,6 +354,7 @@ def run_reconciliation(
     log(f"输入预检查完成，耗时 {time.perf_counter() - precheck_started:.1f} 秒")
     if progress_callback:
         progress_callback(0.3)
+    check_cancelled()
 
     effective_llm_config = llm_config or LLMConfig()
     assistant = (
@@ -376,6 +389,7 @@ def run_reconciliation(
         raise InterruptedError("核对任务已取消")
     if progress_callback:
         progress_callback(0.8)
+    check_cancelled()
     log(
         f"匹配完成：选中关系 {len(matcher.selected_candidates):,} 组，"
         f"耗时 {time.perf_counter() - match_started:.1f} 秒"
@@ -400,6 +414,7 @@ def run_reconciliation(
         bank_path=bank_path,
         journal_path=journal_path,
         date_format=date_format,
+        cancel_check=check_cancelled,
     )
     report_elapsed = time.perf_counter() - report_started
     history_started = time.perf_counter()

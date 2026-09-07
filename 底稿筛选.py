@@ -11,7 +11,7 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
-from make_excel import make_excel
+from make_excel import make_excel, atomic_output_path
 
 
 @dataclass(frozen=True)
@@ -192,7 +192,8 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
     book.calculation.forceFullCalc = True
     progress(0.65)
     log(f'开始写入筛选底稿：保留 {len(book.sheetnames)} 个工作表及全部计算上下文')
-    book.save(output)
+    with atomic_output_path(output) as temporary:
+        book.save(temporary)
     progress(1.0)
     log(f'筛选导出完成：{output}')
     return output
@@ -212,6 +213,10 @@ def export_filtered_workpaper(
     output = Path(output_path).resolve()
     if source == output or (output.exists() and source.samefile(output)):
         raise ValueError("筛选版必须另存为新文件，不能覆盖全量报告")
+    if output.exists():
+        raise FileExistsError("筛选文件已存在，请另存为新文件")
+    if criteria.coverage_ratio is not None and not 0 <= float(criteria.coverage_ratio) <= 1:
+        raise ValueError("金额覆盖比例必须为 0 到 1 之间的有限数字")
     progress(0.0)
     log(f"开始读取全量报告：{source.name}")
     with closing(load_workbook(source, data_only=False)) as book:
@@ -282,7 +287,8 @@ def export_filtered_workpaper(
             output_sheets.append((name, frame.copy()))
     progress(0.65)
     log(f"开始写入筛选底稿：{len(output_sheets)} 个工作表")
-    make_excel(output_sheets, str(output), theme="deep-navy")
+    with atomic_output_path(output) as temporary:
+        make_excel(output_sheets, str(temporary), theme="deep-navy")
     progress(1.0)
     log(f"筛选导出完成：{output}")
     return output

@@ -449,10 +449,16 @@ class LLMAssistant:
             direct = response.get("output_text")
             if isinstance(direct, str):
                 return direct
-            for output in response.get("output", []):
+            outputs = response.get("output")
+            if not isinstance(outputs, list):
+                raise ValueError("Responses 响应中的 output 必须为列表")
+            for output in outputs:
                 if not isinstance(output, dict):
                     continue
-                for content in output.get("content", []):
+                contents = output.get("content")
+                if not isinstance(contents, list):
+                    continue
+                for content in contents:
                     if isinstance(content, dict) and isinstance(
                         content.get("text"),
                         str,
@@ -460,7 +466,7 @@ class LLMAssistant:
                         return content["text"]
             raise ValueError("Responses 响应中缺少文字结果")
         choices = response.get("choices", [])
-        if not choices or not isinstance(choices[0], dict):
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise ValueError("Chat Completions 响应中缺少 choices")
         message = choices[0].get("message", {})
         content = message.get("content") if isinstance(message, dict) else None

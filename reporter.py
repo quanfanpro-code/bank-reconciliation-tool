@@ -31,7 +31,7 @@ from balance import (
     BalanceReconciler,
     check_balance_continuity as check_row_balance_continuity,
 )
-from make_excel import make_excel
+from make_excel import make_excel, atomic_output_path
 from 复核报表 import build_review_tables, apply_review_presentation
 from llm_assistant import redact_sensitive_text, sanitize_url
 
@@ -2349,6 +2349,22 @@ class Reporter:
         }
 
     def generate_report(
+        self,
+        output_path: str,
+        config: Optional[MatcherConfig] = None,
+        bank_path: Optional[str] = None,
+        journal_path: Optional[str] = None,
+        date_format: str = "auto",
+        *,
+        cancel_check: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """完整报告成功且未取消时才交付，失败不留下正式半成品。"""
+        with atomic_output_path(output_path) as temporary:
+            self._generate_report(str(temporary), config, bank_path, journal_path, date_format)
+            if cancel_check:
+                cancel_check()
+
+    def _generate_report(
         self,
         output_path: str,
         config: Optional[MatcherConfig] = None,

@@ -245,7 +245,7 @@ def _read_csv(path: Path, **kwargs: Any) -> pd.DataFrame:
     last_error: Exception | None = None
     for encoding in ("utf-8-sig", "gbk", "latin1"):
         try:
-            return pd.read_csv(path, encoding=encoding, **kwargs)
+            return pd.read_csv(path, encoding=encoding, keep_default_na=False, na_values=[''], **kwargs)
         except UnicodeDecodeError as exc:
             last_error = exc
     raise ValueError(f"CSV 文件无法解码：{path.name}") from last_error
@@ -263,6 +263,8 @@ def _read_preview(path: Path, max_scan_rows: int) -> tuple[pd.DataFrame, list[tu
         header=None,
         nrows=max_scan_rows,
         dtype=object,
+        keep_default_na=False,
+        na_values=[''],
     )
     merges: list[tuple[int, int, int, int]] = []
     if path.suffix.lower() == ".xlsx":

@@ -446,6 +446,8 @@ class DataLoader:
             df = pd.read_excel(
                 file_path,
                 dtype=object,
+                keep_default_na=False,
+                na_values=[''],
                 skiprows=effective_skiprows,
                 header=None if read_without_header else 0,
             )
@@ -457,6 +459,8 @@ class DataLoader:
                         file_path,
                         encoding=encoding,
                         dtype=object,
+                        keep_default_na=False,
+                        na_values=[''],
                         skiprows=effective_skiprows,
                         header=None if read_without_header else 0,
                     )
@@ -502,7 +506,8 @@ class DataLoader:
                 if normalized == "" or normalized.lower() in {"nan", "none"}:
                     return None
                 try:
-                    return Decimal(normalized).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    number = Decimal(normalized)
+                    return number.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if number.is_finite() else None
                 except (ValueError, TypeError, InvalidOperation):
                     return None
 

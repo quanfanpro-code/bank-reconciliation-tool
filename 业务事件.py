@@ -62,6 +62,20 @@ def rows_share_business(left: pd.Series, right: pd.Series) -> tuple[bool, str]:
     return False, ""
 
 
+def _refund_business(left: pd.Series, right: pd.Series) -> tuple[bool, str]:
+    """退款链不能用共同对方掩盖明确编号冲突，逐笔回单号不同不视为冲突。"""
+    left_party, right_party = business_identity(left)[1], business_identity(right)[1]
+    if left_party and right_party and left_party != right_party:
+        return False, ""
+    for names in (("批次号", "批次编号"), ("业务编号",), ("订单号",), ("申请单号",)):
+        left_id, right_id = _field(left, names), _field(right, names)
+        if left_id and right_id:
+            if left_id != right_id:
+                return False, ""
+            break
+    return rows_share_business(left, right)
+
+
 def _stable_id(prefix: str, source: str, indexes: tuple[int, ...]) -> str:
     raw = f"{prefix}|{source}|{','.join(map(str, indexes))}".encode("utf-8")
     return f"{prefix}-{hashlib.sha256(raw).hexdigest()[:12].upper()}"
@@ -87,10 +101,14 @@ def detect_same_side_events(
     # 三段链：原付款/收款、明确退回、再次付款/收款。
     for middle_pos in range(1, len(ordered) - 1):
         middle_idx = ordered[middle_pos]
+        if middle_idx in consumed:
+            continue
         middle = frame.loc[middle_idx]
         if not any(word in _text(middle) for word in RETURN_WORDS):
             continue
         for left_idx in reversed(ordered[:middle_pos]):
+            if left_idx in consumed:
+                continue
             left = frame.loc[left_idx]
             if abs(int(left["amount_decimal"])) != abs(int(middle["amount_decimal"])):
                 continue
@@ -98,17 +116,21 @@ def detect_same_side_events(
                 continue
             if (pd.Timestamp(middle["date"]) - pd.Timestamp(left["date"])).days > date_window_days:
                 continue
-            shared_left, basis_left = rows_share_business(left, middle)
+            shared_left, basis_left = _refund_business(left, middle)
             if not shared_left:
                 continue
             for right_idx in ordered[middle_pos + 1:]:
+                if right_idx in consumed:
+                    continue
                 right = frame.loc[right_idx]
                 if int(right["amount_decimal"]) != int(left["amount_decimal"]):
                     continue
                 if (pd.Timestamp(right["date"]) - pd.Timestamp(middle["date"])).days > date_window_days:
                     continue
-                shared_right, basis_right = rows_share_business(middle, right)
+                shared_right, basis_right = _refund_business(middle, right)
                 if not shared_right:
+                    continue
+                if not _refund_business(left, right)[0]:
                     continue
                 indexes = (left_idx, middle_idx, right_idx)
                 dates = [pd.Timestamp(frame.loc[index, "date"]) for index in indexes]
@@ -143,11 +165,11 @@ def detect_same_side_events(
             if left_idx in consumed:
                 continue
             left = frame.loc[left_idx]
-            if int(left["amount_decimal"]) != -int(right["amount_decimal"]):
+            if not int(left["amount_decimal"]) or int(left["amount_decimal"]) != -int(right["amount_decimal"]):
                 continue
             if (pd.Timestamp(right["date"]) - pd.Timestamp(left["date"])).days > date_window_days:
                 continue
-            shared, basis = rows_share_business(left, right)
+            shared, basis = _refund_business(left, right)
             if not shared:
                 continue
             indexes = (left_idx, right_idx)
@@ -205,6 +227,8 @@ def detect_same_side_events(
         if left_idx in consumed:
             continue
         left = frame.loc[left_idx]
+        if not int(left["amount_decimal"]):
+            continue
         opposite_indexes = indexes_by_amount.get(-int(left["amount_decimal"]), [])
         for right_idx in opposite_indexes:
             if order_position[right_idx] <= order_position[left_idx]:

@@ -19,6 +19,8 @@ beautify — 对已有 Excel 文件只改格式不改数据（保留公式和值
 import argparse
 import re
 import sys
+from contextlib import contextmanager
+from tempfile import TemporaryDirectory
 from datetime import datetime
 from pathlib import Path
 from shutil import copy2
@@ -154,6 +156,17 @@ THEMES = {
 }
 
 AVAILABLE_THEMES = ', '.join(sorted(THEMES.keys()))
+
+
+@contextmanager
+def atomic_output_path(output_path):
+    """先在同盘临时位置完成写入，Windows 改名时拒绝覆盖同名文件。"""
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="核对暂存_", dir=destination.parent) as directory:
+        temporary = Path(directory) / destination.name
+        yield temporary
+        temporary.rename(destination)
 
 
 def _validate_theme(theme_name: str):
@@ -294,7 +307,7 @@ def _apply_styles(ws, df: pd.DataFrame, theme: str = 'default', fmt_override: Op
             cell = ws.cell(row=r, column=1)
             cell.alignment = _a_align
             if _a_nf:
-                cell.number_format = _a_nf
+                cell.number_format = 'General' if _a_col_type == 'date' and cell.data_type == 'n' else _a_nf
             if _a_is_num:
                 cell.font = s['data_font_blue']
             else:
@@ -333,7 +346,8 @@ def _apply_styles(ws, df: pd.DataFrame, theme: str = 'default', fmt_override: Op
             cell.font = s['data_font_blue'] if is_num else Font(name='Arial', size=11)
             cell.alignment = align
             if nf:
-                cell.number_format = nf
+                # 日期列中的原始数字不应被误当作 Excel 日期序号。
+                cell.number_format = 'General' if ct == 'date' and cell.data_type == 'n' else nf
 
     # 5. 合计行检测与特殊格式（最后一行的首列含合计关键词）
     last_val = ws.cell(row=nrows, column=start_col).value
@@ -618,7 +632,7 @@ def _beautify_worksheet(ws, col_types_override: Optional[dict] = None, theme: st
             cell = ws.cell(row=r, column=1)
             cell.alignment = a_align
             if a_nf:
-                cell.number_format = a_nf
+                cell.number_format = 'General' if a_ct == 'date' and cell.data_type == 'n' else a_nf
             if a_is_num:
                 val = cell.value
                 is_formula = (isinstance(val, str) and val.startswith('=')) or cell.data_type == 'f'
@@ -668,7 +682,7 @@ def _beautify_worksheet(ws, col_types_override: Optional[dict] = None, theme: st
             cell = ws.cell(row=r, column=c)
             cell.alignment = align
             if nf:
-                cell.number_format = nf
+                cell.number_format = 'General' if ct == 'date' and cell.data_type == 'n' else nf
             # 所有单元格统一 Arial 11
             if is_num:
                 val = cell.value

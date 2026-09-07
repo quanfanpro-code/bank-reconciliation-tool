@@ -1155,7 +1155,7 @@ class Matcher:
                     scoped_main_indexes.update(main_by_party.get(fee_party, ()))
                 for main_idx in sorted(scoped_main_indexes):
                     main_row = left.loc[main_idx]
-                    if fee_amount * int(main_row["amount_decimal"]) >= 0:
+                    if fee_amount >= 0 or not int(main_row["amount_decimal"]):
                         continue
                     if abs((pd.Timestamp(main_row["date"]) - pd.Timestamp(fee_row["date"])).days) > self.config.tolerance_days:
                         continue
@@ -1163,6 +1163,8 @@ class Matcher:
                     if not shared_fee:
                         continue
                     target = int(main_row["amount_decimal"]) + fee_amount
+                    if target * int(main_row["amount_decimal"]) <= 0:
+                        continue
                     for other_idx in right_by_amount.get(target, ()):
                         other_row = right.loc[other_idx]
                         if abs((pd.Timestamp(other_row["date"]) - pd.Timestamp(main_row["date"])).days) > self.config.tolerance_days:
