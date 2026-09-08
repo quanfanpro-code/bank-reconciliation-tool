@@ -2382,6 +2382,8 @@ class Reporter:
             effective_config,
             date_format=date_format,
         )
+        from 报告偏好 import apply_column_preferences
+        apply_column_preferences(tables)
         total_rows = sum(len(table) for table in tables.values())
         self._log(
             f"报告表格构造完成：{len(tables):,} 个工作表，"

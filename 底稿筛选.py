@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
 
@@ -12,6 +14,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from make_excel import make_excel, atomic_output_path
+from 报告列识别 import identify_columns
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,77 @@ class FilterCriteria:
     business_types: tuple[str, ...] = ()
     statuses: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
+    amount_basis: str = '不限'
+    min_amount: Decimal | float | None = None
+    max_amount: Decimal | float | None = None
+    amount_absolute: bool = True
+
+
+def validate_filter_criteria(criteria: FilterCriteria) -> None:
+    """空结果也检查条件，避免把输错条件解释成没有需核对事项。"""
+    if criteria.amount_basis not in ('不限', '银行单笔', '序时账单笔', '整组金额'):
+        raise ValueError('请选择银行单笔、序时账单笔或整组金额')
+    values = []
+    for value in (criteria.min_amount, criteria.max_amount):
+        try:
+            number = None if value is None else Decimal(str(value))
+        except InvalidOperation as exc:
+            raise ValueError('金额必须是有效数字') from exc
+        if number is not None and not number.is_finite():
+            raise ValueError('金额必须是有限数字')
+        if number is not None and (criteria.amount_absolute or criteria.amount_basis == '整组金额') and number < 0:
+            raise ValueError('绝对金额及整组金额的上下限不能为负数')
+        values.append(number)
+    if all(value is not None for value in values) and values[0] > values[1]:
+        raise ValueError('金额下限不能超过上限')
+    if criteria.amount_basis == '不限' and any(value is not None for value in values):
+        raise ValueError('填写金额上下限后，请选择金额口径')
+    if criteria.coverage_ratio is not None:
+        try:
+            ratio = Decimal(str(criteria.coverage_ratio))
+        except InvalidOperation as exc:
+            raise ValueError('覆盖比例必须是0到100之间的数字') from exc
+        if not ratio.is_finite() or not 0 <= ratio <= 1:
+            raise ValueError('覆盖比例必须在0到100之间')
+    try:
+        start = date.fromisoformat(criteria.start_date) if criteria.start_date else None
+        end = date.fromisoformat(criteria.end_date) if criteria.end_date else None
+    except ValueError as exc:
+        raise ValueError('日期必须是有效的年-月-日，例如2026-01-31') from exc
+    if start and end and start > end:
+        raise ValueError('开始日期不能晚于结束日期')
+
+
+def _amount_mask(frame, criteria, components):
+    """以原始组成命中事项，不使用其他候选或重复展示行凑金额。"""
+    if criteria.amount_basis == '不限' or (criteria.min_amount is None and criteria.max_amount is None):
+        return pd.Series(True, index=frame.index)
+    grouped = criteria.amount_basis == '整组金额'
+    data = frame if grouped else components
+    key = '事项编号' if '事项编号' in frame else '匹配ID'
+    column = '组金额' if grouped else '金额'
+    if data is None or column not in data or (not grouped and not {key, '来源'} <= set(data)):
+        raise ValueError('报告缺少金额明细或组成，无法按此口径筛选；请重新生成完整报告')
+    if not grouped:
+        sources = ('银行流水',) if criteria.amount_basis == '银行单笔' else ('序时账', '日记账')
+        data = data.loc[data['来源'].isin(sources)]
+    def matches(row):
+        try:
+            amount = Decimal(str(row[column]))
+        except InvalidOperation as exc:
+            raise ValueError('报告组成中存在无法识别的金额，已停止筛选') from exc
+        if not amount.is_finite():
+            raise ValueError('报告组成金额缺失，已停止筛选')
+        # 旧版匹配组成将金额存为绝对值，结合收支方向恢复带符号口径。
+        if not grouped and row.get('收支方向') == '支出':
+            amount = -abs(amount)
+        if grouped or criteria.amount_absolute:
+            amount = abs(amount)
+        return (criteria.min_amount is None or amount >= Decimal(str(criteria.min_amount))) and (criteria.max_amount is None or amount <= Decimal(str(criteria.max_amount)))
+    hit = pd.Series([matches(row) for row in data.to_dict('records')], index=data.index, dtype=bool)
+    if grouped:
+        return hit
+    return frame[key].astype(str).isin(set(data.loc[hit, key].astype(str)))
 
 
 def _combined_text(frame: pd.DataFrame) -> pd.Series:
@@ -35,10 +109,11 @@ def _combined_text(frame: pd.DataFrame) -> pd.Series:
     return frame[columns].fillna("").astype(str).agg("|".join, axis=1)
 
 
-def _filter_groups(frame: pd.DataFrame, criteria: FilterCriteria) -> pd.DataFrame:
+def _filter_groups(frame: pd.DataFrame, criteria: FilterCriteria, components: pd.DataFrame | None = None) -> pd.DataFrame:
+    validate_filter_criteria(criteria)
     if frame.empty:
         return frame.copy()
-    mask = pd.Series(True, index=frame.index)
+    mask = _amount_mask(frame, criteria, components)
     if criteria.business_types and "类型" in frame:
         mask &= frame["类型"].astype(str).isin(criteria.business_types)
     status_column = "最终状态" if "最终状态" in frame else "系统结论" if "系统结论" in frame else None
@@ -72,9 +147,9 @@ def _filter_groups(frame: pd.DataFrame, criteria: FilterCriteria) -> pd.DataFram
     return selected.reset_index(drop=True)
 
 
-def _worksheet_frame(sheet) -> pd.DataFrame:
+def _worksheet_frame(sheet, required=()) -> pd.DataFrame:
     """读取原单元格值，保留稳定事项编号，不使用可能已失效的公式缓存。"""
-    columns = {cell.column - 1: cell.value for cell in sheet[1] if cell.value is not None}
+    columns = {position - 1: name for name, position in identify_columns(sheet, required).items()}
     return pd.DataFrame(
         [{name: row[position] for position, name in columns.items()}
          for row in sheet.iter_rows(min_row=2, values_only=True)],
@@ -83,8 +158,8 @@ def _worksheet_frame(sheet) -> pd.DataFrame:
 
 
 def _review_groups(book) -> pd.DataFrame:
-    groups = _worksheet_frame(book['复核事项索引'])
-    details = _worksheet_frame(book['核对明细'])
+    groups = _worksheet_frame(book['复核事项索引'], ('事项编号', '程序结论', '组金额'))
+    details = _worksheet_frame(book['核对明细'], ('事项编号', '来源', '金额'))
     texts = {}
     if not details.empty:
         texts = details.assign(_检索=_combined_text(details)).groupby('事项编号')['_检索'].agg('|'.join).to_dict()
@@ -92,7 +167,7 @@ def _review_groups(book) -> pd.DataFrame:
     for name in ('人工全查', '人工抽样'):
         if name not in book:
             continue
-        for row in _worksheet_frame(book[name]).to_dict('records'):
+        for row in _worksheet_frame(book[name], ('事项编号', '行别', '人工核对结果')).to_dict('records'):
             item_id = row.get('事项编号')
             if pd.isna(item_id) or row.get('行别') != '核对事项':
                 continue
@@ -123,13 +198,18 @@ def _describe_criteria(criteria: FilterCriteria) -> str:
             parts.append(label + '：' + '、'.join(str(value) for value in values))
     if criteria.coverage_ratio is not None:
         parts.append(f'条件内目标金额覆盖比例：{criteria.coverage_ratio:.2%}')
+    if criteria.amount_basis != '不限':
+        mode = '双方收支绝对金额合计较大值' if criteria.amount_basis == '整组金额' else '绝对金额' if criteria.amount_absolute else '带符号金额（收入正、支出负）'
+        low = '不限' if criteria.min_amount is None else str(criteria.min_amount)
+        high = '不限' if criteria.max_amount is None else str(criteria.max_amount)
+        parts.append(f'{criteria.amount_basis}，{mode}，下限{low}元、上限{high}元（均含边界）；命中后保留完整事项')
     return '；'.join(parts) or '全部事项'
 
 
 def _export_review_view(book, source, output, criteria, progress, log) -> Path:
     """另存原簿并隐藏非选中整组；不删除原行、不移动公式及人工填写单元格。"""
     groups = _review_groups(book)
-    selected = _filter_groups(groups, criteria)
+    selected = _filter_groups(groups, criteria, _worksheet_frame(book['核对明细']))
     selected_ids = set(selected['事项编号'])
     progress(0.4)
     log(f'事项筛选完成：{len(selected)}/{len(groups)} 项')
@@ -137,7 +217,7 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
     full_sheets = {'核对结论', '月度核对', '每日统计'}
     for sheet in book:
         if sheet.title in item_sheets:
-            header = {cell.value: cell.column for cell in sheet[1] if cell.value}
+            header = identify_columns(sheet, ('事项编号',))
             if '事项编号' not in header:
                 sheet.sheet_state = 'hidden'
                 continue
@@ -207,6 +287,7 @@ def export_filtered_workpaper(
     progress_callback: Callable[[float], None] | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> Path:
+    validate_filter_criteria(criteria)
     progress = progress_callback or (lambda _value: None)
     log = log_callback or (lambda _message: None)
     source = Path(source_path).resolve()
@@ -224,7 +305,8 @@ def export_filtered_workpaper(
             progress(0.2)
             log(f'全量报告读取完成：{len(book.sheetnames)} 个工作表')
             return _export_review_view(book, source, output, criteria, progress, log)
-    sheets = pd.read_excel(source, sheet_name=None)
+    with closing(load_workbook(source, data_only=True)) as book:
+        sheets = {sheet.title: _worksheet_frame(sheet) for sheet in book}
     progress(0.2)
     log(f"全量报告读取完成：{len(sheets)} 个工作表")
     group_names = [name for name in ("逐笔匹配", "整组勾稽") if name in sheets]
@@ -247,7 +329,7 @@ def export_filtered_workpaper(
             frame["_组成检索文字"] = frame["匹配ID"].astype(str).map(component_text).fillna("")
         group_frames.append(frame)
     combined_groups = pd.concat(group_frames, ignore_index=True) if group_frames else pd.DataFrame()
-    selected_combined = _filter_groups(combined_groups, criteria)
+    selected_combined = _filter_groups(combined_groups, criteria, components)
     progress(0.4)
     log(f"关系筛选完成：{len(selected_combined)}/{len(combined_groups)} 组")
     filtered_groups = {}
@@ -272,7 +354,7 @@ def export_filtered_workpaper(
             ("全量关系金额", float(total_amount)),
             ("筛选关系金额", float(selected_amount)),
             ("覆盖比例", float(selected_amount / total_amount) if total_amount else 0.0),
-            ("筛选条件", str(criteria)),
+            ("筛选条件", _describe_criteria(criteria)),
             ("说明", "筛选版只用于审计选项；全量核对报告保持不变。任一关系被选中时，其银行流水和序时账组成全部带出。"),
         ],
         columns=["项目", "数值"],
@@ -292,3 +374,28 @@ def export_filtered_workpaper(
     progress(1.0)
     log(f"筛选导出完成：{output}")
     return output
+
+
+def preview_filter(source_path, criteria):
+    """只读预览；与正式导出使用相同条件和事项选择方法。"""
+    validate_filter_criteria(criteria)
+    with closing(load_workbook(source_path, data_only=False)) as book:
+        if '复核事项索引' in book and '核对明细' in book:
+            groups = _review_groups(book)
+            components = _worksheet_frame(book['核对明细'])
+        else:
+            frames = [_worksheet_frame(book[name]) for name in ('逐笔匹配', '整组勾稽') if name in book]
+            if not frames:
+                raise ValueError('这不是可识别的全量核对报告')
+            groups = pd.concat(frames, ignore_index=True)
+            components = _worksheet_frame(book['匹配组成']) if '匹配组成' in book else None
+            if components is not None and '匹配ID' in components:
+                texts = components.assign(_文字=_combined_text(components)).groupby('匹配ID')['_文字'].agg('|'.join)
+                groups['_组成检索文字'] = groups['匹配ID'].map(texts).fillna('')
+        chosen = _filter_groups(groups, criteria, components)
+        options = {}
+        for key, column in [('business_types','类型'),('statuses','最终状态' if '最终状态' in groups else '系统结论')]:
+            if column in groups:
+                options[key] = sorted(set(groups[column].dropna().astype(str)) - {''})
+        amount = pd.to_numeric(chosen.get('组金额', pd.Series(dtype=float)), errors='coerce').abs().fillna(0).sum()
+        return {'total':len(groups), 'selected':len(chosen), 'amount':float(amount), 'description':_describe_criteria(criteria), 'options':options}

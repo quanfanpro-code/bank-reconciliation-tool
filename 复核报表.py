@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from 报告列识别 import identify_columns
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from 复核事项 import build_review_items
@@ -146,7 +147,7 @@ def apply_review_presentation(book):
     if '复核事项索引' not in book.sheetnames:
         return
     sheets = {name: book[name] for name in ('复核事项索引','复核候选选项','复核候选组成','核对明细','月度核对','人工全查','人工抽样')}
-    headers = {name:{cell.value:cell.column for cell in sheet[1] if cell.value is not None} for name,sheet in sheets.items()}
+    headers = {name:identify_columns(sheet) for name,sheet in sheets.items()}
     def cell(name, label, row):
         return f'{get_column_letter(headers[name][label])}{row}'
     def rng(name,label):
@@ -261,7 +262,7 @@ def apply_review_presentation(book):
                 put('月度核对','余额衔接差',row,f'=IF(AND(ISNUMBER({b}),ISNUMBER({j}),ISNUMBER({previous})),{current}-{previous}-{inc}+{exp},"")')
     if '月度差异组成' in book:
         sheet=book['月度差异组成']
-        hs={c.value:c.column for c in sheet[1] if c.value}
+        hs=identify_columns(sheet)
         for row in range(2,sheet.max_row+1):
             key=f'{get_column_letter(hs["事项编号"])}{row}'
             month=f'{get_column_letter(hs["月份"])}{row}'
@@ -279,7 +280,7 @@ def apply_review_presentation(book):
 
 def _summary_formulas(book,sheets,headers,rng):
     sheet=book['核对结论']
-    hs={c.value:c.column for c in sheet[1] if c.value}
+    hs=identify_columns(sheet)
     if not {'项目','数值'} <= hs.keys():
         return
     rows={sheet.cell(r,hs['项目']).value:r for r in range(2,sheet.max_row+1)}
@@ -344,7 +345,7 @@ def _format_sheets(book):
         sheet.sheet_state='visible' if sheet.title in 主表 or (sheet.title not in duplicates|technical and has_rows) else 'hidden'
         if sheet.title not in 主表 and sheet.title not in ('月度差异组成','其他对应供选择'):
             continue
-        hs={c.value:c.column for c in sheet[1] if c.value is not None}
+        hs=identify_columns(sheet)
         if not hs:
             continue
         first=min(hs.values())

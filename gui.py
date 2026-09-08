@@ -12,7 +12,7 @@ import threading
 import queue
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -26,7 +26,8 @@ from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
 from matching_policy import COUNTERPARTY_FIELD_KEYWORDS
-from 底稿筛选 import FilterCriteria, export_filtered_workpaper
+from 底稿筛选 import export_filtered_workpaper
+from 筛选窗口 import FilterDialog
 from 输入模板 import generate_input_templates
 from 项目记录 import LocalProjectStore
 
@@ -2114,40 +2115,15 @@ class ReconciliationApp(ctk.CTk):
             messagebox.showerror("无法打开", str(exc), parent=self)
 
     def export_filtered_report(self):
-        source = filedialog.askopenfilename(title="选择全量核对报告", filetypes=[("Excel", "*.xlsx")])
-        if not source:
+        dialog = FilterDialog(self)
+        self.wait_window(dialog)
+        if dialog.result is None:
             return
-        business_type = simpledialog.askstring("筛选业务类型", "输入业务类型；留空表示全部，例如：手续费净额", parent=self) or ""
-        status = simpledialog.askstring("筛选结论状态", "输入结论状态；多个条件用分号分隔，留空表示全部", parent=self) or ""
-        reason = simpledialog.askstring("筛选差异原因", "输入判断依据中应包含的文字；多个条件用分号分隔，留空表示全部", parent=self) or ""
-        start_date = simpledialog.askstring("开始日期", "输入开始日期，例如2026-01-01；留空不限", parent=self) or ""
-        end_date = simpledialog.askstring("结束日期", "输入结束日期，例如2026-12-31；留空不限", parent=self) or ""
-        include_text = simpledialog.askstring("包含文字", "摘要、对方或依据中应包含的文字；多个条件用分号分隔，留空不限", parent=self) or ""
-        exclude_text = simpledialog.askstring("排除文字", "摘要、对方或依据中要排除的文字；多个条件用分号分隔，留空不限", parent=self) or ""
-        coverage_text = simpledialog.askstring("累计覆盖比例", "输入0到100；留空表示不按覆盖比例筛选", parent=self) or ""
-        coverage = None
-        if coverage_text.strip():
-            try:
-                coverage = float(coverage_text) / 100
-            except ValueError:
-                messagebox.showerror("筛选条件", "累计覆盖比例必须是0到100之间的数字。", parent=self)
-                return
-            if not 0 <= coverage <= 1:
-                messagebox.showerror("筛选条件", "累计覆盖比例必须是0到100之间的数字。", parent=self)
-                return
+        criteria = dialog.result
+        source = dialog.source_path
         output = filedialog.asksaveasfilename(title="另存筛选底稿", defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
         if not output:
             return
-        criteria = FilterCriteria(
-            coverage_ratio=coverage,
-            business_types=(business_type.strip(),) if business_type.strip() else (),
-            statuses=tuple(value.strip() for value in status.split("；") if value.strip()),
-            reasons=tuple(value.strip() for value in reason.split("；") if value.strip()),
-            start_date=start_date.strip() or None,
-            end_date=end_date.strip() or None,
-            include_text=tuple(value.strip() for value in include_text.split("；") if value.strip()),
-            exclude_text=tuple(value.strip() for value in exclude_text.split("；") if value.strip()),
-        )
         self.btn_filter.configure(state="disabled", text="筛选中…")
         self._set_progress(0.0)
         self.log("开始筛选导出，窗口可以继续响应；较长步骤每15秒报告一次运行状态。")
