@@ -376,9 +376,8 @@ def export_filtered_workpaper(
     return output
 
 
-def preview_filter(source_path, criteria):
-    """只读预览；与正式导出使用相同条件和事项选择方法。"""
-    validate_filter_criteria(criteria)
+def read_filter_report(source_path):
+    """只读取得事项与组成，供窗口自动加载和后续条件预览复用。"""
     with closing(load_workbook(source_path, data_only=False)) as book:
         if '复核事项索引' in book and '核对明细' in book:
             groups = _review_groups(book)
@@ -392,10 +391,22 @@ def preview_filter(source_path, criteria):
             if components is not None and '匹配ID' in components:
                 texts = components.assign(_文字=_combined_text(components)).groupby('匹配ID')['_文字'].agg('|'.join)
                 groups['_组成检索文字'] = groups['匹配ID'].map(texts).fillna('')
-        chosen = _filter_groups(groups, criteria, components)
-        options = {}
-        for key, column in [('business_types','类型'),('statuses','最终状态' if '最终状态' in groups else '系统结论')]:
-            if column in groups:
-                options[key] = sorted(set(groups[column].dropna().astype(str)) - {''})
-        amount = pd.to_numeric(chosen.get('组金额', pd.Series(dtype=float)), errors='coerce').abs().fillna(0).sum()
-        return {'total':len(groups), 'selected':len(chosen), 'amount':float(amount), 'description':_describe_criteria(criteria), 'options':options}
+    return groups, components
+
+
+def summarize_filter(groups, components, criteria):
+    """对已读取的数据预览，筛选规则与正式导出一致。"""
+    validate_filter_criteria(criteria)
+    chosen = _filter_groups(groups, criteria, components)
+    options = {}
+    for key, column in [('business_types','类型'),('statuses','最终状态' if '最终状态' in groups else '系统结论')]:
+        if column in groups:
+            options[key] = sorted(set(groups[column].dropna().astype(str)) - {''})
+    amount = pd.to_numeric(chosen.get('组金额', pd.Series(dtype=float)), errors='coerce').abs().fillna(0).sum()
+    return {'total':len(groups), 'selected':len(chosen), 'amount':float(amount), 'description':_describe_criteria(criteria), 'options':options}
+
+
+def preview_filter(source_path, criteria):
+    """保留原只读预览入口；窗口可复用同一份读取结果。"""
+    validate_filter_criteria(criteria)
+    return summarize_filter(*read_filter_report(source_path), criteria)

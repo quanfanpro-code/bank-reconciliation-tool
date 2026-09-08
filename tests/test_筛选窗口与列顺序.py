@@ -86,7 +86,8 @@ def test_集中窗口收集条件及取消不返回结果(tmp_path):
         dialog=FilterDialog(root, preferences_path=tmp_path/'偏好.json')
         dialog.variables['amount_basis'].set('银行单笔')
         dialog.variables['min_amount'].set('10000')
-        dialog.variables['include_text'].set('工资;奖金；报销')
+        for word in ('工资','奖金','报销'):
+            dialog.rule_kind.set('包含文字'); dialog.rule_value.set(word); dialog.add_rule()
         value=dialog.build_criteria()
         assert value.min_amount==Decimal('10000')
         assert value.include_text==('工资','奖金','报销')
