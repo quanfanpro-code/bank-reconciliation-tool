@@ -1,4 +1,4 @@
-"""银行流水和银行日记账的自包含输入预检查。"""
+﻿"""银行流水和银行日记账的自包含输入预检查。"""
 
 from __future__ import annotations
 
@@ -301,8 +301,19 @@ def _expand_merges(
     return expanded
 
 
+# 方向列数据值（借/贷）是数据不是表头证据；计入关键词命中会让
+# 圈入数据行的深层表头候选加分，把单层表头误判为多级表头。
+_DIRECTION_CELL_VALUES = frozenset({"借", "贷"})
+
+
 def _keyword_hits(values: Iterable[Any]) -> int:
-    text = " ".join(_cell_text(value).lower() for value in values)
+    cells = []
+    for value in values:
+        cell = _cell_text(value)
+        if cell.strip() in _DIRECTION_CELL_VALUES:
+            continue
+        cells.append(cell.lower())
+    text = " ".join(cells)
     return sum(
         1
         for group in HEADER_KEYWORD_GROUPS

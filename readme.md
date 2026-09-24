@@ -380,8 +380,14 @@ python main.py
 application.py       无界面的完整核对流程
 data_loader.py       文件读取、金额方向和数据清洗
 input_precheck.py    自包含表格结构识别与十三项输入检查
+balance.py           期初期末余额控制与余额连续性检查
+data_structures.py   候选、评分、风险等级等数据结构
+precision_engine.py  金额整数化精度处理
+utils.py             日期、金额解析与文本清理工具
+validate.py          参数校验
 matching_policy.py   评分、重要性分流和月度差异池
 matcher.py           候选生成、组合匹配和统一选择
+业务分组.py          从已有文字提取业务范围和完整组
 业务事件.py          退款冲销重付、手续费净额和重复线索识别
 llm_assistant.py     在线 API 与 LM Studio 可选辅助
 reporter.py          原有核对统计、证据专题与新报表集成
@@ -389,6 +395,9 @@ reporter.py          原有核对统计、证据专题与新报表集成
 复核事项.py          完整原记录归属、月度累计和全查抽样分流
 复核报表.py          Excel人工选择、有效对应、覆盖率和月度解释
 报告展示.py          八张阅读表、逐笔并排、整组折叠及人工填写入口
+报告偏好.py          新报告列显示顺序保存
+报告列识别.py        按列名识别报告字段
+筛选窗口.py          集中筛选条件与列顺序设置窗口
 make_excel.py        Excel 样式输出
 gui.py               Windows 桌面界面
 项目记录.py          列映射模板、输入报告指纹和项目历史
@@ -413,6 +422,12 @@ python -c "import ast,pathlib; [ast.parse(p.read_text(encoding='utf-8-sig')) for
 完整业务验收位于 `tests/test_business_end_to_end.py`、`tests/test_input_precheck.py`、`tests/test_automation_first.py` 和 `tests/test_report_upgrade.py`，覆盖无法计算与业务疑点分离、复杂表头、自动确认、整组勾稽、重要性分流、月度差异池、余额边界、人类友好输出、公式防护和大模型失败降级。
 
 ## 十五、更新日志
+
+### 2026-09-24：全面独立复核与表头识别修复
+
+- 修复方向列数据值污染表头层级评分：单层表头且方向列同时含"借""贷"的简单表格，曾被误判为三行复合表头并以"未找到日期列"阻止核对；现识别表头关键词时排除精确等于"借""贷"的数据单元格，真实多级表头识别不受影响。
+- 复核覆盖全量测试、表头识别与输入检查、候选选择、重要性分流、人工结果公式、筛选导出、原子交付、公式注入防护、大模型脱敏和非工作日日历；日历 2021—2026 年数据与国务院办公厅通知逐项核对一致。
+- 新增 5 项独立边界用例，全量 700 项通过，5 条既有日期解析提醒。仅更新源码与文档，桌面 EXE 未重新打包。详见[本轮全面独立复核报告](docs/reviews/2026-09-24-全面独立复核-review.md)。
 
 ### 2026-09-08（续）：筛选交互易用性
 
