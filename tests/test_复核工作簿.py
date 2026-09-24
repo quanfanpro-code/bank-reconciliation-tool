@@ -26,7 +26,7 @@ def test_新阅读表直接可见且原明细每日辅助表隐藏保留(tmp_pat
     输出, _ = _报告(tmp_path)
     with closing(load_workbook(输出)) as 簿:
         可见 = {表.title for 表 in 簿 if 表.sheet_state == 'visible'}
-        assert {'核对结论', '月度核对', '逐笔核对', '整组核对', '人工全查', '人工抽样', '未对应记录'} == 可见
+        assert {'核对结论', '非工作日交易', '月度核对', '逐笔核对', '整组核对', '人工全查', '人工抽样', '未对应记录'} == 可见
         assert 簿['核对明细'].sheet_state == 簿['每日统计'].sheet_state == 'hidden'
         assert 簿.active.title == '核对结论'
 

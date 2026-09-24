@@ -34,6 +34,7 @@ from balance import (
 from make_excel import make_excel, atomic_output_path
 from 复核报表 import build_review_tables, apply_review_presentation
 from llm_assistant import redact_sensitive_text, sanitize_url
+from 非工作日日历 import 判定日期
 
 
 def _restore_numeric_cells(value: Any) -> Any:
@@ -835,6 +836,43 @@ class Reporter:
                 if value is not None and str(value).strip()
             )
         return ""
+
+    def _build_nonworkday_bank_table(self) -> tuple[pd.DataFrame, int]:
+        """只从银行有效收付生成示警，保留超出日历范围的笔数。"""
+        columns = [
+            "原文件行号", "交易日期", "原日期列名", "原日期值", "休息日类型",
+            "节日名称", "收支方向", "金额", "摘要", "对方及辅助文字",
+        ]
+        rows = []
+        uncovered = 0
+        for index, row in self.matcher.bank.iterrows():
+            amount = row.get("amount")
+            day = row.get("date")
+            if pd.isna(amount) or pd.isna(day) or Decimal(str(amount)) == 0:
+                continue
+            status, holiday = 判定日期(pd.Timestamp(day).date())
+            if status == "未覆盖":
+                uncovered += 1
+                continue
+            if status == "工作日":
+                continue
+            evidence = row.get("date_evidence", {})
+            if not isinstance(evidence, dict):
+                evidence = {}
+            signed_amount = Decimal(str(amount))
+            rows.append({
+                "原文件行号": int(row.get("original_file_row", row.get("original_idx", index))),
+                "交易日期": pd.Timestamp(day),
+                "原日期列名": evidence.get("date_column", ""),
+                "原日期值": evidence.get("original_value", ""),
+                "休息日类型": status,
+                "节日名称": holiday,
+                "收支方向": "收入" if signed_amount > 0 else "支出",
+                "金额": float(abs(signed_amount)),
+                "摘要": row.get("summary", ""),
+                "对方及辅助文字": self._auxiliary_text(row),
+            })
+        return pd.DataFrame(rows, columns=columns), uncovered
 
     @staticmethod
     def _source_evidence_columns(row: pd.Series) -> Dict[str, Any]:
@@ -2278,16 +2316,30 @@ class Reporter:
         daily, monthly = self._build_daily_and_monthly_tables()
         groups = self._build_match_group_table()
         events = self._build_business_event_table()
+        nonworkday, uncovered = self._build_nonworkday_bank_table()
+        income = nonworkday.loc[nonworkday["收支方向"] == "收入", "金额"]
+        expense = nonworkday.loc[nonworkday["收支方向"] == "支出", "金额"]
+        summary = self._build_business_summary_table(
+            config, balance_check_possible=balance_possible,
+        )
+        summary = pd.concat([summary, pd.DataFrame([
+            ("非工作日银行收付笔数", len(nonworkday)),
+            ("非工作日银行收款笔数", len(income)),
+            ("非工作日银行收款金额", float(income.sum())),
+            ("非工作日银行付款笔数", len(expense)),
+            ("非工作日银行付款金额", float(expense.sum())),
+            ("银行交易日历未覆盖笔数", uncovered),
+            ("非工作日日历口径", "2021—2026年全国统一放假日、普通周末和调休上班日；按银行所选日期识别"),
+            ("非工作日日历来源", "国务院办公厅2021—2026年部分节假日安排通知；详见README"),
+        ], columns=["项目", "数值"])], ignore_index=True)
         row_mask = (
             (groups["银行笔数"] == 1) & (groups["日记账笔数"] == 1)
             if not groups.empty
             else pd.Series(dtype=bool)
         )
         tables = {
-            "核对结论": self._build_business_summary_table(
-                config,
-                balance_check_possible=balance_possible,
-            ),
+            "核对结论": summary,
+            "非工作日交易": nonworkday,
             "疑点事项": self._build_issue_table(),
             "自动归集事项": self._build_trivial_table(),
             "银行侧待查": self._decorate_unmatched(

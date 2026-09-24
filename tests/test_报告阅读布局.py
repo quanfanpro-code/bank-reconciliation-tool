@@ -9,7 +9,7 @@ from 底稿筛选 import FilterCriteria, export_filtered_workpaper
 from tests.test_人工结果计算 import _报告
 
 
-可见表 = {'核对结论','月度核对','逐笔核对','整组核对','人工全查','人工抽样','未对应记录'}
+可见表 = {'核对结论','非工作日交易','月度核对','逐笔核对','整组核对','人工全查','人工抽样','未对应记录'}
 原始金额列 = ('银行收入','银行支出','序时账收入','序时账支出')
 
 
@@ -31,7 +31,7 @@ def _隐藏身份(sheet):
             assert sheet.column_dimensions[get_column_letter(headers[key])].hidden
 
 
-def test_七个固定阅读入口及一对一并排单边完整(tmp_path):
+def test_八个固定阅读入口及一对一并排单边完整(tmp_path):
     path=_报告(tmp_path,[100,300],[100,300,700],[((0,),(0,)),((1,),(1,))])
     with closing(load_workbook(path)) as book:
         assert {sheet.title for sheet in book if sheet.sheet_state=='visible'}==可见表

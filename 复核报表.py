@@ -321,6 +321,7 @@ def _summary_formulas(book,sheets,headers,rng):
         set_value(label+'当前已对平金额覆盖率',f'={numerator}/{total}' if total else 0)
         sheet.cell(rows[label+'当前已对平金额覆盖率'],hs['数值']).number_format='0.00%'
     visible = ['使用顺序','核对范围','范围说明','银行有效交易笔数','日记账有效交易笔数','实际执行重要性水平','明显微小错报临界值','人工全查事项数','人工全查未核对数','人工抽样事项数','人工抽样未核对数','待处理事项数','已处理事项数','人工选择冲突数','当前未对应原始记录数','银行当前已对平金额覆盖率','序时账当前已对平金额覆盖率','余额核对','期初余额差额','期初余额状态','人工结果说明','金额差额口径','当前覆盖率口径','月度说明','专题说明']
+    visible[4:4] = ['非工作日银行收付笔数','非工作日银行收款笔数','非工作日银行收款金额','非工作日银行付款笔数','非工作日银行付款金额','银行交易日历未覆盖笔数','非工作日日历口径','非工作日日历来源']
     for label,row in rows.items():
         sheet.row_dimensions[row].hidden = label not in visible
     set_value('已处理事项数',f'=COUNTIF({rng(ix,"人工核对结果")},"?*")-COUNTIF({rng(ix,"当前核对结论")},"选择无效")-COUNTIF({rng(ix,"当前核对结论")},"所选对应重复使用原记录")')
