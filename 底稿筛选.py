@@ -164,16 +164,18 @@ def _review_groups(book) -> pd.DataFrame:
     if not details.empty:
         texts = details.assign(_检索=_combined_text(details)).groupby('事项编号')['_检索'].agg('|'.join).to_dict()
     choices, remarks = {}, {}
-    for name in ('人工全查', '人工抽样'):
+    input_names = ('待处理事项',) if '待处理事项' in book else ('人工全查', '人工抽样')
+    for name in input_names:
         if name not in book:
             continue
-        for row in _worksheet_frame(book[name], ('事项编号', '行别', '人工核对结果')).to_dict('records'):
+        required = ('事项编号', '人工核对结果') if name == '待处理事项' else ('事项编号', '行别', '人工核对结果')
+        for row in _worksheet_frame(book[name], required).to_dict('records'):
             item_id = row.get('事项编号')
-            if pd.isna(item_id) or row.get('行别') != '核对事项':
+            if pd.isna(item_id) or (name != '待处理事项' and row.get('行别') != '核对事项'):
                 continue
             choice = row.get('人工核对结果')
-            choices[str(item_id)] = '' if pd.isna(choice) else str(choice).strip()
-            remarks[str(item_id)] = '|'.join(str(row[column]) for column in ('核对原因', '银行记录', '序时账记录', '备注') if column in row and pd.notna(row[column]))
+            choices[str(item_id)] = '' if pd.isna(choice) or choice == '本次无需填写' else str(choice).strip()
+            remarks[str(item_id)] = '|'.join(str(row[column]) for column in ('核对原因', '哪里需要查看', '银行记录', '序时账记录', '备注') if column in row and pd.notna(row[column]))
     groups['事项编号'] = groups['事项编号'].astype(str)
     groups['_组成检索文字'] = groups['事项编号'].map(texts).fillna('')
     groups['_人工检索文字'] = groups['事项编号'].map(remarks).fillna('')
@@ -213,8 +215,8 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
     selected_ids = set(selected['事项编号'])
     progress(0.4)
     log(f'事项筛选完成：{len(selected)}/{len(groups)} 项')
-    item_sheets = {'核对明细', '人工全查', '人工抽样', '月度差异组成', '其他对应供选择', '逐笔核对', '整组核对', '未对应记录'}
-    full_sheets = {'核对结论', '月度核对', '每日统计'}
+    item_sheets = {'核对明细', '人工全查', '人工抽样', '月度差异组成', '其他对应供选择', '逐笔核对', '整组核对', '未对应记录', '待处理事项', '对应明细'}
+    full_sheets = {'核对结论', '核对总览', '月度核对', '每日统计'}
     for sheet in book:
         if sheet.title in item_sheets:
             header = identify_columns(sheet, ('事项编号',))
@@ -234,7 +236,11 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
             sheet.sheet_state = 'visible' if sheet.title in ('核对明细', '人工全查', '人工抽样') or any(not sheet.row_dimensions[row].hidden for row in range(2, sheet.max_row + 1)) else 'hidden'
         else:
             sheet.sheet_state = 'visible' if sheet.title in full_sheets else 'hidden'
-    if '逐笔核对' in book:
+    compact = '核对总览' in book
+    if compact:
+        for sheet in book:
+            sheet.sheet_state = 'visible'
+    elif '逐笔核对' in book:
         from 报告展示 import 阅读表
         for sheet in book:
             sheet.sheet_state = 'visible' if sheet.title in 阅读表 else 'hidden'
@@ -247,7 +253,7 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
         ('实际金额覆盖比例', float(selected_amount / total_amount) if total_amount else 0.0),
         ('筛选条件', _describe_criteria(criteria)),
         ('口径说明', '本文件为筛选视图；月度、每日及核对结论仍为全量口径。原记录、候选组成和公式全部保留，非选中行仅隐藏，用于公式计算；筛选事项金额取双方收支绝对金额合计的较大值，收付不能抵销。'),
-        ('人工结果口径', '状态筛选采用人工全查、人工抽样中的实际选择；未选择时采用程序结论。人工结果和备注原样保留，打开Excel后公式自动重算。'),
+        ('人工结果口径', '状态筛选采用实际人工选择；未选择时采用程序结论。人工结果和备注原样保留，打开Excel后公式自动重算。'),
     ]
     sheet = book['筛选说明'] if '筛选说明' in book else book.create_sheet('筛选说明', 0)
     for row in sheet:
@@ -265,6 +271,14 @@ def _export_review_view(book, source, output, criteria, progress, log) -> Path:
     sheet.row_dimensions[10].height = 48
     sheet['B7'].number_format = '0.00%'
     sheet.freeze_panes = 'B2'
+    if compact:
+        from 紧凑报告 import format_compact_sheet
+        format_compact_sheet(sheet, reading=True)
+        sheet.column_dimensions['B'].width = 65
+        # 筛选说明也用紧凑排版，全文保留，不继承旧版的大块留白。
+        for row in range(2, sheet.max_row + 1):
+            text = str(sheet.cell(row, 2).value or '')
+            sheet.row_dimensions[row].height = max(15, ((sum(2 if ord(char) > 127 else 1 for char in text) + 63) // 64) * 12 + 3)
     sheet.sheet_state = 'visible'
     book.active = book.index(sheet)
     book.calculation.calcMode = 'auto'

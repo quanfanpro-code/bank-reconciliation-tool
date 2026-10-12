@@ -2482,6 +2482,8 @@ class Reporter:
         apply_review_presentation(workbook)
         if "核对结论" in workbook:
             self._postprocess_summary(workbook["核对结论"], has_warning)
+        from 紧凑报告 import apply_compact_report
+        apply_compact_report(workbook)
         workbook.save(output_path)
         self._log(
             f"报告排版保存完成：排版耗时 "
