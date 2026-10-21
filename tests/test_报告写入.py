@@ -121,3 +121,54 @@ def test_新建簿计划_默认裸表(tmp_path):
     wb = load_workbook(输出)
     assert wb.sheetnames == ["甲表", "乙表"]
     assert wb["甲表"]["A2"].value == 1
+
+
+def test_大表快速通道_列默认样式(tmp_path, monkeypatch):
+    """大表（> 快速通道行数）数据格只写值、整列样式落到列维度；特例格仍逐格。"""
+    import 排版计划
+    from 排版计划 import 格样式, 簿计划, 列计划, 行计划, 表计划
+    from 报告写入 import 渲染簿计划
+
+    monkeypatch.setattr(排版计划, "_快速通道行数", 3)
+    df = pd.DataFrame({
+        "文本": ["甲", "乙", "丙", "丁"],
+        "金额": [1000.0, 2000.5, 3000.0, 4000.0],
+        "链接": ["查看", None, None, None],
+    })
+    表 = 表计划(
+        名称="大表",
+        表=df,
+        表头样式=格样式(字体名="微软雅黑", 字号=10, 加粗=True,
+                     填充色="FF1F4E79", 填充类型="solid"),
+        列=[列计划(宽=20), 列计划(宽=12), 列计划(宽=10)],
+        # 行样式行仍走完整逐格路径（行样式加粗/红字在格变换后保留，填充被清空——
+        # 与旧版逐格行为一致：紧凑变换对整行清填充）
+        行={3: 行计划(样式=格样式(加粗=True, 字色="FF0000"))},
+        # 覆盖格（超链接）仍走完整逐格路径
+        覆盖={(2, 3): 格样式(超链接="#大表!A1")},
+    )
+    表.格变换 = 排版计划._做变换(False)
+    输出 = tmp_path / "出.xlsx"
+    渲染簿计划(簿计划(表=[表]), str(输出))
+    wb = load_workbook(输出)
+    ws = wb["大表"]
+    # 普通数据格：无逐格样式，列默认兜底（读回可见列字体/格式）
+    assert ws["B4"].value == 3000.0
+    assert ws["B4"].font.name == "MiSans" and ws["B4"].font.size == 9
+    assert ws["B4"].number_format == "#,##0.00;[Red]-#,##0.00"
+    # 列默认样式带格变换效果：MiSans 9、金额列右对齐千分位、文本列左对齐
+    # （openpyxl 读回不还原列维度对象的样式，但数据格继承生效，Excel 同理）
+    assert ws["A2"].font.name == "MiSans" and ws["A2"].font.size == 9
+    assert ws["A2"].alignment.horizontal == "left"
+    assert ws["B2"].number_format == "#,##0.00;[Red]-#,##0.00"
+    assert ws["B2"].alignment.horizontal == "right"
+    # 表头仍是显式表头样式
+    assert ws["A1"].font.name == "微软雅黑" and ws["A1"].font.bold
+    # 覆盖格（超链接）走完整路径：MiSans 字体 + 超链接生效
+    assert ws["C2"].hyperlink is not None
+    assert ws["C2"].font.name == "MiSans"
+    # 行样式行走完整路径：加粗红字保留、填充被紧凑变换清空（与旧版逐格一致）
+    assert ws["B3"].font.bold
+    assert ws["B3"].font.color.rgb[-6:] == "FF0000"
+    assert ws["B3"].font.name == "MiSans"
+    assert ws["B3"].fill.fill_type is None

@@ -136,6 +136,10 @@ import math as _math
 
 from openpyxl.utils import get_column_letter as _字母
 
+# 大表快速通道阈值：超过此行数的表不再逐格刷样式，改用列默认样式（用户口径：
+# 排版是锦上添花，逐格一致只对小表保留）
+_快速通道行数 = 50000
+
 
 def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
     """翻译 make_excel._apply_styles（start_col=2，即前置空列=1）。"""
@@ -149,8 +153,13 @@ def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
     tp.前置空列 = 1
     ncols = len(df.columns)
     nrows = 1 + len(df)
-    for r in range(1, nrows + 1):
-        tp.行计划取(r).高 = ROW_HEIGHT
+    大表 = len(df) > _快速通道行数
+    if 大表:
+        # 快速通道：逐行行高/行边框是几十万次样式写入的大头，抹为表级默认行高
+        tp.默认行高 = ROW_HEIGHT
+    else:
+        for r in range(1, nrows + 1):
+            tp.行计划取(r).高 = ROW_HEIGHT
     # A 列永远无数据（_write_data 从 B 列写起）→ 走 else 分支：宽 2
     tp.前部列 = [列计划(宽=A_COL_WIDTH)]
 
@@ -194,14 +203,16 @@ def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
             ))
 
     # 边框：首行 TOP（已并入表头样式）、末行 BOTTOM、中间 MID
-    中虚 = ("dashed", "808080")
-    for r in range(2, nrows + 1):
-        if r == nrows:
-            边 = 格样式(上框=中虚, 下框=("medium", "000000"))
-        else:
-            边 = 格样式(上框=中虚, 下框=中虚)
-        rp = tp.行计划取(r)
-        rp.样式 = 合并样式(rp.样式, 边)
+    # （快速通道大表跳过：逐行虚线边框在留痕大表上无阅读价值，且是逐格写入大头）
+    if not 大表:
+        中虚 = ("dashed", "808080")
+        for r in range(2, nrows + 1):
+            if r == nrows:
+                边 = 格样式(上框=中虚, 下框=("medium", "000000"))
+            else:
+                边 = 格样式(上框=中虚, 下框=中虚)
+            rp = tp.行计划取(r)
+            rp.样式 = 合并样式(rp.样式, 边)
 
     # 右侧空白列（宽 3）
     tp.列计划取(ncols).宽 = 3
@@ -236,17 +247,13 @@ def 应用明细着色(tp: 表计划):
     风险色 = {"低风险": "FFF2CC", "中风险": "FCE4D6", "高风险": "FFC7CE", "范围未知": "F4CCCC"}
     diff_indices = [i for i, h in enumerate(cols)
                     if "差额" in str(h) or "diff" in str(h).lower()]
-    for ri in range(len(df)):
-        for di in diff_indices:
-            v = df.iloc[ri, di]
-            try:
-                f = float(v) if v is not None else 0
-            except (ValueError, TypeError):
-                continue
-            if f != 0:
-                risk = df.iloc[ri, risk_idx] if risk_idx is not None else "低风险"
-                tp.盖格(ri + 2, di + 2, 格样式(
-                    填充色=风险色.get(str(risk), 风险色["低风险"]), 填充类型="solid"))
+    risk_vals = df.iloc[:, risk_idx].tolist() if risk_idx is not None else None
+    for di in diff_indices:
+        vals = pd.to_numeric(df.iloc[:, di], errors="coerce").fillna(0)
+        for ri in vals[vals != 0].index:
+            risk = risk_vals[ri] if risk_vals is not None else "低风险"
+            tp.盖格(ri + 2, di + 2, 格样式(
+                填充色=风险色.get(str(risk), 风险色["低风险"]), 填充类型="solid"))
 
 
 def 应用差额着色(tp: 表计划):
@@ -256,14 +263,9 @@ def 应用差额着色(tp: 表计划):
     for ci, h in enumerate(cols):
         if "差额" not in str(h) and "diff" not in str(h).lower():
             continue
-        for ri in range(len(df)):
-            v = df.iloc[ri, ci]
-            try:
-                f = float(v) if v is not None else 0
-            except (ValueError, TypeError):
-                continue
-            if f != 0:
-                tp.盖格(ri + 2, ci + 2, 格样式(填充色="FFF2CC", 填充类型="solid"))
+        vals = pd.to_numeric(df.iloc[:, ci], errors="coerce").fillna(0)
+        for ri in vals[vals != 0].index:
+            tp.盖格(ri + 2, ci + 2, 格样式(填充色="FFF2CC", 填充类型="solid"))
 
 
 def 应用期初警告(tp: 表计划, has_warning: bool):

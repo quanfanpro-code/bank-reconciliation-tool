@@ -13,7 +13,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from 排版计划 import 格样式, 合并样式, 簿计划
+from 排版计划 import _快速通道行数, 格样式, 合并样式, 簿计划
 
 _字体缓存 = {}
 _填充缓存 = {}
@@ -100,6 +100,24 @@ def _套样式(cell, s: 格样式):
         cell.hyperlink = s.超链接
 
 
+def _套列样式(dim, s: 格样式):
+    """把格样式落到列维度（openpyxl ColumnDimension）：无显式样式的格全列生效。"""
+    f = _字体(s)
+    if f is not None:
+        dim.font = f
+    p = _填充(s)
+    if p is not None:
+        dim.fill = p
+    a = _对齐(s)
+    if a is not None:
+        dim.alignment = a
+    b = _边框(s)
+    if b is not None:
+        dim.border = b
+    if s.数字格式 is not None:
+        dim.number_format = s.数字格式
+
+
 def _值转换(v):
     if v is None:
         return None
@@ -165,6 +183,21 @@ def _渲染表(wb: Workbook, tp):
     # 数据行
     行样式 = {行号: rp.样式 for 行号, rp in tp.行.items() if rp.样式 is not None}
     记录 = tp.表.itertuples(index=False, name=None)
+    大表 = len(tp.表) > _快速通道行数
+    if 大表:
+        # 快速通道：整列样式一次落到列维度，数据格只写值；特例格仍走完整逐格路径
+        列默认 = []
+        for j in range(len(tp.表.columns)):
+            s = tp.列[j].基础样式 if j < len(tp.列) else None
+            s = 合并样式(None, s)          # 复制：格变换会突变传入对象，不能动共享的列基础样式
+            if tp.格变换 is not None:
+                代表 = next((v for v in tp.表.iloc[:, j]
+                             if v is not None
+                             and not (isinstance(v, float) and math.isnan(v))), None)
+                s = tp.格变换(s, 代表, str(tp.表.columns[j]))
+            列默认.append(s)
+            if s is not None:
+                _套列样式(ws.column_dimensions[get_column_letter(偏 + j + 1)], s)
     for i, row in enumerate(记录):
         行号 = i + 2
         rs = 行样式.get(行号)
@@ -180,6 +213,30 @@ def _渲染表(wb: Workbook, tp):
                 ps = 合并样式(ps, cov)
             if ps is not None:
                 _套样式(ws.cell(row=行号, column=k + 1), ps)
+        if 大表:
+            for j, v in enumerate(row):
+                列号 = 偏 + j + 1
+                v = _值转换(v)
+                if v is None and (行号, 列号) in tp.空缺格:
+                    continue
+                cov = tp.覆盖.get((行号, 列号))
+                s2 = tp.后覆盖.get((行号, 列号)) if tp.后覆盖 else None
+                if rs is None and cov is None and s2 is None:
+                    # 普通格：只写值，样式由列默认兜底
+                    ws.cell(row=行号, column=列号, value=v)
+                    continue
+                cell = ws.cell(row=行号, column=列号, value=v)
+                样式 = tp.列[j].基础样式 if j < len(tp.列) else None
+                样式 = 合并样式(样式, rs) if rs is not None else 样式
+                样式 = 合并样式(样式, cov) if cov is not None else 样式
+                if tp.格变换 is not None and (v is not None or tp.物化空格):
+                    样式 = tp.格变换(样式 if 样式 is not None else 格样式(), v,
+                                     str(tp.表.columns[j]))
+                if s2 is not None:
+                    样式 = 合并样式(样式, s2)
+                if 样式 is not None:
+                    _套样式(cell, 样式)
+            continue
         for j, v in enumerate(row):
             列号 = 偏 + j + 1
             v = _值转换(v)
