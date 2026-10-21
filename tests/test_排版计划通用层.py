@@ -30,7 +30,7 @@ def test_底层主题():
     名称列, 金额列, 日期列 = tp.列[0], tp.列[1], tp.列[2]
     assert 金额列.基础样式.字色 == "0000FF" and 金额列.基础样式.水平 == "right"
     assert 金额列.基础样式.数字格式 == "#,##0.00"
-    assert 名称列.基础样式.字色 == "000000" and 名称列.基础样式.水平 == "left"
+    assert 名称列.基础样式.字色 is None and 名称列.基础样式.水平 == "left"
     assert 日期列.基础样式.数字格式 == "yyyy/mm/dd"
     # 列宽估算（介于 10~50）
     assert all(10 <= c.宽 <= 50 for c in tp.列[:3])

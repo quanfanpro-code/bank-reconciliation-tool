@@ -1,4 +1,4 @@
-﻿"""真实项目运行必须持续显示阶段、数量、耗时和整体进度。"""
+"""真实项目运行必须持续显示阶段、数量、耗时和整体进度。"""
 
 from decimal import Decimal
 
@@ -132,5 +132,5 @@ def test_报告生成实时输出构造写入排版保存节点(tmp_path):
     assert output.is_file()
     assert any("开始构造报告表格" in line for line in logs)
     assert any("报告表格构造完成" in line and "工作表" in line for line in logs)
-    assert any("工作簿初次写入完成" in line for line in logs)
+    assert any("开始应用审计报告排版和复核标记" in line for line in logs)
     assert any("报告排版保存完成" in line and "耗时" in line for line in logs)

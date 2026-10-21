@@ -242,3 +242,59 @@ def test_紧凑样式与渲染(tmp_path):
     assert wb["核对总览"].freeze_panes is None
     # 事项编号列隐藏
     assert ws.column_dimensions["L"].hidden
+
+
+def test_紧凑新建表空格物化(tmp_path):
+    """紧凑层新建表（待处理事项/对应明细/核对总览）旧路径在重载后直接建表：
+    空串格也物化并带紧凑样式。"""
+    from 排版计划 import 应用紧凑层, 表计划
+    from 报告写入 import 渲染簿计划
+
+    簿 = _紧凑簿()
+    簿.表.append(表计划(名称="非工作日交易", 表=pd.DataFrame([["2026-01-04"]], columns=["交易日期"])))
+    应用紧凑层(簿)
+    assert 簿.取表("待处理事项").物化空格
+    assert 簿.取表("对应明细").物化空格
+    assert 簿.取表("核对总览").物化空格
+    输出 = tmp_path / "出.xlsx"
+    渲染簿计划(簿, str(输出))
+    wb = load_workbook(输出)
+    ws = wb["待处理事项"]
+    # H2 人工核对结果、J2 备注均为 None：旧路径落格为带紧凑样式的空格
+    for coord in ("H2", "J2"):
+        cell = ws[coord]
+        assert cell.value is None
+        assert cell.font.name == "MiSans" and cell.font.size == 9
+        assert cell.alignment.horizontal == "left" and cell.alignment.vertical == "top"
+    assert ws["H2"].fill.fgColor.rgb[-6:] == "FFF2CC"   # 黄格后覆盖仍在
+    # 核对总览：非工作日行的"怎么看"为空串，同样物化
+    总览 = wb["核对总览"]
+    项目 = [总览.cell(r, 1).value for r in range(1, 总览.max_row + 1)]
+    行 = 项目.index("非工作日银行收款笔数") + 1
+    cell = 总览.cell(行, 3)
+    assert cell.value is None and cell.font.name == "MiSans"
+
+
+def test_期间标记追加列边框中和(tmp_path):
+    """期间标记追加列是紧凑层后建新列：不背复核层行样式/表头边框。"""
+    from 排版计划 import 应用紧凑层, 格样式
+    from 报告写入 import 渲染簿计划
+
+    簿 = _紧凑簿()
+    每日 = 簿.取表("每日统计")
+    每日.表头样式 = 格样式(上框=("medium", "000000"), 下框=("dashed", "808080"))
+    每日.行计划取(2).样式 = 格样式(上框=("dashed", "808080"), 下框=("dashed", "808080"))
+    应用紧凑层(簿)
+    输出 = tmp_path / "出.xlsx"
+    渲染簿计划(簿, str(输出))
+    wb = load_workbook(输出)
+    ws = wb["每日统计"]
+    # 追加列（E 银行-期末余额、H 需查看）表头与数据格无边框
+    for coord in ("E1", "H1", "E2", "H2"):
+        边 = ws[coord].border
+        assert 边.top.style is None and 边.bottom.style is None, coord
+    # 非追加列保持行样式边框
+    assert ws["B2"].border.top.style == "dashed"
+    # 月度核对合计行的需查看格旧路径不存在（空缺格不落格）
+    月 = wb["月度核对"]
+    assert 月["I3"].value is None and not 月["I3"].has_style

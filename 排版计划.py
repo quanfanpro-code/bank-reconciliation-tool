@@ -87,6 +87,8 @@ class 表计划:
     默认行高: float | None = None
     格变换: object = None                           # callable(格样式, 值, 列标签) -> 格样式，数据格合并后调用
     后覆盖: dict = field(default_factory=dict)      # {(行,列)}，格变换之后再合并的格覆盖
+    空缺格: set = field(default_factory=set)        # {(行,列)}，旧路径从不存在的格，渲染时不落格
+    物化空格: bool = False                          # True 时 None 值格也走格变换并落格（紧凑层新建表）
 
     def 列计划取(self, 下标: int) -> 列计划:
         """取下标（0 基）列计划；不足自动补齐。"""
@@ -169,7 +171,8 @@ def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
         nf = FMT.get(col_type)
         cp.基础样式 = 格样式(
             字体名="Arial", 字号=11,
-            字色=t["data_font_blue"] if is_num else t["data_font_black"],
+            # 旧代码文本列 Font(name='Arial', size=11) 不带字色，仅数字列蓝色
+            字色=t["data_font_blue"] if is_num else None,
             水平="right" if is_num else "left", 垂直="center",
             数字格式=nf or None,
         )
@@ -462,9 +465,9 @@ def _写值(tp: 表计划, row: int, col: int, value):
 
 
 def _读值(tp: 表计划, row: int, col: int):
-    """读计划值；NaN/NaT 归一为 None（旧路径保存重载后 NaN 即 None，语义对齐）。"""
+    """读计划值；NaN/NaT/空串归一为 None（旧路径保存重载后三者即 None，语义对齐）。"""
     v = tp.表.iat[row - 2, col - tp.前置空列 - 1]
-    if v is None or v is pd.NaT:
+    if v is None or v is pd.NaT or v == "":
         return None
     if isinstance(v, float) and _math.isnan(v):
         return None
@@ -688,6 +691,8 @@ def _结论汇总(簿: 簿计划, sheets: dict, headers: dict, rng):
     item_col, value_col = hs["项目"], hs["数值"]
     item_idx, value_idx = item_col - tp.前置空列 - 1, value_col - tp.前置空列 - 1
     rows = {df.iat[r, item_idx]: r + 2 for r in range(len(df))}
+    原有末行 = len(df) + 1
+    追加行 = set()
 
     def set_value(label, value):
         row = rows.get(label)
@@ -698,6 +703,7 @@ def _结论汇总(簿: 簿计划, sheets: dict, headers: dict, rng):
             df.loc[len(df)] = new
             row = len(df) + 1
             rows[label] = row
+            追加行.add(row)
         else:
             df.iat[row - 2, value_idx] = value
 
@@ -755,16 +761,26 @@ def _结论汇总(簿: 簿计划, sheets: dict, headers: dict, rng):
     contents = []
     for r in range(2, len(df) + 2):
         cov = tp.覆盖.get((r, value_col))
-        contents.append((df.iat[r - 2, item_idx], df.iat[r - 2, value_idx],
-                         cov.数字格式 if cov and cov.数字格式 else "General"))
+        # 追加行数值格在旧路径里是后建的空格，数字格式为 General 而非底层主题的 '@'；
+        # 旧代码排序时把数值格的内容连同数字格式一起搬运，所以该差异随值走排序
+        nf = cov.数字格式 if cov and cov.数字格式 else None
+        if nf is None and r in 追加行:
+            nf = "General"
+        contents.append((df.iat[r - 2, item_idx], df.iat[r - 2, value_idx], nf))
         tp.覆盖.pop((r, value_col), None)
     priority = {label: number for number, label in enumerate(visible)}
     contents.sort(key=lambda item: priority.get(item[0], len(priority)))
     for row, (label, value, number_format) in enumerate(contents, 2):
         df.iat[row - 2, item_idx] = label
         df.iat[row - 2, value_idx] = value
-        if number_format != "General":
+        if number_format is not None:
             tp.覆盖[(row, value_col)] = 格样式(数字格式=number_format)
+        if row > 原有末行:
+            # 旧代码排序只改写项目/数值两列已存在的格：A 列空格与项目列的
+            # 数字格式保持位置不动——追加区段的 A 列旧路径从未落格、项目列是
+            # 后建空格（General 而非底层 '@'）
+            tp.空缺格.add((row, 1))
+            tp.覆盖[(row, item_col)] = 格样式(数字格式="General")
         tp.行计划取(row).隐藏 = label not in visible
 
 
@@ -831,6 +847,27 @@ def _刷主表样式(簿: 簿计划):
         h.填充色, h.填充类型 = "24445B", "solid"
         h.水平, h.垂直, h.自动换行 = "", "center", True
         tp.表头样式 = h
+        # 旧 _format_sheets 表头循环覆盖 A1（无值也赋样式）但不碰边框
+        tp.表头含前列 = True
+        for k in range(tp.前置空列):
+            tp.盖格(1, k + 1, 格样式(上框=("", None), 下框=("", None),
+                                     左框=("", None), 右框=("", None)))
+        # 旧 _format_sheets 对 hs 数据格整体替换字体/填充/对齐（金额/日期列含数字格式），
+        # 抹掉更早层留下的同域格覆盖
+        金额日期列 = {column for label, column in hs.items()
+                    if (any(k in label for k in ("金额", "收入", "支出", "余额", "差额", "发生额差"))
+                        and label != "余额说明") or label == "日期"}
+        hs列集合 = set(hs.values())
+        for (r, c), cov in list(tp.覆盖.items()):
+            if r < 2 or c not in hs列集合:
+                continue
+            cov.字体名 = cov.字号 = cov.加粗 = cov.字色 = cov.下划线 = None
+            cov.填充色 = cov.填充类型 = None
+            cov.水平 = cov.垂直 = cov.自动换行 = None
+            if c in 金额日期列:
+                cov.数字格式 = None
+            if cov.属性元组() == (None,) * len(cov.属性元组()):
+                del tp.覆盖[(r, c)]
         tp.行计划取(1).高 = 36
         for ri in range(len(df)):
             row = ri + 2
@@ -1047,6 +1084,11 @@ def _展示样式(tp: 表计划):
     h.水平, h.垂直, h.自动换行 = "", "center", True
     tp.表头样式 = h
     tp.表头含前列 = True
+    # 旧 _style 给 A1 上字体/填充/对齐但不碰边框；表头样式带着主题边框，
+    # 前置空列表头需显式清掉边框才与旧产物一致
+    for k in range(偏):
+        tp.盖格(1, k + 1, 格样式(上框=("", None), 下框=("", None),
+                                 左框=("", None), 右框=("", None)))
 
     last_main = None
     for ri in range(len(df)):
@@ -1139,6 +1181,10 @@ def _月度(tp: 表计划):
         new[hs["余额说明"] - 偏 - 1] = "发生额合计；余额不加总"
         df.loc[len(df)] = new
         target = len(df) + 1
+        # 合计行是后加的格子：旧路径非求和列保持默认 General，不继承底层主题格式
+        for label, col in hs.items():
+            if col not in nf_cols:
+                tp.盖格(target, col, 格样式(数字格式="General"))
         for col in nf_cols:
             tp.盖格(target, col, 格样式(数字格式="#,##0.00;[Red]-#,##0.00"))
         rp = tp.行计划取(target)
@@ -1146,6 +1192,11 @@ def _月度(tp: 表计划):
         rp.样式 = 合并样式(rp.样式, 格样式(
             字体名="微软雅黑", 字号=10, 加粗=True, 字色="243746",
             填充色="DEEAF2", 填充类型="solid", 水平="", 垂直="center", 自动换行=True))
+        # 旧路径合计行样式也落到了前置空列 A 格（渲染器行样式不落 A 列，显式补盖）
+        if 偏:
+            tp.盖格(target, 1, 格样式(
+                字体名="微软雅黑", 字号=10, 加粗=True, 字色="243746",
+                填充色="DEEAF2", 填充类型="solid", 垂直="center", 自动换行=True))
     tp.筛选 = f"A1:{_字母(偏 + ncols)}{end}"
     tp.打印 = dict(tp.打印)
     tp.打印["area"] = f"A1:{_字母(偏 + ncols)}{len(df) + 1}"
@@ -1291,8 +1342,10 @@ def _写事项(簿: 簿计划):
                                   len(matched_data) + 1))
 
     待处理 = 表计划(名称="待处理事项", 表=pd.DataFrame(pending_data, columns=待处理列))
+    待处理.物化空格 = True      # 旧路径紧凑层在重载后直接建表，空串格也带紧凑样式落格
     簿.表.append(待处理)
     对应 = 表计划(名称="对应明细", 表=pd.DataFrame(matched_data, columns=对应列))
+    对应.物化空格 = True
     簿.表.append(对应)
 
     for it, row in pending_extra:
@@ -1373,10 +1426,13 @@ def _期间标记(簿: 簿计划, name):
     daily = name == "每日统计"
     balance_labels = (("银行-期末余额", "日记账-期末余额") if daily
                       else ("银行-月末余额", "序时账-月末余额"))
+    追加列 = []
     for label in (*balance_labels, "余额差额"):
         if label not in _列定位(tp):
             tp.表[label] = "未提供"
+            追加列.append(label)
     tp.表["需查看"] = None
+    追加列.append("需查看")
     hs = _列定位(tp)
     anomaly_days = set()
     异常 = 簿.取表("余额连续性异常")
@@ -1406,6 +1462,21 @@ def _期间标记(簿: 簿计划, name):
             _写值(tp, row, column,
                   f'=IF(OR({",".join(tests)}),"有差额",'
                   f'IF(OR({",".join(missing)}),"余额未提供",""))')
+    # 追加列在旧路径里是紧凑层才出现的新列：不背复核层行样式，中和为默认格
+    # （有值的格随后由紧凑变换再盖一遍）；合计行被跳过的需查看格旧路径不存在。
+    # 中和必须连边框一起清掉（复核层行样式的 medium/dashed 边框旧路径不存在），
+    # 表头格同理：旧路径新列表头是空格后盖紧凑表头，不带底层边框。
+    清边框 = dict(上框=("", None), 下框=("", None), 左框=("", None), 右框=("", None))
+    for label in 追加列:
+        col = hs[label]
+        tp.盖格(1, col, 格样式(**清边框))
+        for row in range(2, len(tp.表) + 2):
+            if _读值(tp, row, col) is None:
+                tp.空缺格.add((row, col))
+                continue
+            tp.盖格(row, col, 格样式(字体名="Calibri", 字号=11, 字色="theme:1",
+                                     填充类型="none", 垂直="", 自动换行=False,
+                                     数字格式="General", **清边框))
 
 
 def _建总览(簿: 簿计划):
@@ -1455,6 +1526,7 @@ def _建总览(簿: 簿计划):
             value = f'SUBSTITUTE({value},"余额核对未实施","未提供双方可用余额")'
         out.append([title, "=" + value, explanation])
     tp = 表计划(名称="核对总览", 表=pd.DataFrame(out, columns=["项目", "结果", "怎么看"]))
+    tp.物化空格 = True          # 旧路径紧凑层在重载后直接建表，空串格也带紧凑样式落格
     簿.表.append(tp)
     for i, (title, label, explanation) in enumerate(rows):
         row = i + 2
@@ -1486,7 +1558,13 @@ def _建总览(簿: 簿计划):
 def _做变换(reading):
     """format_compact_sheet 数据格部分：在渲染器每格合并后调用。"""
     def 变换(样式, 值, 列标签):
+        # 旧代码 copy(cell.font)：从未显式赋过字体的格子带默认主题色，
+        # 计划层以 字色 None 表示，这里还原为 theme:1 供渲染器落成 Color(theme=1)
+        无字体痕迹 = all(getattr(样式, k) is None
+                       for k in ("字体名", "字号", "加粗", "字色", "下划线"))
         样式.字体名, 样式.字号 = "MiSans", 9
+        if 无字体痕迹:
+            样式.字色 = "theme:1"
         样式.填充类型, 样式.填充色 = "none", None
         numeric = isinstance(值, (int, float, _Decimal)) and not isinstance(值, bool)
         样式.水平 = "right" if numeric else "left"

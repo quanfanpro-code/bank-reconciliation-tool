@@ -27,8 +27,11 @@ def _字体(s: 格样式) -> Font | None:
         return None
     if key not in _字体缓存:
         # 空字符串表示"显式清空"（旧路径整体替换 Font 时 name/size 回落默认）
+        # 'theme:1' 表示旧路径里从未显式赋过字体的默认字色（主题色 1）
+        from openpyxl.styles.colors import Color
+        color = Color(theme=1) if s.字色 == "theme:1" else s.字色
         _字体缓存[key] = Font(name=s.字体名 or None, size=s.字号 or None,
-                              bold=s.加粗, color=s.字色, underline=s.下划线)
+                              bold=s.加粗, color=color, underline=s.下划线)
     return _字体缓存[key]
 
 
@@ -104,6 +107,9 @@ def _值转换(v):
         return None
     if v is pd.NaT:
         return None
+    if v == "":
+        # 旧路径保存重载后空字符串即 None，样式与取值语义都对齐重载态
+        return None
     return v
 
 
@@ -162,15 +168,23 @@ def _渲染表(wb: Workbook, tp):
     for i, row in enumerate(记录):
         行号 = i + 2
         rs = 行样式.get(行号)
-        # 前置空列：仅在有样式要求时落格（复刻旧路径产生的带样式空格）
+        # 前置空列：仅前部列自身样式（旧路径的行样式不落到 A 列空格格）；
+        # 空缺格跳过（如核对结论追加行的 A 列旧路径从未落格）；
+        # 显式格覆盖仍生效（如月度核对合计行的 A 列旧路径有行样式痕迹）
         for k in range(偏):
+            if (行号, k + 1) in tp.空缺格:
+                continue
             ps = tp.前部列[k].基础样式 if k < len(tp.前部列) else None
-            样式 = 合并样式(ps, rs)
-            if 样式 is not None:
-                _套样式(ws.cell(row=行号, column=k + 1), 样式)
+            cov = tp.覆盖.get((行号, k + 1))
+            if cov is not None:
+                ps = 合并样式(ps, cov)
+            if ps is not None:
+                _套样式(ws.cell(row=行号, column=k + 1), ps)
         for j, v in enumerate(row):
             列号 = 偏 + j + 1
             v = _值转换(v)
+            if v is None and (行号, 列号) in tp.空缺格:
+                continue
             cell = ws.cell(row=行号, column=列号, value=v)
             s = tp.覆盖.get((行号, 列号))
             样式 = None
@@ -180,7 +194,7 @@ def _渲染表(wb: Workbook, tp):
                 样式 = 合并样式(样式, rs)
             if s is not None:
                 样式 = 合并样式(样式, s)
-            if tp.格变换 is not None and v is not None:
+            if tp.格变换 is not None and (v is not None or tp.物化空格):
                 样式 = tp.格变换(样式 if 样式 is not None else 格样式(), v,
                                  str(tp.表.columns[j]))
             if tp.后覆盖:

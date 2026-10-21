@@ -170,6 +170,10 @@ def test_月度(簿):
     assert _值(月度, 4, "余额说明") == "发生额合计；余额不加总"
     assert 月度.行[4].高 == 32 and 月度.行[4].样式.加粗
     assert 月度.覆盖[(4, 5)].数字格式 == "#,##0.00;[Red]-#,##0.00"
+    # 合计行样式也落到前置空列 A 格（旧路径行为，渲染器行样式不落 A 列，靠显式覆盖）
+    a格 = 月度.覆盖[(4, 1)]
+    assert a格.字体名 == "微软雅黑" and a格.加粗 and a格.填充色 == "DEEAF2"
+    assert a格.垂直 == "center" and a格.自动换行
     assert 月度.筛选 == "A1:M3" and 月度.冻结 == "B2"
     assert 月度.列计划取(0).宽 == 13
     说明列 = 月度.列计划取(list(月度.表.columns).index("余额说明"))
@@ -187,3 +191,32 @@ def test_结论说明与次序(簿):
     assert 簿.取表("核对明细").状态 == "hidden"
     assert 簿.取表("逐笔核对").状态 == "visible"
     assert 簿.active == 0
+
+
+def test_前部列覆盖与空缺格渲染(tmp_path):
+    """渲染器：前置空列合并显式格覆盖（合计行 A 格），空缺格不落格。"""
+    from openpyxl import load_workbook
+
+    from 排版计划 import 应用展示层, 格样式
+    from 报告写入 import 渲染簿计划
+
+    簿 = _展示簿()
+    应用展示层(簿)
+    月度 = 簿.取表("月度核对")
+    if not 月度.前部列:
+        from 排版计划 import 列计划
+        月度.前部列.append(列计划())
+    月度.前部列[0].基础样式 = 格样式(垂直="top")
+    月度.空缺格.add((2, 1))
+    输出 = tmp_path / "出.xlsx"
+    渲染簿计划(簿, str(输出))
+    wb = load_workbook(输出)
+    ws = wb["月度核对"]
+    # 合计行 A 格：覆盖合并到前部列基础样式之上
+    a4 = ws["A4"]
+    assert a4.font.name == "微软雅黑" and a4.font.bold
+    assert a4.fill.fgColor.rgb[-6:] == "DEEAF2"
+    assert a4.alignment.vertical == "center"
+    # 空缺格：A2 不落格（无值无样式痕迹）
+    a2 = ws["A2"]
+    assert a2.value is None and not a2.has_style

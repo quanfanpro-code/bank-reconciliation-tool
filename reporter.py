@@ -2446,7 +2446,7 @@ class Reporter:
             self._旧排版写入(output_path, tables, total_rows, report_started)
             return
         presentation_started = time.perf_counter()
-        self._log("开始应用审计报告排版和复核标记（单次写入）")
+        self._log("开始应用审计报告排版和复核标记")
         from 排版计划 import 生成簿计划
         from 报告写入 import 渲染簿计划
         渲染簿计划(生成簿计划(self, tables, effective_config), output_path)
