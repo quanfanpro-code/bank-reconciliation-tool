@@ -26,8 +26,9 @@ def _字体(s: 格样式) -> Font | None:
     if key == (None,) * 5:
         return None
     if key not in _字体缓存:
-        _字体缓存[key] = Font(name=s.字体名, size=s.字号, bold=s.加粗,
-                              color=s.字色, underline=s.下划线)
+        # 空字符串表示"显式清空"（旧路径整体替换 Font 时 name/size 回落默认）
+        _字体缓存[key] = Font(name=s.字体名 or None, size=s.字号 or None,
+                              bold=s.加粗, color=s.字色, underline=s.下划线)
     return _字体缓存[key]
 
 
@@ -49,7 +50,8 @@ def _对齐(s: 格样式) -> Alignment | None:
     if key == (None,) * 3:
         return None
     if key not in _对齐缓存:
-        _对齐缓存[key] = Alignment(horizontal=s.水平, vertical=s.垂直,
+        # 空字符串表示"显式清空"（旧路径整体替换 Alignment 时会清掉 horizontal）
+        _对齐缓存[key] = Alignment(horizontal=s.水平 or None, vertical=s.垂直 or None,
                                    wrap_text=s.自动换行)
     return _对齐缓存[key]
 
@@ -124,6 +126,13 @@ def _渲染表(wb: Workbook, tp):
         ws.sheet_properties.outlinePr.summaryBelow = tp.outline汇总在下
 
     偏 = tp.前置空列
+    # 前置空列（A 列等）的宽与隐藏
+    for k, cp in enumerate(tp.前部列):
+        dim = ws.column_dimensions[get_column_letter(k + 1)]
+        if cp.宽 is not None:
+            dim.width = cp.宽
+        if cp.隐藏:
+            dim.hidden = True
     # 列宽与隐藏
     for i, cp in enumerate(tp.列):
         letter = get_column_letter(偏 + i + 1)
@@ -144,10 +153,16 @@ def _渲染表(wb: Workbook, tp):
     for i, row in enumerate(记录):
         行号 = i + 2
         rs = 行样式.get(行号)
+        # 前置空列：仅在有样式要求时落格（复刻旧路径产生的带样式空格）
+        for k in range(偏):
+            ps = tp.前部列[k].基础样式 if k < len(tp.前部列) else None
+            样式 = 合并样式(ps, rs)
+            if 样式 is not None:
+                _套样式(ws.cell(row=行号, column=k + 1), 样式)
         for j, v in enumerate(row):
             列号 = 偏 + j + 1
             cell = ws.cell(row=行号, column=列号, value=_值转换(v))
-            s = tp.覆盖.get((行号, 列号)) or tp.覆盖.get((行号, j + 1))
+            s = tp.覆盖.get((行号, 列号))
             样式 = None
             if j < len(tp.列):
                 样式 = tp.列[j].基础样式
