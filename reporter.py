@@ -1,4 +1,4 @@
-﻿"""
+"""
 Reporter 模块 — 核对结果报表生成器
 
 使用 make_excel deep-navy 主题输出 Excel，再通过 openpyxl 后处理添加条件格式。
@@ -9,6 +9,7 @@ from decimal import Decimal
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import os
 import time
 from pathlib import Path
 
@@ -2441,6 +2442,21 @@ class Reporter:
             f"报告表格构造完成：{len(tables):,} 个工作表，"
             f"共 {total_rows:,} 行，耗时 {time.perf_counter() - table_started:.1f} 秒"
         )
+        if os.environ.get("银行流水核对_旧排版") == "1":
+            self._旧排版写入(output_path, tables, total_rows, report_started)
+            return
+        presentation_started = time.perf_counter()
+        self._log("开始应用审计报告排版和复核标记（单次写入）")
+        from 排版计划 import 生成簿计划
+        from 报告写入 import 渲染簿计划
+        渲染簿计划(生成簿计划(self, tables, effective_config), output_path)
+        self._log(
+            f"报告排版保存完成：排版耗时 "
+            f"{time.perf_counter() - presentation_started:.1f} 秒，"
+            f"报告总耗时 {time.perf_counter() - report_started:.1f} 秒"
+        )
+
+    def _旧排版写入(self, output_path, tables, total_rows, report_started):
         write_started = time.perf_counter()
         self._log(
             f"开始写入 Excel 工作簿：{len(tables):,} 个工作表，"
