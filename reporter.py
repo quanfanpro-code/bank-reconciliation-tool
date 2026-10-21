@@ -26,7 +26,7 @@ from balance import (
     BalanceReconciler,
     check_balance_continuity as check_row_balance_continuity,
 )
-from 复核报表 import build_review_tables, apply_review_presentation
+from 复核报表 import build_review_tables
 from 排版共享 import atomic_output_path
 from llm_assistant import redact_sensitive_text, sanitize_url
 from 非工作日日历 import 判定日期
