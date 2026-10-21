@@ -52,7 +52,7 @@
 
 ## 后续决策（直写 OpenXML）
 
-用户进一步要求彻底摆脱 openpyxl：生成报告不再经过任何 Excel 库对象模型，改为 `直写XML.py` 手写 OpenXML（styles.xml 索引表去重、sharedStrings 去重、calcPr 强制重算、批注 VML、超链接 rels、条件格式 dxf、数据验证、打印设置），一次 zip 成型。配套 `排版共享.py` 收编旧模块里被生产路径使用的纯逻辑（主题常量、列类型推断、列宽估算、紧凑层纯函数、条件格式自有结构 `条件规则`、atomic_output_path），使 `排版计划/直写XML/报告写入/reporter/application` 导入链**不加载 openpyxl**（已用 `sys.modules` 探针验证）。openpyxl 仅保留在测试的读回验收和旧排版回退路径（函数内延迟导入）。
+用户进一步要求彻底摆脱 openpyxl：生成报告不再经过任何 Excel 库对象模型，改为 `直写XML.py` 手写 OpenXML（styles.xml 索引表去重、sharedStrings 去重、calcPr 强制重算、批注 VML、超链接 rels、条件格式 dxf、数据验证、打印设置），一次 zip 成型。配套 `排版共享.py` 收编旧模块里被生产路径使用的纯逻辑（主题常量、列类型推断、列宽估算、紧凑层纯函数、条件格式自有结构 `条件规则`、atomic_output_path），使 `排版计划/直写XML/报告写入/reporter/application` 导入链**不加载 openpyxl**（已用 `sys.modules` 探针验证）。openpyxl 仅保留在测试的读回验收，以及文件读写型功能（筛选导出、输入模板生成、输入前检查）；旧排版回退路径随后已整体下线。
 
 ## 范围
 
