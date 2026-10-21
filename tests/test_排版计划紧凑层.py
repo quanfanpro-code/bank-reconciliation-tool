@@ -298,3 +298,21 @@ def test_期间标记追加列边框中和(tmp_path):
     # 月度核对合计行的需查看格旧路径不存在（空缺格不落格）
     月 = wb["月度核对"]
     assert 月["I3"].value is None and not 月["I3"].has_style
+
+
+def test_紧凑样式大表跳过逐行扫描(monkeypatch):
+    """大表（> 快速通道行数）不再逐行算行高/建行计划，只扫前 2000 行定列宽；
+    既有行计划的隐藏/收起清除保留（非阅读表）。"""
+    import 排版计划
+    from 排版计划 import 表计划, _紧凑样式
+
+    monkeypatch.setattr(排版计划, "_快速通道行数", 3)
+    df = pd.DataFrame({"文本": [f"r{i}" for i in range(2500)],
+                       "金额": [float(i) for i in range(2500)]})
+    tp = 表计划(名称="留痕大表", 表=df)
+    tp.行计划取(2400).隐藏 = True
+    _紧凑样式(tp, reading=False)
+    assert 2001 in tp.行            # 扫描区末行仍有行计划（行高）
+    assert 2002 not in tp.行        # 超出扫描上限不再逐行建行计划
+    assert not tp.行[2400].隐藏     # 扫描区外的既有行计划仍清隐藏
+    assert tp.默认行高 == 15

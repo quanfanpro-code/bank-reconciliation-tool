@@ -1634,7 +1634,10 @@ def _紧凑样式(tp: 表计划, *, reading):
     tp.表头样式 = h
 
     # 数据行：金额列宽按内容扩、阅读表逐字宽算行高；非阅读表行高抹成 15
-    for ri in range(len(df)):
+    # （快速通道大表只扫前 2000 行定列宽，不再逐行建行计划，行高走表级默认）
+    大表 = len(df) > _快速通道行数
+    扫描 = 2000 if 大表 else len(df)
+    for ri in range(扫描):
         row = ri + 2
         height = 15
         for label, column in hs.items():
@@ -1654,6 +1657,10 @@ def _紧凑样式(tp: 表计划, *, reading):
         rp = tp.行计划取(row)
         rp.高 = height
         if not reading:
+            rp.隐藏 = False
+            rp.收起 = False
+    if 大表 and not reading:
+        for rp in tp.行.values():
             rp.隐藏 = False
             rp.收起 = False
     tp.格变换 = _做变换(reading)
