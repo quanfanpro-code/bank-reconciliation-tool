@@ -1,9 +1,10 @@
 """读取本工具报告的列名，列位置只用于定位已识别字段的单元格。"""
-from openpyxl.utils import get_column_letter
 
 
 def identify_columns(sheet, required=()):
     """报告第一行为表头；允许换序、额外列和两端空格，不猜测歧义列。"""
+    # 延迟导入：identify_columns 本身不依赖 openpyxl 类对象
+    from openpyxl.utils import get_column_letter
     columns = {}
     for cell in sheet[1]:
         label = str(cell.value).strip() if cell.value is not None else ''

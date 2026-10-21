@@ -70,7 +70,7 @@ class 表计划:
     行: dict = field(default_factory=dict)          # {1 基行号: 行计划}（1=表头）
     覆盖: dict = field(default_factory=dict)        # {(行,列) 1 基: 格样式}
     验证: list = field(default_factory=list)        # DataValidation kwargs（含 sqref）
-    条件格式: list = field(default_factory=list)    # [(区域, openpyxl 规则对象)]
+    条件格式: list = field(default_factory=list)    # [(区域, 条件规则)]
     冻结: str | None = None
     筛选: str | None = None
     tab色: str | None = None
@@ -134,7 +134,7 @@ def 新建簿计划(tables: dict) -> 簿计划:
 
 import math as _math
 
-from openpyxl.utils import get_column_letter as _字母
+from 排版共享 import 字母 as _字母, 条件规则
 
 # 大表快速通道阈值：超过此行数的表不再逐格刷样式，改用列默认样式（用户口径：
 # 排版是锦上添花，逐格一致只对小表保留）。金样账户最大表 3531 行（修竹四分
@@ -144,7 +144,7 @@ _快速通道行数 = 5000
 
 def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
     """翻译 make_excel._apply_styles（start_col=2，即前置空列=1）。"""
-    from make_excel import (
+    from 排版共享 import (
         A_COL_WIDTH, FMT, ROW_HEIGHT, SUM_KEYWORDS, THEMES,
         _estimate_column_width, _infer_column_type,
     )
@@ -912,15 +912,12 @@ def _刷主表样式(簿: 簿计划):
 # 展示层回放（翻译自 报告展示.format_display_sheets / _style / _monthly）
 # ═══════════════════════════════════════════════════════════════════════════
 
-from openpyxl.formatting.rule import FormulaRule as _公式规则
-from openpyxl.styles import Font as _字体类, PatternFill as _填充类
-
 _展示金额列 = ("银行金额", "序时账金额", "金额", "差额")
 
 
 def 应用展示层(簿: 簿计划):
     """翻译 报告展示.format_display_sheets。"""
-    from 报告展示 import 阅读表, 组成金额列
+    from 排版共享 import 阅读表, 组成金额列
 
     references = {}
     for name in ("核对明细", "复核事项索引", "人工全查", "人工抽样"):
@@ -1048,7 +1045,7 @@ _展示列宽 = {"核对编号": 9, "行别": 12, "银行日期": 12, "序时账
 
 def _展示样式(tp: 表计划):
     """翻译 报告展示._style。"""
-    from 报告展示 import 组成金额列
+    from 排版共享 import 组成金额列
 
     hs = _列定位(tp)
     df = tp.表
@@ -1163,9 +1160,8 @@ def _月度(tp: 表计划):
             letter = _字母(hs[label])
             tp.条件格式.append((
                 f"{letter}2:{letter}{end}",
-                _公式规则(formula=[f"AND(ISNUMBER({letter}2),{letter}2<>0)"],
-                          fill=_填充类("solid", fgColor="FFF2CC"),
-                          font=_字体类(color="9C0006"))))
+                条件规则(公式=[f"AND(ISNUMBER({letter}2),{letter}2<>0)"],
+                         填充色="FFF2CC", 字色="9C0006")))
     years = sorted({str(_读值(tp, row, hs["月份"]))[:4] for row in range(2, end + 1)})
     for year in years:
         rows = [r for r in range(2, end + 1)
@@ -1281,7 +1277,8 @@ def _含坐标(sqref, coord):
 
 def _写事项(簿: 簿计划):
     """翻译 紧凑报告._write_items：建待处理事项/对应明细，回收人工表入口。"""
-    from 紧凑报告 import _amounts, _description, _plain_reason, _short_result
+    from 排版共享 import (记录金额 as _amounts, 记录描述 as _description,
+                          入选原因 as _plain_reason, 短结果 as _short_result)
 
     明细 = 簿.取表("核对明细")
     hs_明细 = _列定位(明细)
@@ -1696,18 +1693,16 @@ def 应用紧凑层(簿: 簿计划):
             if len(t.表) > 0:
                 t.条件格式.append((
                     f"{column}2:{column}{len(t.表) + 1}",
-                    _公式规则(formula=[f"AND(ISNUMBER({column}2),{column}2<>0)"],
-                              fill=_填充类("solid", fgColor="FFF2CC"),
-                              font=_字体类(color="9C0006"))))
+                    条件规则(公式=[f"AND(ISNUMBER({column}2),{column}2<>0)"],
+                            填充色="FFF2CC", 字色="9C0006")))
     for name in ("每日统计", "月度核对"):
         t = 簿.取表(name)
         column = _字母(_列定位(t)["需查看"])
         if len(t.表) > 0:
             t.条件格式.append((
                 f"{column}2:{column}{len(t.表) + 1}",
-                _公式规则(formula=[f'OR({column}2="有差额",{column}2="余额不连续")'],
-                          fill=_填充类("solid", fgColor="FFF2CC"),
-                          font=_字体类(color="9C0006"))))
+                条件规则(公式=[f'OR({column}2="有差额",{column}2="余额不连续")'],
+                         填充色="FFF2CC", 字色="9C0006")))
     order = [簿.取表(n) for n in _紧凑阅读表]
     簿.表 = order + [t for t in 簿.表 if all(t is not o for o in order)]
     簿.active = 0

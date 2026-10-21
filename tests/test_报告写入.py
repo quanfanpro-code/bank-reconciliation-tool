@@ -2,12 +2,11 @@
 import pandas as pd
 import pytest
 from openpyxl import load_workbook
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import PatternFill
 
 
 def _小计划():
     from 排版计划 import 簿计划, 表计划, 列计划, 行计划, 格样式
+    from 排版共享 import 条件规则
 
     表头样式 = 格样式(字体名="微软雅黑", 字号=10, 加粗=True, 填充色="FF1F4E79",
                     填充类型="solid", 水平="center", 垂直="center")
@@ -21,7 +20,7 @@ def _小计划():
         覆盖={(2, 2): 格样式(填充色="FFFFF2CC", 填充类型="solid", 数字格式="#,##0.00"),
               (2, 3): 格样式(批注=("提示", "核对"), 超链接="#测试表!A1")},
         验证=[{"type": "list", "formula1": '"是,否"', "sqref": "C2", "allow_blank": True}],
-        条件格式=[("B2:B3", FormulaRule(formula=["B2>1"], fill=PatternFill("solid", fgColor="FFFF0000")))],
+        条件格式=[("B2:B3", 条件规则(公式=["B2>1"], 填充色="FF0000"))],
         冻结="B2",
         筛选="A1:C3",
         tab色="FF0000",
@@ -152,16 +151,24 @@ def test_大表快速通道_列默认样式(tmp_path, monkeypatch):
     渲染簿计划(簿计划(表=[表]), str(输出))
     wb = load_workbook(输出)
     ws = wb["大表"]
-    # 普通数据格：无逐格样式，列默认兜底（读回可见列字体/格式）
+    # 普通数据格：无逐格样式，列默认兜底（字体经列样式继承读回；数字格式见下方 XML 断言）
     assert ws["B4"].value == 3000.0
     assert ws["B4"].font.name == "MiSans" and ws["B4"].font.size == 9
-    assert ws["B4"].number_format == "#,##0.00;[Red]-#,##0.00"
-    # 列默认样式带格变换效果：MiSans 9、金额列右对齐千分位、文本列左对齐
-    # （openpyxl 读回不还原列维度对象的样式，但数据格继承生效，Excel 同理）
+    # 列默认样式带格变换效果：MiSans 9、文本列左对齐（单元格继承读回）
     assert ws["A2"].font.name == "MiSans" and ws["A2"].font.size == 9
     assert ws["A2"].alignment.horizontal == "left"
-    assert ws["B2"].number_format == "#,##0.00;[Red]-#,##0.00"
-    assert ws["B2"].alignment.horizontal == "right"
+    # 金额列的千分位/右对齐经列样式承载：openpyxl 读不回，直接断言 XML
+    import re
+    import zipfile
+    zp = zipfile.ZipFile(输出)
+    表 = zp.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    样 = zp.read("xl/styles.xml").decode("utf-8")
+    列格 = re.search(r'<col min="2" max="2"[^>]*style="(\d+)"', 表)
+    assert 列格, "金额列应带列样式"
+    xf段 = re.search(r"<cellXfs count=\"\d+\">(.*?)</cellXfs>", 样, re.S).group(1)
+    xf = re.findall(r"<xf [^>]*>", xf段)[int(列格.group(1))]
+    assert 'applyNumberFormat="1"' in xf and 'applyAlignment="1"' in xf
+    assert "#,##0.00;[Red]-#,##0.00" in 样 and 'horizontal="right"' in 样
     # 表头仍是显式表头样式
     assert ws["A1"].font.name == "微软雅黑" and ws["A1"].font.bold
     # 覆盖格（超链接）走完整路径：MiSans 字体 + 超链接生效

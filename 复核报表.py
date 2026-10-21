@@ -4,10 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 from 报告列识别 import identify_columns
-from openpyxl.worksheet.datavalidation import DataValidation
 
 from 复核事项 import build_review_items
 from 报告展示 import build_display_tables, format_display_sheets
@@ -143,6 +140,8 @@ def build_review_tables(reporter, tables):
 
 
 def apply_review_presentation(book):
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
     """普通Excel公式承接人工选择；按稳定事项和原记录号查找，不依赖行序。"""
     if '复核事项索引' not in book.sheetnames:
         return
@@ -337,6 +336,8 @@ def _summary_formulas(book,sheets,headers,rng):
 
 
 def _format_sheets(book):
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
     duplicates={'疑点事项','自动归集事项','银行侧待查','日记账侧待查','逐笔匹配','整组勾稽','匹配组成','月度统计','其他可能对应明细'}
     technical={'运行参数','大模型辅助明细','解析异常明细','运行资料与映射','数据入口处置','复核事项索引','复核候选选项','复核候选组成'}
     order=[book[name] for name in 主表 if name in book]

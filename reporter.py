@@ -14,11 +14,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.worksheet.datavalidation import DataValidation
+# openpyxl 仅旧排版回退路径使用，延迟到函数内导入：生产单次写入路径零 openpyxl
 
 from precision_engine import PrecisionEngine
 from data_structures import InitialBalanceWarning, MatcherConfig
@@ -32,8 +28,8 @@ from balance import (
     BalanceReconciler,
     check_balance_continuity as check_row_balance_continuity,
 )
-from make_excel import make_excel, atomic_output_path
 from 复核报表 import build_review_tables, apply_review_presentation
+from 排版共享 import atomic_output_path
 from llm_assistant import redact_sensitive_text, sanitize_url
 from 非工作日日历 import 判定日期
 
@@ -244,6 +240,7 @@ class Reporter:
         """核对结论后处理：只高亮实际的期初余额警告行。"""
         if not has_initial_warning:
             return
+        from openpyxl.styles import Font, PatternFill
         warning_font = Font(color='FF0000', bold=True, size=14)
         warning_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
         max_row = ws.max_row or 7
@@ -262,6 +259,7 @@ class Reporter:
     @staticmethod
     def _postprocess_details(ws) -> None:
         """按风险等级标示差异，不把正负方向误当成好坏。"""
+        from openpyxl.styles import Font, PatternFill
         max_row = ws.max_row or 1
         max_col = ws.max_column or 1
 
@@ -322,6 +320,7 @@ class Reporter:
     @staticmethod
     def _postprocess_diff_columns(ws) -> None:
         """统计表中的非零差额统一提示，不按正负方向判断好坏。"""
+        from openpyxl.styles import PatternFill
         max_row = ws.max_row or 1
         max_col = ws.max_column or 1
         difference_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
@@ -2130,6 +2129,9 @@ class Reporter:
         return result
 
     def _apply_report_presentation(self, workbook: Any) -> None:
+        from openpyxl.styles import Alignment
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.datavalidation import DataValidation
         technical_sheets = {"运行参数", "大模型辅助明细", "解析异常明细"}
         technical_columns = {
             "候选ID", "阶段", "最终状态", "处理原因", "综合可信度",
@@ -2457,6 +2459,8 @@ class Reporter:
         )
 
     def _旧排版写入(self, output_path, tables, total_rows, report_started):
+        from make_excel import make_excel
+        from openpyxl import load_workbook
         write_started = time.perf_counter()
         self._log(
             f"开始写入 Excel 工作簿：{len(tables):,} 个工作表，"

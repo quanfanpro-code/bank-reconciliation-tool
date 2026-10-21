@@ -1,12 +1,8 @@
-﻿"""只组织已有核对结果的阅读展示；不参与匹配、风险分流或结果计算。"""
+"""只组织已有核对结果的阅读展示；不参与匹配、风险分流或结果计算。"""
 from collections import defaultdict
 from decimal import Decimal
 
 import pandas as pd
-from openpyxl.comments import Comment
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
 
 阅读表 = ('核对结论', '非工作日交易', '月度核对', '逐笔核对', '整组核对', '人工全查', '人工抽样', '未对应记录')
@@ -119,6 +115,8 @@ def _headers(sheet):
 
 
 def format_display_sheets(book):
+    from openpyxl.comments import Comment
+    from openpyxl.utils import get_column_letter
     """引用现有公式的结果，再设置阅读顺序、折叠与唯一填写入口。"""
     references = {name: (_headers(book[name]), max(2, book[name].max_row)) for name in ('核对明细', '复核事项索引', '人工全查', '人工抽样')}
     def find(name, key_label, key, label):
@@ -203,6 +201,9 @@ def format_display_sheets(book):
 
 
 def _style(sheet):
+    from openpyxl.comments import Comment
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
     hs = _headers(sheet)
     manual = sheet.title in ('人工全查', '人工抽样')
     grouped = '行别' in hs
@@ -280,6 +281,9 @@ def _style(sheet):
 
 
 def _monthly(sheet):
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
     hs = _headers(sheet)
     end = sheet.max_row
     balance_cols = [hs[x] for x in ('银行-月末余额', '序时账-月末余额', '余额差额')]
