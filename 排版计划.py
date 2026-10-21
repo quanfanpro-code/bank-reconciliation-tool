@@ -872,6 +872,19 @@ def _刷主表样式(簿: 簿计划):
             if cov.属性元组() == (None,) * len(cov.属性元组()):
                 del tp.覆盖[(r, c)]
         tp.行计划取(1).高 = 36
+        # 列基础样式与行无关：先按列设置一次；取值用整列数组，避免逐格 pandas 标量读取
+        j映射 = {label: column - tp.前置空列 - 1 for label, column in hs.items()}
+        for label, j in j映射.items():
+            base = tp.列计划取(j).基础样式 or 格样式()
+            if any(k in label for k in ("金额", "收入", "支出", "余额", "差额", "发生额差")) \
+                    and label != "余额说明":
+                base.数字格式 = "#,##0.00;[Red]-#,##0.00"
+            if label == "日期":
+                base.数字格式 = "yyyy-mm-dd"
+            tp.列计划取(j).基础样式 = base
+        列数组 = {label: df.iloc[:, j].tolist() for label, j in j映射.items()
+                 if 0 <= j < len(df.columns)}
+        行别列 = 列数组.get("行别")
         for ri in range(len(df)):
             row = ri + 2
             height = 32
@@ -881,15 +894,7 @@ def _刷主表样式(簿: 簿计划):
                 填充色="F1F5F8" if row % 2 else "FFFFFF", 填充类型="solid",
                 水平="", 垂直="top", 自动换行=True))
             for label, column in hs.items():
-                j = column - tp.前置空列 - 1
-                base = tp.列计划取(j).基础样式 or 格样式()
-                if any(k in label for k in ("金额", "收入", "支出", "余额", "差额", "发生额差")) \
-                        and label != "余额说明":
-                    base.数字格式 = "#,##0.00;[Red]-#,##0.00"
-                if label == "日期":
-                    base.数字格式 = "yyyy-mm-dd"
-                tp.列计划取(j).基础样式 = base
-                v = df.iat[ri, j]
+                v = 列数组[label][ri] if label in 列数组 else None
                 if not (isinstance(v, str) and v.startswith("=")) and label not in hidden:
                     width = _主表列宽.get(label, 17)
                     lines = sum(
@@ -897,7 +902,7 @@ def _刷主表样式(簿: 簿计划):
                         for part in str(v or "").split("\n"))
                     height = max(height, lines * 15 + 5)
                 if label == "人工核对结果" and tp.名称 in ("人工全查", "人工抽样") \
-                        and df.iat[ri, hs["行别"] - tp.前置空列 - 1] == "核对事项":
+                        and 行别列 is not None and 行别列[ri] == "核对事项":
                     tp.盖格(row, column, 格样式(填充色="FFF2CC", 填充类型="solid"))
             rp.高 = min(height, 300)
         tp.打印 = {"orientation": "landscape", "paperSize": 8, "fitToWidth": 1,
@@ -1281,13 +1286,19 @@ def _写事项(簿: 簿计划):
                           入选原因 as _plain_reason, 短结果 as _short_result)
 
     明细 = 簿.取表("核对明细")
-    hs_明细 = _列定位(明细)
     records = _defaultdict(lambda: {"银行流水": [], "序时账": []})
     first_record = {}
-    for row in range(2, len(明细.表) + 2):
-        item = {label: _读值(明细, row, col) for label, col in hs_明细.items()}
+    # 一次性转记录字典（C 层完成），替代逐格 pandas 标量读取
+    for 序, item in enumerate(明细.表.to_dict(orient="records"), 2):
+        for k, v in item.items():
+            if isinstance(v, float) and _math.isnan(v):
+                item[k] = None
+            elif isinstance(v, str) and v == "":
+                item[k] = None
+            elif v is pd.NaT:
+                item[k] = None
         records[item["事项编号"]][item["来源"]].append(item)
-        first_record.setdefault(item["事项编号"], row)
+        first_record.setdefault(item["事项编号"], 序)
     manual = {}
     for name in _紧凑人工方式:
         tp = 簿.取表(name)

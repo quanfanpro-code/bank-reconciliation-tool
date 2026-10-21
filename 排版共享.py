@@ -254,9 +254,17 @@ def _字符宽(text) -> int:
 
 
 def 列宽估算(header: str, series: pd.Series) -> int:
-    """原 make_excel._estimate_column_width：表头和数据最大字符宽 + padding。"""
+    """原 make_excel._estimate_column_width：表头和数据最大字符宽 + padding。
+
+    超过 5000 行的表只取样前 500 个非空值：列宽是视觉近似（用户口径
+    "看起来差不多"），30 万行全量逐字计算没有意义且占排版耗时的近一成；
+    小表全量扫描，保证金样逐格一致。
+    """
     max_w = _字符宽(header)
-    for v in series.dropna():
+    值列 = series.dropna()
+    if len(值列) > 5000:
+        值列 = 值列.head(500)
+    for v in 值列:
         try:
             w = _字符宽(str(v))
             if w > max_w:
