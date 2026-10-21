@@ -422,3 +422,429 @@ def 应用通用排版(簿: 簿计划):
                     if item in formulas:
                         结论.表.iat[ri, vi] = formulas[item]
                 簿.自动重算 = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 复核层回放（翻译自 复核报表.apply_review_presentation / _summary_formulas /
+# _format_sheets；逐条对照源逻辑）
+# ═══════════════════════════════════════════════════════════════════════════
+
+from collections import defaultdict as _defaultdict
+
+
+def _列定位(tp: 表计划) -> dict:
+    """报告列识别.identify_columns 的计划层等价：表头 → 绝对列号。"""
+    定位 = {}
+    for i, c in enumerate(tp.表.columns):
+        label = str(c).strip() if c is not None else ""
+        if not label:
+            continue
+        if label in 定位:
+            raise ValueError(f"工作表“{tp.名称}”存在重复列名“{label}”，请区分列名后再操作")
+        定位[label] = tp.前置空列 + i + 1
+    return 定位
+
+
+def _写值(tp: 表计划, row: int, col: int, value):
+    tp.表.iat[row - 2, col - tp.前置空列 - 1] = value
+
+
+def _读值(tp: 表计划, row: int, col: int):
+    return tp.表.iat[row - 2, col - tp.前置空列 - 1]
+
+
+def 应用复核层(簿: 簿计划):
+    """翻译 复核报表.apply_review_presentation（末尾的 format_display_sheets
+    由 应用展示层 紧接回放，保持同样的调用次序）。"""
+    if 簿.取表("复核事项索引") is None:
+        return
+    sheets = {}
+    for n in ("复核事项索引", "复核候选选项", "复核候选组成", "核对明细",
+              "月度核对", "人工全查", "人工抽样"):
+        t = 簿.取表(n)
+        if t is None:
+            raise KeyError(n)
+        sheets[n] = t
+    headers = {n: _列定位(t) for n, t in sheets.items()}
+
+    def 行数(n):
+        return len(sheets[n].表) + 1
+
+    def cell(n, label, row):
+        return f"{_字母(headers[n][label])}{row}"
+
+    def rng(n, label):
+        letter = _字母(headers[n][label])
+        return f"'{n}'!${letter}$2:${letter}${max(2, 行数(n))}"
+
+    def put(n, label, row, formula):
+        _写值(sheets[n], row, headers[n][label], formula)
+
+    def find(n, label, key, key_label="事项编号", default='""'):
+        return f"IFERROR(INDEX({rng(n,label)},MATCH({key},{rng(n,key_label)},0)),{default})"
+
+    ix, op, mem, detail = "复核事项索引", "复核候选选项", "复核候选组成", "核对明细"
+    index_rows = {str(_读值(sheets[ix], r, headers[ix]["事项编号"])): r
+                  for r in range(2, 行数(ix) + 1)}
+    option_rows = _defaultdict(list)
+    for row in range(2, 行数(op) + 1):
+        item_id = str(_读值(sheets[op], row, headers[op]["事项编号"]))
+        option_rows[item_id].append(row)
+
+    # 稳定编号查找人工输入
+    for item_id, row in index_rows.items():
+        key = cell(ix, "事项编号", row)
+        mode = _读值(sheets[ix], row, headers[ix]["核对方式"])
+        raw_choice = find(mode, "人工核对结果", key, "填报编号") \
+            if mode in ("人工全查", "人工抽样") else '""'
+        choice = f'IF({raw_choice}="","",{raw_choice})'
+        put(ix, "人工核对结果", row, "=" + choice)
+
+    for mode in ("人工全查", "人工抽样"):
+        tp = sheets[mode]
+        for row in range(2, 行数(mode) + 1):
+            item_id = _读值(tp, row, headers[mode]["事项编号"])
+            if not item_id:
+                continue
+            if _读值(tp, row, headers[mode]["行别"]) != "核对事项":
+                put(mode, "人工核对结果", row,
+                    "=" + find(ix, "人工核对结果", cell(mode, "事项编号", row)))
+                put(mode, "当前核对结论", row,
+                    "=" + find(ix, "当前核对结论", cell(mode, "事项编号", row)))
+                continue
+            choices = [_读值(sheets[op], r, headers[op]["选择文字"])
+                       for r in option_rows.get(str(item_id), [])]
+            choices.append("否定对应" if choices else "保留未对应")
+            tp.验证.append({
+                "type": "list",
+                "formula1": '"' + ",".join(choices) + '"',
+                "allow_blank": True,
+                "errorTitle": "请选择本事项的结果",
+                "error": "请选择下拉列表中的对应结果。",
+                "showErrorMessage": True,
+                "errorStyle": "stop",
+                "sqref": cell(mode, "人工核对结果", row),
+            })
+            put(mode, "当前核对结论", row,
+                "=" + find(ix, "当前核对结论", cell(mode, "事项编号", row)))
+
+    for row in range(2, 行数(op) + 1):
+        key = cell(op, "事项编号", row)
+        choice = find(ix, "人工核对结果", key)
+        put(op, "人工选中", row, f'=--({choice}={cell(op,"选择文字",row)})')
+
+    for row in range(2, 行数(mem) + 1):
+        opt = cell(mem, "选项编号", row)
+        key = cell(mem, "原始记录号", row)
+        put(mem, "人工占用", row, "=" + find(op, "人工选中", opt, "选项编号", "0"))
+        put(mem, "占用次数", row,
+            f'=SUMIF({rng(mem,"原始记录号")},{key},{rng(mem,"人工占用")})')
+
+    for row in range(2, 行数(op) + 1):
+        opt = cell(op, "选项编号", row)
+        manual = cell(op, "人工选中", row)
+        choice = find(ix, "人工核对结果", cell(op, "事项编号", row))
+        put(op, "选择冲突", row,
+            f'=COUNTIFS({rng(mem,"选项编号")},{opt},{rng(mem,"占用次数")},">1")')
+        put(op, "有效对应", row,
+            f'=IF({manual}=1,--({cell(op,"选择冲突",row)}=0),'
+            f'IF(AND({cell(op,"自动确认",row)}=1,{choice}=""),'
+            f'--(SUMIF({rng(mem,"选项编号")},{opt},{rng(mem,"占用次数")})=0),0))')
+
+    for row in range(2, 行数(mem) + 1):
+        opt = cell(mem, "选项编号", row)
+        put(mem, "实际生效", row, "=" + find(op, "有效对应", opt, "选项编号", "0"))
+        put(mem, "生效记录号", row,
+            f'=IF({cell(mem,"实际生效",row)}=1,{cell(mem,"原始记录号",row)},"")')
+        put(mem, "显示结果", row, "=" + find(op, "显示结果", opt, "选项编号"))
+        put(mem, "已对平", row,
+            f'=IF({cell(mem,"实际生效",row)}=1,'
+            f'--({find(op,"差异金额",opt,"选项编号","1")}=0),0)')
+
+    for item_id, row in index_rows.items():
+        key = cell(ix, "事项编号", row)
+        choice = cell(ix, "人工核对结果", row)
+        selected = f'SUMIFS({rng(op,"人工选中")},{rng(op,"事项编号")},{key})'
+        conflict = f'SUMIFS({rng(op,"选择冲突")},{rng(op,"事项编号")},{key},{rng(op,"人工选中")},1)'
+        effective = f'SUMIFS({rng(op,"有效对应")},{rng(op,"事项编号")},{key})'
+        mode = _读值(sheets[ix], row, headers[ix]["核对方式"])
+        default = ("待人工核对" if mode in ("人工全查", "人工抽样")
+                   else "原对应被人工选择替代，记录未对应" if mode == "自动确认"
+                   else "留存备查，未作人工确认")
+        formula = (f'=IF({choice}="否定对应","原对应已否定，记录恢复未对应",'
+                   f'IF({choice}="保留未对应","已人工核对，保留未对应",'
+                   f'IF({selected}>0,IF({conflict}>0,"所选对应重复使用原记录",'
+                   f'"已确认所选对应；原始差额及期间保留"),'
+                   f'IF({effective}>0,"程序已确认对应",'
+                   f'IF({choice}<>"","选择无效","{default}")))))')
+        if not option_rows.get(item_id):
+            all_records = f'COUNTIF({rng(detail,"事项编号")},{key})'
+            effective_records = (f'COUNTIFS({rng(detail,"事项编号")},{key},'
+                                 f'{rng(detail,"当前对应")},"?*")')
+            formula = (f'=IF({effective_records}>0,'
+                       f'IF({effective_records}={all_records},"原记录已由其他事项建立对应",'
+                       f'"部分原记录已由其他事项建立对应，其余仍未对应"),{formula[1:]})')
+        put(ix, "当前核对结论", row, formula)
+
+    for row in range(2, 行数(detail) + 1):
+        key = cell(detail, "原始记录号", row)
+        lookup = f'MATCH({key},{rng(mem,"生效记录号")},0)'
+        put(detail, "当前对应", row,
+            f'=IFERROR(INDEX({rng(mem,"事项编号")},{lookup}),"")')
+        put(detail, "当前核对编号", row,
+            "=" + find(ix, "核对编号", cell(detail, "当前对应", row)))
+        initial_id = str(_读值(sheets[detail], row, headers[detail]["事项编号"]))
+        initial = find(ix, "当前核对结论", cell(detail, "事项编号", row))
+        if option_rows.get(initial_id):
+            choice = find(ix, "人工核对结果", cell(detail, "事项编号", row))
+            initial = (f'IF({choice}<>"","该记录当前未对应；请按当前对应列查看",'
+                       f'IF({find(ix,"核对方式",cell(detail,"事项编号",row))}="自动确认",'
+                       f'"原对应已被替代，该记录当前未对应",{initial}))')
+        put(detail, "当前核对结果", row,
+            f'=IFERROR(INDEX({rng(mem,"显示结果")},{lookup}),{initial})')
+        put(detail, "已对平金额", row,
+            f'=IFERROR(INDEX({rng(mem,"已对平")},{lookup})*ABS({cell(detail,"金额",row)}),0)')
+        for category in ("收入", "支出"):
+            put(detail, "已确认" + category + "差", row,
+                f'=IF({cell(detail,"当前对应",row)}<>"",'
+                f'{cell(detail,category+"差贡献",row)},0)')
+
+    monthly = sheets["月度核对"]
+    for row in range(2, 行数("月度核对") + 1):
+        month = cell("月度核对", "月份", row)
+        for category in ("收入", "支出"):
+            put("月度核对", "已确认" + category + "差", row,
+                f'=SUMIF({rng(detail,"月份")},{month},{rng(detail,"已确认"+category+"差")})')
+            put("月度核对", "未确认" + category + "差", row,
+                f'={cell("月度核对",category+"金额差额",row)}'
+                f'-{cell("月度核对","已确认"+category+"差",row)}')
+        bal_headers = headers["月度核对"]
+        if "余额差额" not in bal_headers:
+            put("月度核对", "余额说明", row, "本次未提供双方可用余额")
+        else:
+            b = cell("月度核对", "银行-月末余额", row)
+            j = cell("月度核对", "序时账-月末余额", row)
+            put("月度核对", "余额说明", row,
+                f'=IF(AND(ISNUMBER({b}),ISNUMBER({j})),"按双方原始余额核对","本月余额无法完整确认")')
+            if row > 2:
+                previous = cell("月度核对", "余额差额", row - 1)
+                current = cell("月度核对", "余额差额", row)
+                inc = cell("月度核对", "收入金额差额", row)
+                exp = cell("月度核对", "支出金额差额", row)
+                put("月度核对", "余额衔接差", row,
+                    f'=IF(AND(ISNUMBER({b}),ISNUMBER({j}),ISNUMBER({previous})),'
+                    f'{current}-{previous}-{inc}+{exp},"")')
+
+    差异组成 = 簿.取表("月度差异组成")
+    if 差异组成 is not None:
+        hs = _列定位(差异组成)
+        for row in range(2, len(差异组成.表) + 2):
+            key = f'{_字母(hs["事项编号"])}{row}'
+            month = f'{_字母(hs["月份"])}{row}'
+            for category in ("收入", "支出"):
+                confirmed = f'{_字母(hs["已确认"+category+"差"])}{row}'
+                difference = f'{_字母(hs[category+"差额"])}{row}'
+                _写值(差异组成, row, hs["已确认" + category + "差"],
+                      f'=SUMIFS({rng(detail,"已确认"+category+"差")},'
+                      f'{rng(detail,"事项编号")},{key},{rng(detail,"月份")},{month})')
+                _写值(差异组成, row, hs["未确认" + category + "差"],
+                      f'={difference}-{confirmed}')
+            remaining = (f'COUNTIFS({rng(detail,"事项编号")},{key},{rng(detail,"月份")},{month})'
+                         f'-COUNTIFS({rng(detail,"事项编号")},{key},{rng(detail,"月份")},{month},'
+                         f'{rng(detail,"当前对应")},"?*")')
+            _写值(差异组成, row, hs["当前核对结论"],
+                  f'=IF({remaining}>0,"本月原记录仍有未对应；详见核对明细",'
+                  f'"本月原记录均已建立对应，原始差额保留")')
+
+    _结论汇总(簿, sheets, headers, rng)
+    _刷主表样式(簿)
+
+
+def _结论汇总(簿: 簿计划, sheets: dict, headers: dict, rng):
+    """翻译 复核报表._summary_formulas：改写、追加、排序、隐藏核对结论行。"""
+    tp = 簿.取表("核对结论")
+    hs = _列定位(tp)
+    if not {"项目", "数值"} <= hs.keys():
+        return
+    df = tp.表
+    item_col, value_col = hs["项目"], hs["数值"]
+    item_idx, value_idx = item_col - tp.前置空列 - 1, value_col - tp.前置空列 - 1
+    rows = {df.iat[r, item_idx]: r + 2 for r in range(len(df))}
+
+    def set_value(label, value):
+        row = rows.get(label)
+        if row is None:
+            new = [None] * len(df.columns)
+            new[item_idx] = label
+            new[value_idx] = value
+            df.loc[len(df)] = new
+            row = len(df) + 1
+            rows[label] = row
+        else:
+            df.iat[row - 2, value_idx] = value
+
+    ix = "复核事项索引"
+    for risk in ("低风险", "中风险", "高风险", "范围未知"):
+        set_value(risk + "事项数", f'=COUNTIF({rng(ix,"风险等级")},"{risk}")')
+        set_value(risk + "事项金额", f'=SUMIF({rng(ix,"风险等级")},"{risk}",{rng(ix,"影响金额")})')
+    set_value("中风险抽样总数", f'=COUNTIF({rng(ix,"风险等级")},"中风险")')
+    set_value("中风险抽中待核查数", f'=COUNTIF({rng(ix,"核对方式")},"人工抽样")')
+    set_value("当前未对应原始记录数",
+              f'=COUNTA({rng("核对明细","原始记录号")})-COUNTIF({rng("核对明细","当前对应")},"?*")')
+    set_value("使用顺序", "先看月度发生额和余额，再看核对明细；人工全查及人工抽样只在黄色格选择结果。多笔业务的组成直接展开。")
+    set_value("金额差额口径", "收入与支出分别比较，差额不相互抵销。人工表金额为各侧净额，差额为收入差和支出差绝对值之和；原始各笔金额见组成。")
+    set_value("当前覆盖率口径", "只统计有效对应且差额为零的原记录绝对金额；已人工查看但仍未对应或仍有差额，不计作已对平。")
+    set_value("月度说明", "月度始终显示双方原始发生额和余额；已确认差表示对应关系已确认，金额与记账月份均未改写；月度差异组成可查看仍未确认部分。")
+    set_value("专题说明", "退款冲销重付、手续费及净额、截止性差异、重复线索及余额检查等，有事项时直接显示；月度笔数与解释分项列、技术留存表可在Excel取消隐藏查看。")
+    pending = []
+    for mode in ("人工全查", "人工抽样"):
+        mode_range = rng(ix, "核对方式")
+        choice = rng(ix, "人工核对结果")
+        set_value(mode + "事项数", f'=COUNTIF({mode_range},"{mode}")')
+        expression = (f'COUNTIFS({mode_range},"{mode}",{choice},"")'
+                      f'+COUNTIFS({mode_range},"{mode}",{rng(ix,"当前核对结论")},"选择无效")'
+                      f'+COUNTIFS({mode_range},"{mode}",{rng(ix,"当前核对结论")},"所选对应重复使用原记录")')
+        pending.append(expression)
+        set_value(mode + "未核对数", "=" + expression)
+    set_value("待处理事项数", "=" + "+".join(pending))
+    set_value("已处理事项数", f'=COUNTIF({rng(ix,"人工核对结果")},"<>")')
+    set_value("人工选择冲突数", f'=COUNTIF({rng(ix,"当前核对结论")},"所选对应重复使用原记录")')
+    set_value("人工结果说明", "在人工全查或人工抽样中选择结果；确认不改变原始金额和期间，否定取消对应，候选冲突不计入有效覆盖。")
+    for source, label in (("银行流水", "银行"), ("序时账", "序时账")):
+        numerator = f'SUMIF({rng("核对明细","来源")},"{source}",{rng("核对明细","已对平金额")})'
+        明细 = sheets["核对明细"]
+        金额idx = headers["核对明细"]["金额"] - 明细.前置空列 - 1
+        来源idx = headers["核对明细"]["来源"] - 明细.前置空列 - 1
+        total = sum(abs(float(明细.表.iat[r, 金额idx] or 0))
+                    for r in range(len(明细.表))
+                    if 明细.表.iat[r, 来源idx] == source)
+        set_value(label + "当前已对平金额覆盖率",
+                  f"={numerator}/{total}" if total else 0)
+        tp.覆盖[(rows[label + "当前已对平金额覆盖率"], value_col)] = 格样式(数字格式="0.00%")
+    visible = ["使用顺序", "核对范围", "范围说明", "银行有效交易笔数", "日记账有效交易笔数",
+               "实际执行重要性水平", "明显微小错报临界值", "人工全查事项数", "人工全查未核对数",
+               "人工抽样事项数", "人工抽样未核对数", "待处理事项数", "已处理事项数",
+               "人工选择冲突数", "当前未对应原始记录数", "银行当前已对平金额覆盖率",
+               "序时账当前已对平金额覆盖率", "余额核对", "期初余额差额", "期初余额状态",
+               "人工结果说明", "金额差额口径", "当前覆盖率口径", "月度说明", "专题说明"]
+    visible[4:4] = ["非工作日银行收付笔数", "非工作日银行收款笔数", "非工作日银行收款金额",
+                    "非工作日银行付款笔数", "非工作日银行付款金额", "银行交易日历未覆盖笔数",
+                    "非工作日日历口径", "非工作日日历来源"]
+    set_value("已处理事项数",
+              f'=COUNTIF({rng(ix,"人工核对结果")},"?*")'
+              f'-COUNTIF({rng(ix,"当前核对结论")},"选择无效")'
+              f'-COUNTIF({rng(ix,"当前核对结论")},"所选对应重复使用原记录")')
+    contents = []
+    for r in range(2, len(df) + 2):
+        cov = tp.覆盖.get((r, value_col))
+        contents.append((df.iat[r - 2, item_idx], df.iat[r - 2, value_idx],
+                         cov.数字格式 if cov and cov.数字格式 else "General"))
+        tp.覆盖.pop((r, value_col), None)
+    priority = {label: number for number, label in enumerate(visible)}
+    contents.sort(key=lambda item: priority.get(item[0], len(priority)))
+    for row, (label, value, number_format) in enumerate(contents, 2):
+        df.iat[row - 2, item_idx] = label
+        df.iat[row - 2, value_idx] = value
+        if number_format != "General":
+            tp.覆盖[(row, value_col)] = 格样式(数字格式=number_format)
+        tp.行计划取(row).隐藏 = label not in visible
+
+
+_复核主表 = ("核对结论", "月度核对", "核对明细", "人工全查", "人工抽样", "每日统计")
+_复核副表 = ("月度差异组成", "其他对应供选择")
+_重复表 = {"疑点事项", "自动归集事项", "银行侧待查", "日记账侧待查", "逐笔匹配",
+           "整组勾稽", "匹配组成", "月度统计", "其他可能对应明细"}
+_技术留存 = {"运行参数", "大模型辅助明细", "解析异常明细", "运行资料与映射",
+             "数据入口处置", "复核事项索引", "复核候选选项", "复核候选组成"}
+_主表列宽 = {"核对编号": 10, "当前核对编号": 12, "事项编号": 24, "行别": 12, "核对原因": 28,
+             "银行记录": 36, "序时账记录": 36, "银行金额": 16, "序时账金额": 16, "差额": 15,
+             "人工核对结果": 24, "当前核对结论": 36, "备注": 25, "原始出处": 24, "来源": 12,
+             "日期": 13, "摘要": 30, "对方及凭证": 24, "金额": 16, "程序结论": 18, "核对方式": 14,
+             "当前对应": 24, "当前核对结果": 34, "月份": 12, "余额说明": 30, "项目": 29,
+             "数值": 70, "摘要及对方": 38, "关系说明": 40}
+
+
+def _刷主表样式(簿: 簿计划):
+    """翻译 复核报表._format_sheets：表序、可见性、主表样式、打印。"""
+    order = [t for n in _复核主表 if (t := 簿.取表(n)) is not None]
+    簿.表 = order + [t for t in 簿.表 if t not in order]
+    for tp in 簿.表:
+        df = tp.表
+        has_rows = len(df) > 0 and any(
+            v is not None and not (isinstance(v, float) and _math.isnan(v))
+            for row in df.itertuples(index=False, name=None) for v in row)
+        tp.状态 = ("visible" if (tp.名称 in _复核主表
+                   or (tp.名称 not in _重复表 | _技术留存 and has_rows))
+                   else "hidden")
+        if tp.名称 not in _复核主表 and tp.名称 not in _复核副表:
+            continue
+        hs = _列定位(tp)
+        if not hs:
+            continue
+        first = min(hs.values())
+        while len(tp.前部列) < first - 1:
+            tp.前部列.append(列计划())
+        for column in range(1, first):
+            tp.前部列[column - 1].隐藏 = True
+        hidden = ({"原始记录号", "收入差贡献", "支出差贡献", "已对平金额",
+                   "已确认收入差", "已确认支出差"} if tp.名称 == "核对明细" else set())
+        if "核对编号" in hs:
+            hidden.add("事项编号")
+        if tp.名称 == "核对明细":
+            hidden.update(("月份", "当前对应"))
+        if tp.名称 in ("人工全查", "人工抽样"):
+            hidden.add("填报编号")
+        if tp.名称 == "月度核对":
+            hidden.update(label for label in hs
+                          if "笔数" in label or "变动净额" in label
+                          or label.startswith("已确认") or label.startswith("未确认"))
+        for label, column in hs.items():
+            cp = tp.列计划取(column - tp.前置空列 - 1)
+            cp.隐藏 = label in hidden
+            cp.宽 = _主表列宽.get(label, 17)
+        tp.网格线 = False
+        tp.缩放 = 90
+        tp.冻结 = f"{_字母(first + 1)}2"
+        ncols = len(df.columns)
+        nrows = 1 + len(df)
+        tp.筛选 = f"{_字母(first)}1:{_字母(tp.前置空列 + ncols)}{max(1, nrows)}"
+        h = tp.表头样式 or 格样式()
+        h.字体名, h.字号, h.加粗, h.字色 = "微软雅黑", 11, True, "FFFFFF"
+        h.填充色, h.填充类型 = "24445B", "solid"
+        h.水平, h.垂直, h.自动换行 = "", "center", True
+        tp.表头样式 = h
+        tp.行计划取(1).高 = 36
+        for ri in range(len(df)):
+            row = ri + 2
+            height = 32
+            rp = tp.行计划取(row)
+            rp.样式 = 合并样式(rp.样式, 格样式(
+                字体名="微软雅黑", 字号=10, 加粗=False, 字色="243746",
+                填充色="F1F5F8" if row % 2 else "FFFFFF", 填充类型="solid",
+                水平="", 垂直="top", 自动换行=True))
+            for label, column in hs.items():
+                j = column - tp.前置空列 - 1
+                base = tp.列计划取(j).基础样式 or 格样式()
+                if any(k in label for k in ("金额", "收入", "支出", "余额", "差额", "发生额差")) \
+                        and label != "余额说明":
+                    base.数字格式 = "#,##0.00;[Red]-#,##0.00"
+                if label == "日期":
+                    base.数字格式 = "yyyy-mm-dd"
+                tp.列计划取(j).基础样式 = base
+                v = df.iat[ri, j]
+                if not (isinstance(v, str) and v.startswith("=")) and label not in hidden:
+                    width = _主表列宽.get(label, 17)
+                    lines = sum(
+                        max(1, (_中文宽(part) + width - 1) // width)
+                        for part in str(v or "").split("\n"))
+                    height = max(height, lines * 15 + 5)
+                if label == "人工核对结果" and tp.名称 in ("人工全查", "人工抽样") \
+                        and df.iat[ri, hs["行别"] - tp.前置空列 - 1] == "核对事项":
+                    tp.盖格(row, column, 格样式(填充色="FFF2CC", 填充类型="solid"))
+            rp.高 = min(height, 300)
+        tp.打印 = {"orientation": "landscape", "paperSize": 8, "fitToWidth": 1,
+                   "fitToHeight": 0, "fitToPage": True, "title_rows": "1:1",
+                   "area": f"{_字母(first)}1:{_字母(tp.前置空列 + ncols)}{nrows}",
+                   "左边距": 0.25, "右边距": 0.25}
+    簿.active = 0
+    簿.自动重算 = True
