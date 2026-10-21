@@ -36,7 +36,6 @@ def test_报告末段失败不能留下半成品或毁掉旧文件(tmp_path, mon
         输出.write_bytes(b"existing reviewed workbook")
     def 末段故障(*args):
         raise OSError("模拟末段写入故障")
-    monkeypatch.setattr(Reporter, "_apply_report_presentation", 末段故障)
     import 报告写入
     monkeypatch.setattr(报告写入, "渲染簿计划", 末段故障)  # 新排版单次写入路径的末段钩子
     with pytest.raises(OSError, match="末段"):
