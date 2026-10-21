@@ -79,6 +79,8 @@ class 表计划:
     缩放: int | None = None
     左上角: str | None = None
     outline汇总在下: bool | None = None
+    显示outline符号: bool | None = None
+    表头含前列: bool = False                 # True 时表头样式也套到前置空列
     打印: dict = field(default_factory=dict)
     前置空列: int = 0
     前部列: list = field(default_factory=list)      # list[列计划]，对应 1..前置空列 的空列
@@ -446,11 +448,24 @@ def _列定位(tp: 表计划) -> dict:
 
 
 def _写值(tp: 表计划, row: int, col: int, value):
-    tp.表.iat[row - 2, col - tp.前置空列 - 1] = value
+    j = col - tp.前置空列 - 1
+    try:
+        tp.表.iat[row - 2, j] = value
+    except (TypeError, ValueError):
+        # 列 dtype 不兼容（如 float 列写文本）→ 转 object 再写
+        列名 = tp.表.columns[j]
+        tp.表[列名] = tp.表[列名].astype(object)
+        tp.表.iat[row - 2, j] = value
 
 
 def _读值(tp: 表计划, row: int, col: int):
-    return tp.表.iat[row - 2, col - tp.前置空列 - 1]
+    """读计划值；NaN/NaT 归一为 None（旧路径保存重载后 NaN 即 None，语义对齐）。"""
+    v = tp.表.iat[row - 2, col - tp.前置空列 - 1]
+    if v is None or v is pd.NaT:
+        return None
+    if isinstance(v, float) and _math.isnan(v):
+        return None
+    return v
 
 
 def 应用复核层(簿: 簿计划):
@@ -767,7 +782,7 @@ _主表列宽 = {"核对编号": 10, "当前核对编号": 12, "事项编号": 2
 def _刷主表样式(簿: 簿计划):
     """翻译 复核报表._format_sheets：表序、可见性、主表样式、打印。"""
     order = [t for n in _复核主表 if (t := 簿.取表(n)) is not None]
-    簿.表 = order + [t for t in 簿.表 if t not in order]
+    簿.表 = order + [t for t in 簿.表 if all(t is not o for o in order)]
     for tp in 簿.表:
         df = tp.表
         has_rows = len(df) > 0 and any(
@@ -848,3 +863,289 @@ def _刷主表样式(簿: 簿计划):
                    "左边距": 0.25, "右边距": 0.25}
     簿.active = 0
     簿.自动重算 = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 展示层回放（翻译自 报告展示.format_display_sheets / _style / _monthly）
+# ═══════════════════════════════════════════════════════════════════════════
+
+from openpyxl.formatting.rule import FormulaRule as _公式规则
+from openpyxl.styles import Font as _字体类, PatternFill as _填充类
+
+_展示金额列 = ("银行金额", "序时账金额", "金额", "差额")
+
+
+def 应用展示层(簿: 簿计划):
+    """翻译 报告展示.format_display_sheets。"""
+    from 报告展示 import 阅读表, 组成金额列
+
+    references = {}
+    for name in ("核对明细", "复核事项索引", "人工全查", "人工抽样"):
+        t = 簿.取表(name)
+        if t is None:
+            raise KeyError(name)
+        references[name] = (_列定位(t), max(2, len(t.表) + 1))
+
+    def find(name, key_label, key, label):
+        headers, end = references[name]
+        value_col = _字母(headers[label])
+        key_col = _字母(headers[key_label])
+        return (f"IFERROR(INDEX('{name}'!${value_col}$2:${value_col}${end},"
+                f"MATCH({key},'{name}'!${key_col}$2:${key_col}${end},0)),\"\")")
+
+    manual_links = {}
+    for name in ("人工全查", "人工抽样"):
+        tp = 簿.取表(name)
+        hs = _列定位(tp)
+        for row in range(2, len(tp.表) + 2):
+            if _读值(tp, row, hs["填报编号"]):
+                manual_links[str(_读值(tp, row, hs["事项编号"]))] = (
+                    name, row, hs["人工核对结果"])
+
+    for name in ("逐笔核对", "整组核对", "未对应记录", "人工全查", "人工抽样"):
+        tp = 簿.取表(name)
+        hs = _列定位(tp)
+        for row in range(2, len(tp.表) + 2):
+            item_coord = f"{_字母(hs['事项编号'])}{row}"
+            current = find("复核事项索引", "事项编号", item_coord, "当前核对结论")
+            if name == "逐笔核对":
+                keys = [f"{_字母(hs[label])}{row}" for label in ("银行记录号", "序时账记录号")]
+                owners = [find("核对明细", "原始记录号", key, "当前对应") for key in keys]
+                numbers = [find("复核事项索引", "事项编号", owner, "核对编号") for owner in owners]
+                bank_location = f'IF({owners[0]}="","未对应","已确认对应（核对"&{numbers[0]}&"）")'
+                journal_location = f'IF({owners[1]}="","未对应","已确认对应（核对"&{numbers[1]}&"）")'
+                current = (f'IF(AND({owners[0]}={owners[1]},{owners[0]}<>""),'
+                           f'IF({owners[0]}={item_coord},{current},'
+                           f'"已并入核对"&{numbers[0]}&"，对应已确认"),'
+                           f'IF(AND({owners[0]}="",{owners[1]}=""),{current},'
+                           f'"银行："&{bank_location}&"；序时账："&{journal_location}))')
+            if name == "整组核对" or (
+                    name in ("人工全查", "人工抽样")
+                    and _读值(tp, row, hs["行别"]) == "核对事项"
+                    and all(_读值(tp, row, hs[label]) is None for label in 组成金额列)):
+                current = f'SUBSTITUTE({current},"原对应被人工选择替代，记录未对应","原对应已被替代；展开查看各笔当前去向")'
+                current = f'SUBSTITUTE({current},"原对应已否定，记录恢复未对应","原对应已否定；展开查看各笔当前去向")'
+            elif name in ("人工全查", "人工抽样") and _读值(tp, row, hs["行别"]) == "核对事项":
+                current = f'SUBSTITUTE({current},"原对应被人工选择替代，记录未对应","原对应已被替代；当前去向见逐笔核对")'
+                current = f'SUBSTITUTE({current},"原对应已否定，记录恢复未对应","原对应已否定；当前去向见逐笔核对")'
+            if "当前核对结论" in hs and (name == "逐笔核对"
+                    or _读值(tp, row, hs["行别"]) == "核对事项"):
+                _写值(tp, row, hs["当前核对结论"], "=" + current)
+            if "原始记录号" in hs and _读值(tp, row, hs["原始记录号"]):
+                target = "当前核对结果" if name == "未对应记录" else "当前记录结果"
+                key = f"{_字母(hs['原始记录号'])}{row}"
+                record_result = "=" + find("核对明细", "原始记录号", key, "当前核对结果")
+                _写值(tp, row, hs[target], record_result)
+                owner = find("核对明细", "原始记录号", key, "当前对应")
+                number = find("核对明细", "原始记录号", key, "当前核对编号")
+                display = (f'=IF(AND({owner}<>"",{owner}<>{item_coord}),'
+                           f'"已并入核对"&{number}&"，对应已确认",{record_result[1:]})')
+                if "当前核对结论" in hs:
+                    _写值(tp, row, hs["当前核对结论"], display)
+                else:
+                    _写值(tp, row, hs[target], display)
+            if "行别" in hs and "其他对应" in str(_读值(tp, row, hs["行别"])):
+                _写值(tp, row, hs["当前核对结论"], None)
+            if name not in ("人工全查", "人工抽样") \
+                    and str(_读值(tp, row, hs["事项编号"])) in manual_links:
+                dest, dest_row, dest_col = manual_links[str(_读值(tp, row, hs["事项编号"]))]
+                dest_headers, dest_end = references[dest]
+                key_col = _字母(dest_headers["填报编号"])
+                label = _读值(tp, row, hs["核对编号"])
+                _写值(tp, row, hs["核对编号"],
+                      f'=HYPERLINK("#\'{dest}\'!"&ADDRESS(MATCH({item_coord},'
+                      f"'{dest}'!${key_col}$2:${key_col}${dest_end},0)+1,{dest_col},4),\"{label}\")")
+        _展示样式(tp)
+    _展示样式(簿.取表("非工作日交易"))
+    _月度(簿.取表("月度核对"))
+
+    summary = 簿.取表("核对结论")
+    hs = _列定位(summary)
+    messages = {
+        "使用顺序": "先看非工作日银行收付示警，再看月度收支与余额、逐笔或整组。整组左侧“＋”展开原始记录。人工全查、人工抽样直接在黄色格选择结果。",
+        "金额差额口径": "收入与支出分别比较。整组汇总金额写在文字格；收入、支出数值列只记录原始组成，避免重复加总。逐笔金额正数为收入、负数为支出。",
+        "月度说明": "月度收支和余额在同一张表。人工确认不改变原始金额、记账月份和客观差额；年度合计只加总发生额。",
+        "专题说明": "非工作日交易按银行所选日期独立示警；每日、退款重付、手续费、跨期、重复线索及输入详情保留在隐藏表中。",
+        "人工结果说明": "黄色格每项只选一次并保存。点击逐笔、整组或未对应表的核对编号，可跳到人工填写处。原始分组保留，当前结果随选择更新。",
+    }
+    for row in range(2, len(summary.表) + 2):
+        label = _读值(summary, row, hs["项目"])
+        if label in messages:
+            _写值(summary, row, hs["数值"], messages[label])
+    summary.列计划取(hs["项目"] - summary.前置空列 - 1).宽 = 28
+    summary.列计划取(hs["数值"] - summary.前置空列 - 1).宽 = 100
+    for row in range(2, len(summary.表) + 2):
+        value = _读值(summary, row, hs["数值"])
+        is_formula = isinstance(value, str) and value.startswith("=")
+        lines = max(1, (len(str(value or "")) * 2 + 99) // 100) if not is_formula else 1
+        summary.行计划取(row).高 = max(25, lines * 15 + 6)
+
+    order = []
+    for n in 阅读表:
+        t = 簿.取表(n)
+        if t is None:
+            raise KeyError(n)
+        order.append(t)
+    簿.表 = order + [t for t in 簿.表 if all(t is not o for o in order)]
+    for tp in 簿.表:
+        tp.状态 = "visible" if tp.名称 in 阅读表 else "hidden"
+    簿.active = 0
+
+
+_展示隐藏列 = {"事项编号", "原始记录号", "银行记录号", "序时账记录号", "填报编号", "当前记录结果"}
+_展示列宽 = {"核对编号": 9, "行别": 12, "银行日期": 12, "序时账日期": 12, "日期": 12,
+             "交易日期": 14, "原日期列名": 18, "原日期值": 18, "原文件行号": 14,
+             "休息日类型": 16, "节日名称": 18, "收支方向": 12, "对方及辅助文字": 36,
+             "银行记录": 34, "序时账记录": 34, "银行金额": 14, "序时账金额": 14, "金额": 14,
+             "差额": 13, "核对差额": 22, "人工核对结果": 24, "当前核对结论": 29,
+             "当前记录结果": 27, "当前核对结果": 30, "核对原因": 36, "核对依据": 36,
+             "核对方式": 12, "摘要": 30, "对方及凭证": 27, "原始出处": 28,
+             "银行原始出处": 26, "序时账原始出处": 26, "备注": 25}
+
+
+def _展示样式(tp: 表计划):
+    """翻译 报告展示._style。"""
+    from 报告展示 import 组成金额列
+
+    hs = _列定位(tp)
+    df = tp.表
+    偏 = tp.前置空列
+    ncols = len(df.columns)
+    nrows = 1 + len(df)
+    manual = tp.名称 in ("人工全查", "人工抽样")
+    grouped = "行别" in hs
+    hidden = set(_展示隐藏列)
+    if manual:
+        hidden.update(("银行金额", "序时账金额", "差额"))
+    while len(tp.前部列) < min(hs.values()) - 1:
+        tp.前部列.append(列计划())
+    for col in range(1, min(hs.values())):
+        tp.前部列[col - 1].隐藏 = True
+    for label, col in hs.items():
+        cp = tp.列计划取(col - 偏 - 1)
+        cp.隐藏 = label in hidden
+        cp.宽 = _展示列宽.get(label, 14)
+        base = cp.基础样式 or 格样式()
+        if label in 组成金额列 or label in _展示金额列:
+            base.数字格式 = "#,##0.00;[Red]-#,##0.00"
+        if label.endswith("日期"):
+            base.数字格式 = "yyyy-mm-dd"
+        cp.基础样式 = base
+    tp.网格线 = False
+    tp.缩放 = 85
+    tp.冻结 = "C2" if grouped else "B2"
+    tp.outline汇总在下 = False
+    tp.显示outline符号 = True
+    tp.筛选 = None if grouped else f"A1:{_字母(偏 + ncols)}{nrows}"
+    tp.行计划取(1).高 = 32
+    h = tp.表头样式 or 格样式()
+    h.字体名, h.字号, h.加粗, h.字色 = "微软雅黑", 10, True, "FFFFFF"
+    h.填充色, h.填充类型 = "24445B", "solid"
+    h.水平, h.垂直, h.自动换行 = "", "center", True
+    tp.表头样式 = h
+    tp.表头含前列 = True
+
+    last_main = None
+    for ri in range(len(df)):
+        row = ri + 2
+        kind = _读值(tp, row, hs["行别"]) if grouped else ""
+        main = kind == "核对事项"
+        other = "其他对应" in str(kind)
+        if main:
+            last_main = row
+        child = grouped and not main
+        rp = tp.行计划取(row)
+        rp.outline = int(child)
+        rp.隐藏 = bool(child and tp.名称 == "整组核对")
+        rp.收起 = False
+        if child and last_main and tp.名称 == "整组核对":
+            tp.行计划取(last_main).收起 = True
+        rp.样式 = 合并样式(rp.样式, 格样式(
+            字体名="微软雅黑", 字号=10, 加粗=main, 字色="243746",
+            填充色="DEEAF2" if main else "FFF8E8" if other
+                  else "F3F7FA" if kind == "银行组成" else "FFFFFF",
+            填充类型="solid", 水平="", 垂直="center", 自动换行=True,
+            **({"上框": ("thin", "91A8B8"), "下框": ("", None),
+                "左框": ("", None), "右框": ("", None)} if main else {})))
+        height = 40
+        for label, col in hs.items():
+            j = col - 偏 - 1
+            v = df.iat[ri, j]
+            if label == "人工核对结果" and manual and main:
+                tp.盖格(row, col, 格样式(填充色="FFF2CC", 填充类型="solid"))
+            elif label == "人工核对结果" and child:
+                tp.盖格(row, col, 格样式(数字格式=";;;"))
+            if isinstance(v, str) and v.startswith("=HYPERLINK("):
+                tp.盖格(row, col, 格样式(字体名="微软雅黑", 字号=10, 加粗=False,
+                                         字色="0563C1", 下划线="single"))
+            if label not in hidden and not (isinstance(v, str) and v.startswith("=")):
+                width = _展示列宽.get(label, 14)
+                lines = sum(max(1, int((_中文宽(part) + width - 1) // width))
+                            for part in str(v or "").split("\n"))
+                height = max(height, lines * 15 + 8)
+        rp.高 = min(height, 350)
+    for label in ("银行金额", "序时账金额", "金额"):
+        if label in hs and label not in hidden:
+            tp.盖格(1, hs[label], 格样式(批注=("正数为收入，负数为支出。", "核对说明")))
+    if grouped:
+        tp.盖格(1, hs["银行记录"], 格样式(批注=(
+            "汇总行先看双方笔数、收入与支出；组成行先银行后序时账。两侧排在同一组不表示已经逐笔配对。",
+            "核对说明")))
+    tp.打印 = {"orientation": "landscape", "paperSize": 8, "fitToWidth": 1,
+               "fitToHeight": 0, "fitToPage": True, "title_rows": "1:1",
+               "area": f"A1:{_字母(max(c for k, c in hs.items() if k not in hidden))}{nrows}",
+               "左边距": 0.2, "右边距": 0.2}
+
+
+def _月度(tp: 表计划):
+    """翻译 报告展示._monthly。"""
+    hs = _列定位(tp)
+    df = tp.表
+    偏 = tp.前置空列
+    ncols = len(df.columns)
+    end = len(df) + 1
+    balance_cols = [hs[x] for x in ("银行-月末余额", "序时账-月末余额", "余额差额")]
+    for row in range(2, end + 1):
+        for col in balance_cols:
+            if _读值(tp, row, col) is None:
+                _写值(tp, row, col, "缺失")
+                tp.盖格(row, col, 格样式(字体名="微软雅黑", 字号=10, 加粗=False, 字色="9C6500"))
+    if end >= 2:
+        for label in ("收入金额差额", "支出金额差额", "余额差额", "余额衔接差"):
+            letter = _字母(hs[label])
+            tp.条件格式.append((
+                f"{letter}2:{letter}{end}",
+                _公式规则(formula=[f"AND(ISNUMBER({letter}2),{letter}2<>0)"],
+                          fill=_填充类("solid", fgColor="FFF2CC"),
+                          font=_字体类(color="9C0006"))))
+    years = sorted({str(_读值(tp, row, hs["月份"]))[:4] for row in range(2, end + 1)})
+    for year in years:
+        rows = [r for r in range(2, end + 1)
+                if str(_读值(tp, r, hs["月份"])).startswith(year + "-")]
+        if not rows:
+            continue
+        new = [None] * ncols
+        nf_cols = []
+        for label, col in hs.items():
+            j = col - 偏 - 1
+            if "金额" in label or "笔数" in label or "变动净额" in label \
+                    or label.startswith(("已确认", "未确认")):
+                new[j] = "=" + "+".join(f"{_字母(col)}{r}" for r in rows)
+                nf_cols.append(col)
+        new[hs["月份"] - 偏 - 1] = year + "年合计"
+        new[hs["余额说明"] - 偏 - 1] = "发生额合计；余额不加总"
+        df.loc[len(df)] = new
+        target = len(df) + 1
+        for col in nf_cols:
+            tp.盖格(target, col, 格样式(数字格式="#,##0.00;[Red]-#,##0.00"))
+        rp = tp.行计划取(target)
+        rp.高 = 32
+        rp.样式 = 合并样式(rp.样式, 格样式(
+            字体名="微软雅黑", 字号=10, 加粗=True, 字色="243746",
+            填充色="DEEAF2", 填充类型="solid", 水平="", 垂直="center", 自动换行=True))
+    tp.筛选 = f"A1:{_字母(偏 + ncols)}{end}"
+    tp.打印 = dict(tp.打印)
+    tp.打印["area"] = f"A1:{_字母(偏 + ncols)}{len(df) + 1}"
+    tp.冻结 = "B2"
+    for label, col in hs.items():
+        tp.列计划取(col - 偏 - 1).宽 = 13 if label != "余额说明" else 28

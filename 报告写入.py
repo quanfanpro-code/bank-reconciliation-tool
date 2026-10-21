@@ -60,7 +60,8 @@ def _边(框: tuple | None) -> Side:
     if 框 is None:
         return Side(style=None)
     style, color = 框
-    return Side(style=style, color=color)
+    # style 为空字符串表示"显式清除该边"（旧路径整体替换 Border 的效果）
+    return Side(style=style or None, color=color)
 
 
 def _边框(s: 格样式) -> Border | None:
@@ -124,6 +125,8 @@ def _渲染表(wb: Workbook, tp):
         ws.sheet_view.topLeftCell = tp.左上角
     if tp.outline汇总在下 is not None:
         ws.sheet_properties.outlinePr.summaryBelow = tp.outline汇总在下
+    if tp.显示outline符号 is not None:
+        ws.sheet_view.showOutlineSymbols = tp.显示outline符号
 
     偏 = tp.前置空列
     # 前置空列（A 列等）的宽与隐藏
@@ -142,10 +145,14 @@ def _渲染表(wb: Workbook, tp):
         if cp.隐藏:
             dim.hidden = True
 
-    # 表头行（第 1 行）
+    # 表头行（第 1 行）；覆盖对表头同样生效（如表头批注）
+    if tp.表头含前列:
+        for k in range(偏):
+            cell = ws.cell(row=1, column=k + 1)
+            _套样式(cell, 合并样式(tp.表头样式, tp.覆盖.get((1, k + 1))))
     for j, 列名 in enumerate(tp.表.columns):
         cell = ws.cell(row=1, column=偏 + j + 1, value=列名)
-        _套样式(cell, tp.表头样式)
+        _套样式(cell, 合并样式(tp.表头样式, tp.覆盖.get((1, 偏 + j + 1))))
 
     # 数据行
     行样式 = {行号: rp.样式 for 行号, rp in tp.行.items() if rp.样式 is not None}
