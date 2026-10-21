@@ -127,6 +127,8 @@ def _渲染表(wb: Workbook, tp):
         ws.sheet_properties.outlinePr.summaryBelow = tp.outline汇总在下
     if tp.显示outline符号 is not None:
         ws.sheet_view.showOutlineSymbols = tp.显示outline符号
+    if tp.默认行高 is not None:
+        ws.sheet_format.defaultRowHeight = tp.默认行高
 
     偏 = tp.前置空列
     # 前置空列（A 列等）的宽与隐藏
@@ -168,7 +170,8 @@ def _渲染表(wb: Workbook, tp):
                 _套样式(ws.cell(row=行号, column=k + 1), 样式)
         for j, v in enumerate(row):
             列号 = 偏 + j + 1
-            cell = ws.cell(row=行号, column=列号, value=_值转换(v))
+            v = _值转换(v)
+            cell = ws.cell(row=行号, column=列号, value=v)
             s = tp.覆盖.get((行号, 列号))
             样式 = None
             if j < len(tp.列):
@@ -177,6 +180,13 @@ def _渲染表(wb: Workbook, tp):
                 样式 = 合并样式(样式, rs)
             if s is not None:
                 样式 = 合并样式(样式, s)
+            if tp.格变换 is not None and v is not None:
+                样式 = tp.格变换(样式 if 样式 is not None else 格样式(), v,
+                                 str(tp.表.columns[j]))
+            if tp.后覆盖:
+                s2 = tp.后覆盖.get((行号, 列号))
+                if s2 is not None:
+                    样式 = 合并样式(样式, s2)
             if 样式 is not None:
                 _套样式(cell, 样式)
 

@@ -84,6 +84,9 @@ class 表计划:
     打印: dict = field(default_factory=dict)
     前置空列: int = 0
     前部列: list = field(default_factory=list)      # list[列计划]，对应 1..前置空列 的空列
+    默认行高: float | None = None
+    格变换: object = None                           # callable(格样式, 值, 列标签) -> 格样式，数据格合并后调用
+    后覆盖: dict = field(default_factory=dict)      # {(行,列)}，格变换之后再合并的格覆盖
 
     def 列计划取(self, 下标: int) -> 列计划:
         """取下标（0 基）列计划；不足自动补齐。"""
@@ -1149,3 +1152,510 @@ def _月度(tp: 表计划):
     tp.冻结 = "B2"
     for label, col in hs.items():
         tp.列计划取(col - 偏 - 1).宽 = 13 if label != "余额说明" else 28
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 紧凑层回放（翻译自 紧凑报告.apply_compact_report / _write_items /
+# _period_flags / _overview / format_compact_sheet；逐条对照源逻辑）
+# ═══════════════════════════════════════════════════════════════════════════
+
+import re as _re
+import unicodedata as _uni
+from copy import copy as _copy
+from datetime import date as _date, datetime as _dt
+from decimal import Decimal as _Decimal
+
+_紧凑阅读表 = ("核对总览", "待处理事项", "月度核对", "每日统计", "对应明细")
+_紧凑阅读色 = "BDD7EE"
+_紧凑留痕色 = "C6E0B4"
+_紧凑人工方式 = ("人工全查", "人工抽样")
+_紧凑列宽 = {"核对编号": 7, "处理要求": 9, "对应方式": 9, "哪里需要查看": 26,
+             "银行记录": 28, "序时账记录": 28, "人工核对结果": 19, "当前结果": 21,
+             "备注": 20, "完整明细": 7, "核对依据": 26, "日期": 11, "月份": 10,
+             "需查看": 13, "余额说明": 21, "项目": 27, "结果": 43, "怎么看": 47}
+
+
+def _查找(簿: 簿计划, name, label, key, key_label="事项编号", default='""'):
+    """紧凑报告._lookup 的计划层等价。"""
+    t = 簿.取表(name)
+    hs = _列定位(t)
+    end = max(2, len(t.表) + 1)
+    vcol, kcol = (_字母(hs[x]) for x in (label, key_label))
+    return (f"IFERROR(INDEX('{name}'!${vcol}$2:${vcol}${end},"
+            f"MATCH({key},'{name}'!${kcol}$2:${kcol}${end},0)),{default})")
+
+
+def _text计划(tp: 表计划, row, col, text, limit=48):
+    """紧凑报告._text 的计划层等价：截断+批注+公式符号前置引号。"""
+    text = str(text or "").replace("\r", "").replace("\n", "；")
+    value = text if len(text) <= limit else text[:limit - 1] + "…"
+    if len(text) > limit:
+        tp.盖格(row, col, 格样式(批注=(text, "完整说明")))
+    if value and value[0] in "=+-@":
+        value = "'" + value
+    _写值(tp, row, col, value)
+
+
+def _行号(coord):
+    return int(_re.sub(r"[^0-9]", "", coord))
+
+
+def _sqref行(sqref):
+    rows = []
+    for part in str(sqref).split():
+        if ":" in part:
+            a, b = part.split(":", 1)
+            rows.extend(range(_行号(a), _行号(b) + 1))
+        elif part:
+            rows.append(_行号(part))
+    return rows
+
+
+def _含坐标(sqref, coord):
+    col = _re.sub(r"[0-9]", "", coord)
+    row = _行号(coord)
+    for part in str(sqref).split():
+        if ":" in part:
+            a, b = part.split(":", 1)
+            ca, cb = _re.sub(r"[0-9]", "", a), _re.sub(r"[0-9]", "", b)
+            if ca <= col <= cb and _行号(a) <= row <= _行号(b):
+                return True
+        elif part == coord:
+            return True
+    return False
+
+
+def _写事项(簿: 簿计划):
+    """翻译 紧凑报告._write_items：建待处理事项/对应明细，回收人工表入口。"""
+    from 紧凑报告 import _amounts, _description, _plain_reason, _short_result
+
+    明细 = 簿.取表("核对明细")
+    hs_明细 = _列定位(明细)
+    records = _defaultdict(lambda: {"银行流水": [], "序时账": []})
+    first_record = {}
+    for row in range(2, len(明细.表) + 2):
+        item = {label: _读值(明细, row, col) for label, col in hs_明细.items()}
+        records[item["事项编号"]][item["来源"]].append(item)
+        first_record.setdefault(item["事项编号"], row)
+    manual = {}
+    for name in _紧凑人工方式:
+        tp = 簿.取表(name)
+        hs = _列定位(tp)
+        for row in range(2, len(tp.表) + 2):
+            r = {label: _读值(tp, row, col) for label, col in hs.items()}
+            if r.get("行别") == "核对事项":
+                manual[r["事项编号"]] = (name, row, hs, r)
+
+    ix = 簿.取表("复核事项索引")
+    hs_ix = _列定位(ix)
+    items = [{label: _读值(ix, row, col) for label, col in hs_ix.items()}
+             for row in range(2, len(ix.表) + 1 + 1)]
+    priority = {"人工全查": 0, "人工抽样": 1, "留存备查": 2, "自动确认": 3}
+    items.sort(key=lambda it: (priority.get(it["核对方式"], 2), int(it["核对编号"])))
+    numbers = {it["事项编号"]: it["核对编号"] for it in items}
+    end = max(2, len(items) + 1)
+
+    待处理列 = ["核对编号", "处理要求", "哪里需要查看", "银行记录", "序时账记录",
+                "收入差额", "支出差额", "人工核对结果", "当前结果", "备注",
+                "完整明细", "事项编号"]
+    对应列 = ["核对编号", "对应方式", "银行记录", "银行收入", "银行支出",
+              "序时账记录", "序时账收入", "序时账支出", "收入差额", "支出差额",
+              "当前结果", "核对依据", "完整明细", "事项编号"]
+    pending_data, pending_extra = [], []
+    matched_data, matched_extra = [], []
+    pending_rows = {}
+    for it in items:
+        identity = it["事项编号"]
+        bank = records[identity]["银行流水"]
+        journal = records[identity]["序时账"]
+        bi, be = _amounts(bank)
+        ji, je = _amounts(journal)
+        mode = it["核对方式"]
+        if mode != "自动确认":
+            pending_data.append([
+                it["核对编号"],
+                {"人工全查": "逐项核对", "人工抽样": "抽中核对"}.get(mode, "留存查看"),
+                _plain_reason(it, bank, journal, bi - ji, be - je),
+                _description(bank), _description(journal), bi - ji, be - je,
+                "", "", "", "查看", identity])
+            row = len(pending_data) + 1
+            pending_rows[identity] = row
+            pending_extra.append((it, row))
+        if bank and journal:
+            matched_data.append([
+                it["核对编号"],
+                "逐笔对应" if len(bank) == len(journal) == 1 else "整组对应",
+                _description(bank), bi, be, _description(journal), ji, je,
+                bi - ji, be - je, "", it.get("判断依据") or "", "查看", identity])
+            matched_extra.append((it, len(bank) == len(journal) == 1,
+                                  len(matched_data) + 1))
+
+    待处理 = 表计划(名称="待处理事项", 表=pd.DataFrame(pending_data, columns=待处理列))
+    簿.表.append(待处理)
+    对应 = 表计划(名称="对应明细", 表=pd.DataFrame(matched_data, columns=对应列))
+    簿.表.append(对应)
+
+    for it, row in pending_extra:
+        identity = it["事项编号"]
+        for col in (3, 4, 5):
+            _text计划(待处理, row, col, 待处理.表.iat[row - 2, col - 1], 32)
+        待处理.盖格(row, 3, 格样式(批注=(
+            "；".join(str(it.get(k) or "") for k in ("入选原因", "判断依据")),
+            "原判断依据")))
+        key = f"$L{row}"
+        _写值(待处理, row, 9,
+              _short_result(_查找(簿, "复核事项索引", "当前核对结论", key)))
+        target = manual.get(identity)
+        if target:
+            name, source_row, hs_m, original = target
+            _写值(待处理, row, 8, original.get("人工核对结果") or None)
+            _写值(待处理, row, 10, original.get("备注") or None)
+            人工tp = 簿.取表(name)
+            old_coord = f"{_字母(hs_m['人工核对结果'])}{source_row}"
+            for v in 人工tp.验证:
+                if _含坐标(v.get("sqref", ""), old_coord):
+                    nv = dict(v)
+                    nv["sqref"] = f"H{row}"
+                    待处理.验证.append(nv)
+            owner_key = f"{_字母(hs_m['填报编号'])}{source_row}"
+            for label, col_l in (("人工核对结果", "H"), ("备注", "J")):
+                value = (f"IFERROR(INDEX('待处理事项'!${col_l}$2:${col_l}${end},"
+                         f"MATCH({owner_key},'待处理事项'!$L$2:$L${end},0)),\"\")")
+                _写值(人工tp, source_row, hs_m[label], f'=IF({value}="","",{value})')
+        else:
+            _写值(待处理, row, 8, "本次无需填写")
+        target_row = first_record.get(identity, 2)
+        link = (f"#'{target[0]}'!A{target[1]}" if target
+                else f"#'核对明细'!A{target_row}")
+        待处理.盖格(row, 11, 格样式(超链接=link))
+
+    for it, single, row in matched_extra:
+        identity = it["事项编号"]
+        for col in (3, 6, 12):
+            _text计划(对应, row, col, 对应.表.iat[row - 2, col - 1], 32)
+        key = f"$N{row}"
+        _写值(对应, row, 11,
+              _short_result(_查找(簿, "复核事项索引", "当前核对结论", key)))
+        if identity in pending_rows:
+            _写值(对应, row, 1,
+                  f'=HYPERLINK("#\'待处理事项\'!H"&(MATCH({key},'
+                  f"'待处理事项'!$L$2:$L${end},0)+1),\"{it['核对编号']}\")")
+        detail_name = "逐笔核对" if single else "整组核对"
+        dt = 簿.取表(detail_name)
+        hs_d = _列定位(dt)
+        dkey = _字母(hs_d["事项编号"])
+        dend = max(2, len(dt.表) + 1)
+        _写值(对应, row, 13,
+              f'=HYPERLINK("#\'{detail_name}\'!A"&(MATCH({key},'
+              f"'{detail_name}'!${dkey}$2:${dkey}${dend},0)+1),\"查看\")")
+
+    for name in _紧凑人工方式:
+        簿.取表(name).验证 = []
+    for name in ("逐笔核对", "整组核对", "未对应记录"):
+        tp = 簿.取表(name)
+        hs = _列定位(tp)
+        for row in range(2, len(tp.表) + 2):
+            item_id = _读值(tp, row, hs["事项编号"])
+            if item_id not in pending_rows:
+                continue
+            key = f"{_字母(hs['事项编号'])}{row}"
+            number = str(_读值(tp, row, hs["核对编号"]))
+            if number.startswith("="):
+                number = numbers[item_id]
+            _写值(tp, row, hs["核对编号"],
+                  f'=HYPERLINK("#\'待处理事项\'!H"&(MATCH({key},'
+                  f"'待处理事项'!$L$2:$L${end},0)+1),\"{number}\")")
+
+
+def _期间标记(簿: 簿计划, name):
+    """翻译 紧凑报告._period_flags。"""
+    tp = 簿.取表(name)
+    daily = name == "每日统计"
+    balance_labels = (("银行-期末余额", "日记账-期末余额") if daily
+                      else ("银行-月末余额", "序时账-月末余额"))
+    for label in (*balance_labels, "余额差额"):
+        if label not in _列定位(tp):
+            tp.表[label] = "未提供"
+    tp.表["需查看"] = None
+    hs = _列定位(tp)
+    anomaly_days = set()
+    异常 = 簿.取表("余额连续性异常")
+    if 异常 is not None:
+        hs_a = _列定位(异常)
+        for row in range(2, len(异常.表) + 2):
+            for label in ("日期", "异常日期", "date"):
+                if label in hs_a:
+                    v = _读值(异常, row, hs_a[label])
+                    if v:
+                        anomaly_days.add(str(v)[:10])
+    diff_labels = [l for l in ("收入金额差额", "支出金额差额", "余额差额", "余额衔接差")
+                   if l in hs]
+    column = hs["需查看"]
+    for row in range(2, len(tp.表) + 2):
+        period = _读值(tp, row, hs["日期" if daily else "月份"])
+        if not daily and "合计" in str(period):
+            continue
+        tests = [f"AND(ISNUMBER({_字母(hs[l])}{row}),{_字母(hs[l])}{row}<>0)"
+                 for l in diff_labels]
+        missing = [f"NOT(ISNUMBER({_字母(hs[l])}{row}))" for l in balance_labels]
+        if (daily and str(period)[:10] in anomaly_days) or (
+                not daily
+                and str(period)[:7] in {day[:7] for day in anomaly_days}):
+            _写值(tp, row, column, "余额不连续")
+        else:
+            _写值(tp, row, column,
+                  f'=IF(OR({",".join(tests)}),"有差额",'
+                  f'IF(OR({",".join(missing)}),"余额未提供",""))')
+
+
+def _建总览(簿: 簿计划):
+    """翻译 紧凑报告._overview。"""
+    结论 = 簿.取表("核对结论")
+    hs_c = _列定位(结论)
+    rows = [
+        ("核对范围", "核对范围", "资料有缺口时，结果要结合原始说明查看。"),
+        ("资料情况", "范围说明", ""),
+        ("银行记录数", "银行有效交易笔数", "进入本次核对的银行交易笔数。"),
+        ("账上记录数", "日记账有效交易笔数", "进入本次核对的银行存款记账笔数。"),
+        ("银行金额已对平比例", "银行当前已对平金额覆盖率", "收付金额分开累计；只计入已对应且差额为零的记录。"),
+        ("账上金额已对平比例", "序时账当前已对平金额覆盖率", "人工查看过但仍有差额，不算已对平。"),
+        ("还需人工核对", "待处理事项数", "在待处理事项的黄色格选择结果；留存查看不计入待办。"),
+        ("已完成人工核对", "已处理事项数", "已选有效结果的事项数，有差额的仍保留差额。"),
+        ("人工选择有冲突", "人工选择冲突数", "同一原记录被重复采用时，需要重新选择。"),
+        ("还没找到对应的记录", "当前未对应原始记录数", "银行和账上合计笔数；未对应不等于漏记。"),
+        ("期初余额差额", "期初余额差额", "银行余额减账上余额；未提供可用余额时不补零。"),
+        ("余额核对情况", "余额核对", "每日和月度表保留收支、余额及差额。"),
+    ]
+    if 簿.取表("非工作日交易") is not None:
+        rows.extend([
+            ("非工作日银行收付笔数", "非工作日银行收付笔数", "已对平的记录也保留提示；完整清单在绿色非工作日交易表。"),
+            ("非工作日银行收款笔数", "非工作日银行收款笔数", ""),
+            ("非工作日银行收款金额", "非工作日银行收款金额", ""),
+            ("非工作日银行付款笔数", "非工作日银行付款笔数", ""),
+            ("非工作日银行付款金额", "非工作日银行付款金额", ""),
+            ("银行交易日历未覆盖笔数", "银行交易日历未覆盖笔数", "超出2021至2026年日历的记录，不能据此判断是否为工作日。"),
+        ])
+    out = []
+    for title, label, explanation in rows:
+        value = _查找(簿, "核对结论", "数值", '"' + label + '"', "项目", '"未提供"')
+        if label == "核对范围":
+            for old, new in (("范围受限", "资料有缺口，部分结果需核实"),
+                             ("范围可用", "本次资料可以用于核对"),
+                             ("范围未验证", "尚未确认资料范围")):
+                value = f'SUBSTITUTE({value},"{old}","{new}")'
+        if label == "范围说明":
+            original = next(
+                (_读值(结论, r, hs_c["数值"])
+                 for r in range(2, len(结论.表) + 2)
+                 if _读值(结论, r, hs_c["项目"]) == label), "")
+            value = (f'IF({value}="未发现范围疑点","未发现额外资料问题",'
+                     f'"有需要确认的资料，见原始说明")')
+            explanation = str(original or "")
+        if label == "余额核对":
+            value = f'SUBSTITUTE({value},"余额核对未实施","未提供双方可用余额")'
+        out.append([title, "=" + value, explanation])
+    tp = 表计划(名称="核对总览", 表=pd.DataFrame(out, columns=["项目", "结果", "怎么看"]))
+    簿.表.append(tp)
+    for i, (title, label, explanation) in enumerate(rows):
+        row = i + 2
+        _text计划(tp, row, 3, tp.表.iat[row - 2, 2], 40)
+        if "比例" in title:
+            tp.盖格(row, 2, 格样式(数字格式="0.00%"))
+        elif "差额" in title or "金额" in title:
+            tp.盖格(row, 2, 格样式(数字格式="#,##0.00;[Red]-#,##0.00"))
+    for name, title in (("月度核对", "有差额的月份"), ("每日统计", "有差额或余额不连续的日期")):
+        t = 簿.取表(name)
+        column = _字母(_列定位(t)["需查看"])
+        rng = f"'{name}'!${column}$2:${column}${max(2, len(t.表) + 1)}"
+        row = len(tp.表) + 2
+        tp.表.loc[len(tp.表)] = [title,
+                                 f'=COUNTIF({rng},"有差额")+COUNTIF({rng},"余额不连续")',
+                                 "打开" + name + "，筛选“需查看”列。"]
+        tp.盖格(row, 3, 格样式(超链接=f"#'{name}'!A1"))
+    search = _查找(簿, "核对结论", "数值", '"组合搜索完整性"', "项目")
+    tp.表.loc[len(tp.表)] = [
+        "对应查找情况",
+        f'=IF({search}="范围受限","部分查找未完成",'
+        f'IF({search}="存在多解","有多种可能对应","已在程序设定的范围内查找"))',
+        "未找到不等于没有对应，详细检查范围见绿色运行参数表。"]
+    tp.表.loc[len(tp.表)] = [
+        "使用方法", "先看总览和每日、月度差额，再处理黄色格。",
+        "浅蓝色表用于阅读；浅绿色表保留完整记录和计算依据。"]
+
+
+def _做变换(reading):
+    """format_compact_sheet 数据格部分：在渲染器每格合并后调用。"""
+    def 变换(样式, 值, 列标签):
+        样式.字体名, 样式.字号 = "MiSans", 9
+        样式.填充类型, 样式.填充色 = "none", None
+        numeric = isinstance(值, (int, float, _Decimal)) and not isinstance(值, bool)
+        样式.水平 = "right" if numeric else "left"
+        样式.垂直 = "top"
+        样式.自动换行 = reading
+        if numeric and any(k in 列标签 for k in ("金额", "余额", "收入", "支出", "差额")):
+            样式.数字格式 = "#,##0.00;[Red]-#,##0.00"
+        if isinstance(值, (_dt, _date)):
+            样式.数字格式 = "yyyy-mm-dd"
+        if 样式.超链接 or (isinstance(值, str) and 值.startswith("=HYPERLINK(")):
+            样式.字色 = "0563C1"
+            样式.下划线 = "single"
+            样式.加粗 = False
+        return 样式
+    return 变换
+
+
+def _紧凑样式(tp: 表计划, *, reading):
+    """翻译 紧凑报告.format_compact_sheet。"""
+    hs = _列定位(tp)
+    df = tp.表
+    hidden = {"事项编号"} if tp.名称 in ("待处理事项", "对应明细") else set()
+    if reading and tp.名称 in ("每日统计", "月度核对"):
+        hidden.update(l for l in hs
+                      if "笔数" in l or "变动净额" in l
+                      or l.startswith(("已确认", "未确认")))
+    first = min(hs.values(), default=1)
+    while len(tp.前部列) < first - 1:
+        tp.前部列.append(列计划())
+    for column in range(1, first):
+        tp.前部列[column - 1].隐藏 = True
+    for label, column in hs.items():
+        cp = tp.列计划取(column - tp.前置空列 - 1)
+        cp.隐藏 = label in hidden
+        amount = any(k in label for k in ("金额", "余额", "收入", "支出", "差额")) \
+            and not any(k in label for k in ("说明", "比例", "依据", "原因"))
+        cp.宽 = _紧凑列宽.get(
+            label, 14 if amount
+            else 28 if any(k in label for k in ("摘要", "原因", "说明", "依据", "记录"))
+            else 16)
+    last = max(hs.values(), default=1)
+    for j in range(last - tp.前置空列, len(tp.列)):
+        tp.列[j].隐藏 = True
+    tp.tab色 = _紧凑阅读色 if reading else _紧凑留痕色
+    tp.状态 = "visible"
+    tp.网格线 = False
+    tp.缩放 = 100
+    tp.左上角 = f"{_字母(first)}1"
+    tp.冻结 = None if tp.名称 == "核对总览" else "A2"
+    tp.默认行高 = 15
+    tp.行计划取(1).高 = 28
+    nrows = len(df) + 1
+    tp.筛选 = None if tp.名称 == "核对总览" else f"{_字母(first)}1:{_字母(last)}{nrows}"
+
+    # 表头：紧凑样式整体替换字体/填充/对齐，边框保留；A 列等前置空列表头
+    # 旧代码因无值而跳过，这里把旧表头样式冻结进覆盖，保持原样。
+    旧头 = tp.表头样式
+    if tp.表头含前列 and 旧头 is not None:
+        for k in range(tp.前置空列):
+            tp.覆盖[(1, k + 1)] = 合并样式(_copy(旧头), tp.覆盖.get((1, k + 1)))
+    h = 旧头 or 格样式()
+    h.字体名, h.字号, h.加粗, h.字色 = "MiSans", 9, True, "243746"
+    h.填充色, h.填充类型 = tp.tab色, "solid"
+    h.水平, h.垂直, h.自动换行 = "", "center", True
+    tp.表头样式 = h
+
+    # 数据行：金额列宽按内容扩、阅读表逐字宽算行高；非阅读表行高抹成 15
+    for ri in range(len(df)):
+        row = ri + 2
+        height = 15
+        for label, column in hs.items():
+            v = _读值(tp, row, column)
+            if v is None:
+                continue
+            cp = tp.列计划取(column - tp.前置空列 - 1)
+            if isinstance(v, (int, float, _Decimal)) and not isinstance(v, bool) \
+                    and any(k in label for k in ("金额", "余额", "收入", "支出", "差额")):
+                cp.宽 = max(cp.宽 or 0, len(f"{v:,.2f}") + 1)
+            if reading and label not in hidden \
+                    and not (isinstance(v, str) and v.startswith("=")):
+                width = cp.宽 or 0
+                tw = sum(1.5 if _uni.east_asian_width(ch) in ("W", "F") else 0.75
+                         for ch in str(v))
+                height = max(height, _math.ceil(tw / max(1, width - 1)) * 12 + 3)
+        rp = tp.行计划取(row)
+        rp.高 = height
+        if not reading:
+            rp.隐藏 = False
+            rp.收起 = False
+    tp.格变换 = _做变换(reading)
+
+    p = dict(tp.打印)
+    if tp.名称 != "核对总览":
+        p["title_rows"] = "1:1"
+    p["area"] = f"{_字母(first)}1:{_字母(last)}{nrows}"
+    if reading:
+        p.update(orientation="landscape", paperSize=9, fitToWidth=1,
+                 fitToHeight=0, fitToPage=True)
+    tp.打印 = p
+
+
+def 应用紧凑层(簿: 簿计划):
+    """翻译 紧凑报告.apply_compact_report，必须在复核层/展示层回放之后调用。"""
+    _写事项(簿)
+    _期间标记(簿, "每日统计")
+    _期间标记(簿, "月度核对")
+    _建总览(簿)
+    for tp in 簿.表:
+        _紧凑样式(tp, reading=tp.名称 in _紧凑阅读表)
+    待处理 = 簿.取表("待处理事项")
+    for v in 待处理.验证:
+        for row in _sqref行(v.get("sqref", "")):
+            待处理.后覆盖[(row, 8)] = 格样式(填充色="FFF2CC", 填充类型="solid")
+    for name in ("待处理事项", "对应明细"):
+        t = 簿.取表(name)
+        hs = _列定位(t)
+        for label in ("收入差额", "支出差额"):
+            column = _字母(hs[label])
+            if len(t.表) > 0:
+                t.条件格式.append((
+                    f"{column}2:{column}{len(t.表) + 1}",
+                    _公式规则(formula=[f"AND(ISNUMBER({column}2),{column}2<>0)"],
+                              fill=_填充类("solid", fgColor="FFF2CC"),
+                              font=_字体类(color="9C0006"))))
+    for name in ("每日统计", "月度核对"):
+        t = 簿.取表(name)
+        column = _字母(_列定位(t)["需查看"])
+        if len(t.表) > 0:
+            t.条件格式.append((
+                f"{column}2:{column}{len(t.表) + 1}",
+                _公式规则(formula=[f'OR({column}2="有差额",{column}2="余额不连续")'],
+                          fill=_填充类("solid", fgColor="FFF2CC"),
+                          font=_字体类(color="9C0006"))))
+    order = [簿.取表(n) for n in _紧凑阅读表]
+    簿.表 = order + [t for t in 簿.表 if all(t is not o for o in order)]
+    簿.active = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 总装：按旧路径同序回放全部排版层（reporter._generate_report 的排版段）
+# ═══════════════════════════════════════════════════════════════════════════
+
+def 生成簿计划(reporter, tables: dict, effective_config=None, theme="deep-navy") -> 簿计划:
+    """tables 为 build_report_tables + apply_column_preferences 之后的表集合。
+
+    回放次序与旧路径一致：底层主题 → 期初警告 → 明细着色 → 差额着色 →
+    通用排版 → 复核层 → 展示层 → 期初警告(第二次) → 紧凑层。
+    """
+    簿 = 新建簿计划(tables)
+    for tp in 簿.表:
+        应用底层主题(tp, theme)
+    has_warning = bool(
+        getattr(reporter, "initial_balance_warning", None)
+        and reporter.initial_balance_warning.has_warning)
+    结论 = 簿.取表("核对结论")
+    if 结论 is not None:
+        应用期初警告(结论, has_warning)
+    for name in ("逐笔匹配", "整组勾稽", "疑点事项", "自动归集事项"):
+        t = 簿.取表(name)
+        if t is not None:
+            应用明细着色(t)
+    for name in ("每日统计", "月度统计", "余额差异明细", "余额连续性异常"):
+        t = 簿.取表(name)
+        if t is not None:
+            应用差额着色(t)
+    应用通用排版(簿)
+    应用复核层(簿)
+    应用展示层(簿)
+    if 结论 is not None:
+        应用期初警告(结论, has_warning)
+    应用紧凑层(簿)
+    return 簿
