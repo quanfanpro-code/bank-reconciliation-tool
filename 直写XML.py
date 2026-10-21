@@ -183,9 +183,9 @@ class _样式表:
         if 规则.字色:
             片.append(f'<font><color rgb="{_rgb(规则.字色)}"/></font>')
         if 规则.填充色:
-            # dxf 里的纯色填充：openpyxl 旧产物把颜色放 bgColor（Excel 的 dxf 约定）
-            片.append("<fill><patternFill>"
-                      f'<bgColor rgb="{_rgb(规则.填充色)}"/>'
+            # 与旧产物逐字一致：solid + fgColor（dxf 内不放 bgColor）
+            片.append('<fill><patternFill patternType="solid">'
+                      f'<fgColor rgb="{_rgb(规则.填充色)}"/>'
                       "</patternFill></fill>")
         片.append("</dxf>")
         键 = (规则.字色, 规则.填充色)
@@ -234,8 +234,9 @@ def _数字文本(v):
     if isinstance(v, float):
         if math.isnan(v) or math.isinf(v):
             return None
-        v = round(v, 15)                  # 与 openpyxl 写盘一致：抹掉浮点尾噪声
-        return repr(v) if v != int(v) or abs(v) >= 1e15 else str(int(v))
+        # 与 openpyxl safe_string 完全一致：16 位有效数字（"%.16g"），
+        # 既能抹掉 1000.0000000000002 这类尾噪声，也覆盖科学计数法
+        return "%.16g" % v
     if isinstance(v, _dt):
         基 = _dt(1899, 12, 30)
         秒 = (v - 基).total_seconds()
