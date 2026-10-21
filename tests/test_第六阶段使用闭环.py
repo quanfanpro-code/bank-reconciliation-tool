@@ -1,12 +1,10 @@
-﻿import hashlib
+import hashlib
 import json
 import subprocess
 from pathlib import Path
 
-import pandas as pd
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook
 
-from 底稿筛选 import FilterCriteria, export_filtered_workpaper
 from 输入模板 import generate_input_templates
 from 项目记录 import LocalProjectStore
 
@@ -50,86 +48,6 @@ def test_项目记录保存输入与报告指纹并可重新打开(tmp_path):
     assert latest["project_id"] == record["project_id"]
     assert latest["files"]["report"]["sha256"] == _sha256(report)
     assert store.resolve_report(record["project_id"]) == report
-
-
-def test_筛选任一关系时完整带出组成且不覆盖全量报告(tmp_path):
-    source = tmp_path / "full.xlsx"
-    output = tmp_path / "filtered.xlsx"
-    with pd.ExcelWriter(source, engine="openpyxl") as writer:
-        pd.DataFrame({"项目": ["总银行流水金额"], "数值": [1000]}).to_excel(writer, sheet_name="核对结论", index=False)
-        pd.DataFrame(
-            {
-                "匹配ID": ["M1", "M2"],
-                "类型": ["手续费净额", "普通匹配"],
-                "最终状态": ["整组勾稽一致", "自动确认"],
-                "最早日期": ["2026-01-01", "2026-01-02"],
-                "组金额": [800, 200],
-                "判断依据": ["手续费明确", "普通业务"],
-            }
-        ).to_excel(writer, sheet_name="整组勾稽", index=False)
-        pd.DataFrame(
-            {
-                "匹配ID": ["M1", "M1", "M1", "M2", "M2"],
-                "来源": ["银行流水", "银行存款序时账", "银行存款序时账", "银行流水", "银行存款序时账"],
-                "金额": [790, 800, 10, 200, 200],
-                "摘要": ["回款", "应收", "手续费", "普通", "普通"],
-            }
-        ).to_excel(writer, sheet_name="匹配组成", index=False)
-    before = _sha256(source)
-
-    export_filtered_workpaper(source, output, FilterCriteria(business_types=("手续费净额",)))
-
-    assert _sha256(source) == before
-    result = pd.read_excel(output, sheet_name="匹配组成")
-    explanation = pd.read_excel(output, sheet_name="筛选说明")
-    assert list(result["匹配ID"].unique()) == ["M1"]
-    assert len(result) == 3
-    assert explanation.loc[explanation["项目"] == "筛选关系数", "数值"].iloc[0] == 1
-    assert explanation.loc[explanation["项目"] == "覆盖比例", "数值"].iloc[0] == 0.8
-
-
-def test_摘要或对方文字筛选会读取关系组成而不只看关系首页(tmp_path):
-    source = tmp_path / "full.xlsx"
-    output = tmp_path / "filtered.xlsx"
-    with pd.ExcelWriter(source, engine="openpyxl") as writer:
-        pd.DataFrame({"匹配ID": ["M1", "M2"], "类型": ["普通匹配", "普通匹配"], "组金额": [600, 400]}).to_excel(writer, sheet_name="逐笔匹配", index=False)
-        pd.DataFrame({"匹配ID": ["M1", "M1", "M2", "M2"], "来源": ["银行流水", "银行存款序时账"] * 2, "金额": [600, 600, 400, 400], "摘要": ["设备款", "购置设备", "房租", "支付租金"], "辅助文字": ["对方：甲公司", "对方：甲公司", "对方：乙公司", "对方：乙公司"]}).to_excel(writer, sheet_name="匹配组成", index=False)
-
-    export_filtered_workpaper(source, output, FilterCriteria(include_text=("甲公司",)))
-
-    groups = pd.read_excel(output, sheet_name="逐笔匹配")
-    components = pd.read_excel(output, sheet_name="匹配组成")
-    assert list(groups["匹配ID"]) == ["M1"]
-    assert set(components["匹配ID"]) == {"M1"}
-
-
-def test_筛选导出长任务持续报告阶段进度(tmp_path):
-    source = tmp_path / "full.xlsx"
-    output = tmp_path / "filtered.xlsx"
-    with pd.ExcelWriter(source, engine="openpyxl") as writer:
-        pd.DataFrame({"匹配ID": ["M1"], "类型": ["普通匹配"], "组金额": [100]}).to_excel(
-            writer, sheet_name="逐笔匹配", index=False
-        )
-        pd.DataFrame({"匹配ID": ["M1", "M1"], "来源": ["银行流水", "银行存款序时账"]}).to_excel(
-            writer, sheet_name="匹配组成", index=False
-        )
-    progress = []
-    logs = []
-
-    export_filtered_workpaper(
-        source,
-        output,
-        FilterCriteria(),
-        progress_callback=progress.append,
-        log_callback=logs.append,
-    )
-
-    assert progress[0] == 0.0
-    assert progress[-1] == 1.0
-    assert progress == sorted(progress)
-    assert any("读取全量报告" in message for message in logs)
-    assert any("写入筛选底稿" in message for message in logs)
-    assert any("筛选导出完成" in message for message in logs)
 
 
 def test_输入模板生成银行流水和序时账两个可直接填写文件(tmp_path):

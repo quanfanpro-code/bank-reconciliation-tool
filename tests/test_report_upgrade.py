@@ -1,7 +1,7 @@
 ﻿from decimal import Decimal
 
 import pandas as pd
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook, 读Excel
 
 from data_structures import LLMDecisionRecord, MatcherConfig
 from input_precheck import InputPrecheckReport, PrecheckItem
@@ -98,8 +98,8 @@ def test_多对多报告按组展示且组成明细不伪造一一对应(tmp_pat
         config=MatcherConfig(),
     )
 
-    groups = pd.read_excel(output, sheet_name="整组勾稽")
-    components = pd.read_excel(output, sheet_name="匹配组成")
+    groups = 读Excel(output, sheet_name="整组勾稽")
+    components = 读Excel(output, sheet_name="匹配组成")
 
     assert len(groups) == 1
     assert len(components) == 8
@@ -479,7 +479,7 @@ def test_大模型明细字段完整且敏感内容被清理(tmp_path):
         str(output),
         config=MatcherConfig(),
     )
-    table = pd.read_excel(output, sheet_name="大模型辅助明细")
+    table = 读Excel(output, sheet_name="大模型辅助明细")
     body = table.to_string()
 
     assert {

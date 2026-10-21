@@ -5,6 +5,7 @@ from decimal import Decimal
 import pandas as pd
 import pytest
 
+from tests._excel假面 import 存表
 from data_loader import DataLoader, ParseErrorCollector
 from llm_assistant import LLMConfig, LLMAssistant
 from tests.test_llm_assistant import _sample_request
@@ -61,6 +62,6 @@ def test_输入编号中的NA与NULL是原文而不是空值(tmp_path, 扩展名
     if 扩展名 == ".csv":
         表.to_csv(路径, index=False, encoding="utf-8-sig")
     else:
-        表.to_excel(路径, index=False)
+        存表(表, 路径)
     结果 = DataLoader().load_file(str(路径))
     assert list(结果["业务编号"]) == ["NA", "NULL"]

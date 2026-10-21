@@ -83,6 +83,8 @@ class _样式表:
         return i
 
     def font(self, 名, 号, 粗, 色, 下划线):
+        if 号 in (None, ""):
+            号 = None
         if 名 is None and 号 is None and 粗 is None and 色 is None and 下划线 is None:
             return 0                    # 0 号位 = 默认字体（Calibri 11 主题色 1）
         键 = (名, 号, 粗, 色, 下划线)
@@ -237,6 +239,10 @@ def _数字文本(v):
         # 与 openpyxl safe_string 完全一致：16 位有效数字（"%.16g"），
         # 既能抹掉 1000.0000000000002 这类尾噪声，也覆盖科学计数法
         return "%.16g" % v
+    if isinstance(v, _Decimal):
+        if not v.is_finite():
+            return None
+        return format(v, "f")
     if isinstance(v, _dt):
         基 = _dt(1899, 12, 30)
         秒 = (v - 基).total_seconds()
@@ -291,14 +297,16 @@ def _冻结解析(冻结):
 class _表写出:
     """单张表 → sheet XML 文本 + 批注表。"""
 
-    def __init__(self, tp, 样式表, sst, sst序):
+    def __init__(self, tp, 样式表, sst, sst序, sst引用):
         self.tp = tp
         self.样式表 = 样式表
         self.sst = sst
         self.sst序 = sst序
+        self.sst引用 = sst引用
         self.批注 = []             # (引用, 文本, 作者)
 
     def 串(self, v):
+        self.sst引用[0] += 1
         i = self.sst.get(v)
         if i is None:
             i = len(self.sst序)
@@ -320,7 +328,7 @@ class _表写出:
                 return f"<c{属}/>"
             return None
         if isinstance(v, str) and v.startswith("="):
-            return f'<c{属}><f>{_xesc(v[1:])}</f><v></v></c>'
+            return f'<c{属}><f>{_xesc(v[1:])}</f></c>'
         if isinstance(v, str):
             return f'<c{属} t="s"><v>{self.串(v)}</v></c>'
         if isinstance(v, bool):
@@ -383,10 +391,13 @@ class _表写出:
         if tp.缩放 is not None:
             视图.append(f' zoomScale="{tp.缩放}" zoomScaleNormal="{tp.缩放}"')
         冻结 = _冻结解析(tp.冻结)
-        if 冻结:
+        if 冻结 and 冻结 != (1, 1):
+            # 冻结锚点 A2 语义 = 冻结 1 行：split 数 = 锚点行列 - 1，为 0 省略
             列, 行 = 冻结
-            视图.append(f'><pane xSplit="{列}" ySplit="{行}" '
-                        f'topLeftCell="{tp.冻结}" activePane="bottomRight" state="frozen"/>')
+            x, y = 列 - 1, 行 - 1
+            属 = (f' xSplit="{x}"' if x else "") + (f' ySplit="{y}"' if y else "")
+            pane = "bottomRight" if (x and y) else ("bottomLeft" if y else "topRight")
+            视图.append(f'><pane{属} topLeftCell="{tp.冻结}" activePane="{pane}" state="frozen"/>')
             视图.append("</sheetView>")
         else:
             视图.append("/>")
@@ -433,7 +444,17 @@ class _表写出:
             s = 合并样式(tp.表头样式, 覆盖.get((1, 偏 + j + 1)))
             if s is not None and s.批注:
                 批注格.append((1, 偏 + j + 1, s.批注[0], s.批注[1]))
-            行1.append(self.格(1, 偏 + j + 1, s, _串文本(名)))
+            if s is not None and s.超链接:
+                self.超链集 = getattr(self, "超链集", [])
+                self.超链集.append((f"{_字母(偏 + j + 1)}1", s.超链接))
+            名文 = _串文本(名)
+            if 名文 == "":
+                # 空表头不落值只落样式：与 openpyxl 不写空格的行为对齐
+                t = self.格(1, 偏 + j + 1, s, None, 强制空=True)
+                if t:
+                    行1.append(t)
+            else:
+                行1.append(self.格(1, 偏 + j + 1, s, 名文))
         行1.append("</row>")
         片.append("".join(行1))
 
@@ -521,6 +542,14 @@ class _表写出:
         # ---- autoFilter ----
         if tp.筛选:
             片.append(f'<autoFilter ref="{tp.筛选}"/>')
+
+        # ---- mergeCells（schema 序：autoFilter 之后、conditionalFormatting 之前） ----
+        合并 = getattr(tp, "合并", None)
+        if 合并:
+            片.append(f'<mergeCells count="{len(合并)}">')
+            for ref in sorted(合并, key=lambda r: (int("".join(c for c in r.split(":")[0] if c.isdigit())), r)):
+                片.append(f'<mergeCell ref="{_xesc(ref)}"/>')
+            片.append("</mergeCells>")
 
         # ---- conditionalFormatting ----
         优先 = 1
@@ -651,11 +680,11 @@ def _打印名(区域):
 def 写簿(计划: 簿计划, 输出路径: str) -> None:
     """渲染簿计划的直写 XML 实现：一次 zip 成型。"""
     样式表 = _样式表()
-    sst, sst序 = {}, []
+    sst, sst序, sst引用 = {}, [], [0]
     表XML = []
     全部批注 = []              # (sheet序, 批注格, 超链集)
     for 序, tp in enumerate(计划.表):
-        w = _表写出(tp, 样式表, sst, sst序)
+        w = _表写出(tp, 样式表, sst, sst序, sst引用)
         表XML.append(w.出())
         if w.批注格 or getattr(w, "超链集", None):
             全部批注.append((序, w.批注格, getattr(w, "超链集", [])))
@@ -701,7 +730,7 @@ def 写簿(计划: 簿计划, 输出路径: str) -> None:
         for 序 in range(n):
             类型.append(f'<Override PartName="/xl/worksheets/sheet{序 + 1}.xml" '
                         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
-        for k in range(len(全部批注)):
+        for k in range(len([1 for b in 全部批注 if b[1]])):
             类型.append(f'<Override PartName="/xl/comments{k + 1}.xml" '
                         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>')
         类型.append("</Types>")
@@ -731,7 +760,7 @@ def 写簿(计划: 簿计划, 输出路径: str) -> None:
         z.writestr("xl/styles.xml", 样式表.xml().encode("utf-8"))
         z.writestr("xl/sharedStrings.xml",
                    (_HEADER + f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-                    f'count="{len(sst序)}" uniqueCount="{len(sst序)}">'
+                    f'count="{sst引用[0]}" uniqueCount="{len(sst序)}">'
                     + "".join(f"<si><t xml:space=\"preserve\">{_xesc(s_)}</t></si>" for s_ in sst序)
                     + "</sst>").encode("utf-8"))
 
@@ -743,7 +772,7 @@ def 写簿(计划: 簿计划, 输出路径: str) -> None:
             _, 批注格, 超链集 = 该表
             条 = []
             if 批注格:
-                k = len([1 for b in 全部批注 if b[0] < 序]) + 1
+                k = len([1 for b in 全部批注 if b[0] < 序 and b[1]]) + 1
                 cx, vml = _批注XML(批注格)
                 z.writestr(f"xl/comments{k}.xml", cx.encode("utf-8"))
                 z.writestr(f"xl/drawings/vmlDrawing{k}.vml", vml.encode("utf-8"))

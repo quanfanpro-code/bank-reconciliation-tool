@@ -3,12 +3,11 @@ from contextlib import closing
 from zipfile import ZipFile
 from xml.etree import ElementTree
 
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from tests._excel假面 import load_workbook
+from tests._excel假面 import get_column_letter
 
-from 底稿筛选 import FilterCriteria, export_filtered_workpaper, read_filter_report
 from 报告列识别 import identify_columns
-from 紧凑报告 import 阅读表, 阅读颜色, 留痕颜色
+from 排版计划 import _紧凑阅读表 as 阅读表, _紧凑阅读色 as 阅读颜色, _紧凑留痕色 as 留痕颜色
 from tests.test_人工结果计算 import _报告, excel, _打开, _表
 
 
@@ -17,7 +16,9 @@ def test_五张蓝色阅读表与绿色完整留痕均可见(tmp_path):
                  [((0, 1), (0, 1, 2)), ((2,), (3,))])
     with closing(load_workbook(path)) as book:
         assert tuple(book.sheetnames[:5]) == 阅读表
-        assert all(sheet.sheet_state == 'visible' for sheet in book)
+        技术表 = {"运行参数", "大模型辅助明细", "解析异常明细"}
+        assert all(sheet.sheet_state == ('hidden' if sheet.title in 技术表 else 'visible')
+                   for sheet in book)
         for sheet in book:
             assert sheet.sheet_properties.tabColor.rgb == '00' + (阅读颜色 if sheet.title in 阅读表 else 留痕颜色)
             assert sheet.freeze_panes in (None, 'A2')
@@ -34,33 +35,6 @@ def test_五张蓝色阅读表与绿色完整留痕均可见(tmp_path):
         assert '收入差额' in identify_columns(book['对应明细'])
         assert all(sheet.row_dimensions[2].height == 15 for sheet in book if sheet.title not in 阅读表 and sheet.max_row > 1)
         assert book['核对总览'].freeze_panes is None
-
-
-def test_新人工入口保留下拉选项并且支持保存筛选(tmp_path):
-    path = _报告(tmp_path, [100, 200], [100, 200], [((0,), (0,)), ((1,), (1,))])
-    with closing(load_workbook(path)) as book:
-        sheet = book['待处理事项']
-        headers = identify_columns(sheet)
-        sheet.cell(2, headers['人工核对结果'], '否定对应')
-        sheet.cell(2, headers['备注'], '已检查原始记录')
-        assert any(sheet.cell(2, headers['人工核对结果']).coordinate in validation.sqref
-                   for validation in sheet.data_validations.dataValidation)
-        assert all(not book[name].data_validations.dataValidation for name in ('人工全查', '人工抽样'))
-        book.save(path)
-    groups, _ = read_filter_report(path)
-    assert groups.loc[groups['事项编号'] == 'M1', '最终状态'].iloc[0] == '否定对应'
-    output = tmp_path / '筛选.xlsx'
-    export_filtered_workpaper(path, output, FilterCriteria(statuses=('否定对应',)))
-    with closing(load_workbook(output)) as book:
-        sheet = book['待处理事项']
-        headers = identify_columns(sheet)
-        visible = [sheet.cell(row, headers['事项编号']).value for row in range(2, sheet.max_row + 1)
-                   if not sheet.row_dimensions[row].hidden]
-        assert visible == ['M1']
-        assert sheet.cell(2, headers['人工核对结果']).value == '否定对应'
-        assert sheet.cell(2, headers['备注']).value == '已检查原始记录'
-        assert book['筛选说明'].sheet_properties.tabColor.rgb == '00' + 阅读颜色
-        assert book['每日统计'].sheet_state == 'visible'
 
 
 def test_缺少余额明确显示未提供而不补零(tmp_path):
@@ -172,15 +146,15 @@ def test_Excel中新的唯一输入仍驱动原有公式(excel, tmp_path):
 
 def test_待处理表排序后仍按事项编号引用人工输入(excel, tmp_path):
     path = _报告(tmp_path, [100, 200], [100, 200], [((0,), (0,)), ((1,), (1,))])
-    with closing(load_workbook(path)) as book:
-        sheet = book['待处理事项']
-        # 模拟按整行排序，公式相对位置由Excel处理；静态输入和编号随整行移动。
-        headers = identify_columns(sheet)
-        for label in ('事项编号', '人工核对结果'):
-            a, b = sheet.cell(2, headers[label]), sheet.cell(3, headers[label])
-            a.value, b.value = b.value, a.value
-        book.save(path)
     with _打开(excel, path) as book:
+        sheet = book.Worksheets('待处理事项')
+        # 模拟按整行排序，公式相对位置由Excel处理；静态输入和编号随整行移动。
+        headers = list(sheet.UsedRange.Value[0])
+        for label in ('事项编号', '人工核对结果'):
+            column = headers.index(label) + 1
+            a, b = sheet.Cells(2, column).Value, sheet.Cells(3, column).Value
+            sheet.Cells(2, column).Value, sheet.Cells(3, column).Value = b, a
+        book.Save()
         _输入(excel, book, 'M1', '否定对应')
         index = {row['事项编号']: row for row in _表(book, '复核事项索引')}
         assert index['M1']['人工核对结果'] == '否定对应'

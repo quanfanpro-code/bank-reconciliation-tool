@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """排版对比工具的行为测试：一致返回空，差异必须报得出。"""
-from openpyxl import Workbook
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Font, PatternFill
-from openpyxl.worksheet.datavalidation import DataValidation
+from tests._excel假面 import (
+    DataValidation, Font, FormulaRule, PatternFill, Workbook,
+)
 
 from 排版对比 import 对比工作簿
 

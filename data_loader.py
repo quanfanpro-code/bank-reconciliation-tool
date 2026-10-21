@@ -441,16 +441,18 @@ class DataLoader:
         read_without_header = derived_columns is not None or header_rows > 1
         effective_skiprows = skiprows + header_rows if read_without_header else skiprows
 
-        if ext in ['.xlsx', '.xls']:
-            # Excel不支持分块读取，直接读取
-            df = pd.read_excel(
-                file_path,
-                dtype=object,
-                keep_default_na=False,
-                na_values=[''],
-                skiprows=effective_skiprows,
-                header=None if read_without_header else 0,
-            )
+        if ext == '.xlsx':
+            from 直读XML import 读表数据
+            列数, 行迭代 = 读表数据(file_path, 0, 跳过行=effective_skiprows)
+            rows = [[(np.nan if v is None or v == '' else v) for v in row] for row in 行迭代]
+            if read_without_header:
+                df = pd.DataFrame(rows)
+            elif rows:
+                df = pd.DataFrame(rows[1:], columns=list(rows[0]))
+            else:
+                df = pd.DataFrame()
+        elif ext == '.xls':
+            raise ValueError("不支持 .xls 老格式，请在 Excel 中另存为 .xlsx 后再导入")
         elif ext == '.csv':
             loaded = False
             for encoding in encodings:
@@ -637,8 +639,8 @@ class DataLoader:
         if '__source_row__' not in working_df.columns:
             working_df['__source_row__'] = working_df.index + 1
         if '__file_row__' not in working_df.columns:
-            # pd.read_excel(skiprows=N) 跳过 N 行，第 N+1 行成为表头，
-            # 第 N+2 行是第一条数据（DataFrame index 0）。
+            # 跳过 N 行后，第 N+1 行是表头，第 N+2 行是第一条数据
+            # （DataFrame index 0）。
             # 因此文件行号 = index + skiprows + 2（+1 转为1起始，+1 补偿表头行）
             working_df['__file_row__'] = (
                 working_df.index

@@ -8,11 +8,9 @@ import pytest
 from gui import ReconciliationApp
 from reporter import Reporter
 from tests.test_第五阶段交付边界 import _输入, _运行
-from tests.test_复核保存筛选 import _构造报告
 from tests.test_第三阶段特殊业务 import _df
 from matcher import Matcher
 from data_structures import MatcherConfig
-from 底稿筛选 import FilterCriteria, export_filtered_workpaper
 from 项目记录 import LocalProjectStore
 
 
@@ -87,24 +85,6 @@ def test_读取阶段点击停止不应继续生成报告(tmp_path, monkeypatch)
     assert [sha256(path.read_bytes()).hexdigest() for path in 输入] == 原哈希
 
 
-def test_筛选另存不能覆盖已有底稿(tmp_path):
-    来源 = _构造报告(tmp_path)
-    输出 = tmp_path / "已有筛选.xlsx"
-    输出.write_bytes(b"reviewed filter")
-    with pytest.raises(FileExistsError):
-        export_filtered_workpaper(来源, 输出, FilterCriteria())
-    assert 输出.read_bytes() == b"reviewed filter"
-
-
-@pytest.mark.parametrize("比例", [float("nan"), -0.1, 1.1])
-def test_筛选比例越界不能悄悄变成全选或空选(tmp_path, 比例):
-    来源 = _构造报告(tmp_path)
-    输出 = tmp_path / "筛选.xlsx"
-    with pytest.raises(ValueError):
-        export_filtered_workpaper(来源, 输出, FilterCriteria(coverage_ratio=比例))
-    assert not 输出.exists()
-
-
 def test_报告写入期间取消不交付正式文件(tmp_path):
     输入 = _输入(tmp_path)
     输出 = tmp_path / "报告.xlsx"
@@ -117,22 +97,6 @@ def test_报告写入期间取消不交付正式文件(tmp_path):
               cancel_requested=lambda: 状态["取消"])
     assert not 输出.exists()
     assert not (tmp_path / "历史").exists()
-
-
-def test_筛选保存中途失败不留下正式半成品(tmp_path, monkeypatch):
-    from pathlib import Path
-    from openpyxl import Workbook
-    来源 = _构造报告(tmp_path)
-    原哈希 = sha256(来源.read_bytes()).digest()
-    输出 = tmp_path / "筛选.xlsx"
-    def 保存故障(self, path):
-        Path(path).write_bytes(b"partial workbook")
-        raise OSError("模拟磁盘写入失败")
-    monkeypatch.setattr(Workbook, "save", 保存故障)
-    with pytest.raises(OSError, match="磁盘"):
-        export_filtered_workpaper(来源, 输出, FilterCriteria())
-    assert not 输出.exists()
-    assert sha256(来源.read_bytes()).digest() == 原哈希
 
 
 def test_任务运行期间出现同名底稿也不能覆盖(tmp_path):
@@ -150,7 +114,7 @@ def test_任务运行期间出现同名底稿也不能覆盖(tmp_path):
 def test_日期列的原始数字不能被排版改成错误日期(tmp_path, 列名, 原值):
     from contextlib import closing
     import pandas as pd
-    from openpyxl import load_workbook
+    from tests._excel假面 import load_workbook
     from make_excel import make_excel, beautify
     输出 = tmp_path / "原值.xlsx"
     make_excel(pd.DataFrame({列名: [原值]}), str(输出))
@@ -167,7 +131,7 @@ def test_真实日期对象仍按日期展示(tmp_path):
     from contextlib import closing
     from datetime import datetime
     import pandas as pd
-    from openpyxl import load_workbook
+    from tests._excel假面 import load_workbook
     from make_excel import make_excel
     输出 = tmp_path / "真实日期.xlsx"
     原日期 = datetime(2026, 1, 5)

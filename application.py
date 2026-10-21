@@ -83,8 +83,9 @@ def _source_info(
             sheet = "CSV"
         else:
             try:
-                with pd.ExcelFile(path) as workbook:
-                    sheet = workbook.sheet_names[0] if workbook.sheet_names else ""
+                from 直读XML import 读表名
+                表名 = 读表名(path)
+                sheet = 表名[0] if 表名 else ""
             except Exception:
                 sheet = "无法读取"
     return {

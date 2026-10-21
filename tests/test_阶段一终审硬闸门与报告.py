@@ -1,5 +1,7 @@
 ﻿"""第一阶段终审：自动映射、账户硬闸门和总体控制报告必须同源。"""
 from decimal import Decimal
+
+from tests._excel假面 import 存表
 from pathlib import Path
 
 import pandas as pd
@@ -50,8 +52,8 @@ def test_账户名称不得遮住真实账号且跨账户必须在匹配前阻�
 
     银行路径 = tmp_path / "银行.xlsx"
     账路径 = tmp_path / "序时账.xlsx"
-    银行.to_excel(银行路径, index=False)
-    序时账.to_excel(账路径, index=False)
+    存表(银行, 银行路径)
+    存表(序时账, 账路径)
     正式报告 = tmp_path / "正式报告.xlsx"
     with pytest.raises(InputPrecheckBlockedError) as 异常:
         run_reconciliation(

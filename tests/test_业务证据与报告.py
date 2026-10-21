@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pandas as pd
 import pytest
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook, 读Excel
 
 from data_structures import MatchCandidate, MatcherConfig, ProcessingStatus
 from gui import auto_select_auxiliary_columns
@@ -115,7 +115,7 @@ def test_大量竞争关系逐行保留不受单元格长度截断(tmp_path):
     reporter.matcher.selected_candidates = [selected]
     output = tmp_path / "大量竞争关系.xlsx"
     reporter.generate_report(str(output), config=MatcherConfig())
-    details = pd.read_excel(output, sheet_name="其他可能对应明细")
+    details = 读Excel(output, sheet_name="其他可能对应明细")
     assert len(details) == 3600
     assert details["对应方案"].nunique() == 1800
     ledger_rows = details.loc[details["来源"] == "银行存款序时账", "原文件行号"]

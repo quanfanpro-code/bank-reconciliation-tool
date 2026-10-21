@@ -73,6 +73,7 @@ class 表计划:
     条件格式: list = field(default_factory=list)    # [(区域, 条件规则)]
     冻结: str | None = None
     筛选: str | None = None
+    合并: set = field(default_factory=set)      # {"A1:B2"} 合并区域
     tab色: str | None = None
     状态: str = "visible"
     网格线: bool = True
@@ -142,16 +143,21 @@ from 排版共享 import 字母 as _字母, 条件规则
 _快速通道行数 = 5000
 
 
-def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
-    """翻译 make_excel._apply_styles（start_col=2，即前置空列=1）。"""
+def 应用底层主题(tp: 表计划, theme: str = "deep-navy", fmt_override: dict | None = None,
+               首列留白: bool = True):
+    """翻译 make_excel._apply_styles（首列留白=True 即 start_col=2 的前置空列布局）。"""
     from 排版共享 import (
         A_COL_WIDTH, FMT, ROW_HEIGHT, SUM_KEYWORDS, THEMES,
         _estimate_column_width, _infer_column_type,
     )
 
+    有效格式 = dict(FMT)
+    if fmt_override:
+        有效格式.update(fmt_override)
     t = THEMES[theme]
     df = tp.表
-    tp.前置空列 = 1
+    偏 = 1 if 首列留白 else 0
+    tp.前置空列 = 偏
     ncols = len(df.columns)
     nrows = 1 + len(df)
     大表 = len(df) > _快速通道行数
@@ -161,8 +167,8 @@ def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
     else:
         for r in range(1, nrows + 1):
             tp.行计划取(r).高 = ROW_HEIGHT
-    # A 列永远无数据（_write_data 从 B 列写起）→ 走 else 分支：宽 2
-    tp.前部列 = [列计划(宽=A_COL_WIDTH)]
+    # A 列永远无数据（_write_data 从 B 列写起）→ 宽 2；不留白时无前部列
+    tp.前部列 = [列计划(宽=A_COL_WIDTH)] if 偏 else []
 
     # 表头：主题表头样式 + 首行边框（TOP_BORDER）
     tp.表头样式 = 格样式(
@@ -178,7 +184,7 @@ def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
         cp = tp.列计划取(ci)
         cp.宽 = _estimate_column_width(str(df.columns[ci]), df.iloc[:, ci])
         is_num = col_type in ("money", "number", "pct")
-        nf = FMT.get(col_type)
+        nf = 有效格式.get(col_type)
         cp.基础样式 = 格样式(
             字体名="Arial", 字号=11,
             # 旧代码文本列 Font(name='Arial', size=11) 不带字色，仅数字列蓝色
@@ -191,7 +197,7 @@ def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
             for ri, v in enumerate(df.iloc[:, ci].tolist()):
                 if isinstance(v, (int, float)) and not isinstance(v, bool) \
                         and not (isinstance(v, float) and _math.isnan(v)):
-                    tp.盖格(ri + 2, ci + 2, 格样式(数字格式="General"))
+                    tp.盖格(ri + 2, ci + 1 + 偏, 格样式(数字格式="General"))
 
     # 合计行检测（末行首数据列含合计关键词）
     if len(df) > 0 and ncols > 0:
@@ -221,7 +227,7 @@ def 应用底层主题(tp: 表计划, theme: str = "deep-navy"):
     tp.网格线 = False
     tp.冻结 = "A2"
     if ncols > 0:
-        tp.筛选 = f"B1:{_字母(1 + ncols)}{max(1, nrows)}"
+        tp.筛选 = f"{_字母(偏 + 1)}1:{_字母(偏 + ncols)}{max(1, nrows)}"
 
 
 def 应用明细着色(tp: 表计划):
@@ -1246,8 +1252,8 @@ _紧凑阅读表 = ("核对总览", "待处理事项", "月度核对", "每日�
 _紧凑阅读色 = "BDD7EE"
 _紧凑留痕色 = "C6E0B4"
 _紧凑人工方式 = ("人工全查", "人工抽样")
-_紧凑列宽 = {"核对编号": 7, "处理要求": 9, "对应方式": 9, "哪里需要查看": 26,
-             "银行记录": 28, "序时账记录": 28, "人工核对结果": 19, "当前结果": 21,
+_紧凑列宽 = {"核对编号": 7, "处理要求": 9, "对应方式": 9, "核对动作": 45,
+             "银行记录": 46, "序时账记录": 46, "人工核对结果": 19, "当前结果": 21,
              "备注": 20, "完整明细": 7, "核对依据": 26, "日期": 11, "月份": 10,
              "需查看": 13, "余额说明": 21, "项目": 27, "结果": 43, "怎么看": 47}
 
@@ -1305,7 +1311,7 @@ def _含坐标(sqref, coord):
 def _写事项(簿: 簿计划):
     """翻译 紧凑报告._write_items：建待处理事项/对应明细，回收人工表入口。"""
     from 排版共享 import (记录金额 as _amounts, 记录描述 as _description,
-                          入选原因 as _plain_reason, 短结果 as _short_result)
+                          核对动作 as _action, 短结果 as _short_result)
 
     明细 = 簿.取表("核对明细")
     records = _defaultdict(lambda: {"银行流水": [], "序时账": []})
@@ -1337,9 +1343,7 @@ def _写事项(簿: 簿计划):
     priority = {"人工全查": 0, "人工抽样": 1, "留存备查": 2, "自动确认": 3}
     items.sort(key=lambda it: (priority.get(it["核对方式"], 2), int(it["核对编号"])))
     numbers = {it["事项编号"]: it["核对编号"] for it in items}
-    end = max(2, len(items) + 1)
-
-    待处理列 = ["核对编号", "处理要求", "哪里需要查看", "银行记录", "序时账记录",
+    待处理列 = ["核对编号", "处理要求", "核对动作", "银行记录", "序时账记录",
                 "收入差额", "支出差额", "人工核对结果", "当前结果", "备注",
                 "完整明细", "事项编号"]
     对应列 = ["核对编号", "对应方式", "银行记录", "银行收入", "银行支出",
@@ -1355,11 +1359,11 @@ def _写事项(簿: 簿计划):
         bi, be = _amounts(bank)
         ji, je = _amounts(journal)
         mode = it["核对方式"]
-        if mode != "自动确认":
+        if mode in _紧凑人工方式:
             pending_data.append([
                 it["核对编号"],
-                {"人工全查": "逐项核对", "人工抽样": "抽中核对"}.get(mode, "留存查看"),
-                _plain_reason(it, bank, journal, bi - ji, be - je),
+                {"人工全查": "逐项核对", "人工抽样": "抽中核对"}[mode],
+                _action(it, bank, journal, bi - ji, be - je),
                 _description(bank), _description(journal), bi - ji, be - je,
                 "", "", "", "查看", identity])
             row = len(pending_data) + 1
@@ -1374,6 +1378,7 @@ def _写事项(簿: 簿计划):
             matched_extra.append((it, len(bank) == len(journal) == 1,
                                   len(matched_data) + 1))
 
+    end = max(2, len(pending_data) + 1)
     待处理 = 表计划(名称="待处理事项", 表=pd.DataFrame(pending_data, columns=待处理列))
     待处理.物化空格 = True      # 旧路径紧凑层在重载后直接建表，空串格也带紧凑样式落格
     簿.表.append(待处理)
@@ -1384,7 +1389,7 @@ def _写事项(簿: 簿计划):
     for it, row in pending_extra:
         identity = it["事项编号"]
         for col in (3, 4, 5):
-            _text计划(待处理, row, col, 待处理.表.iat[row - 2, col - 1], 32)
+            _text计划(待处理, row, col, 待处理.表.iat[row - 2, col - 1], 100)
         待处理.盖格(row, 3, 格样式(批注=(
             "；".join(str(it.get(k) or "") for k in ("入选原因", "判断依据")),
             "原判断依据")))
@@ -1523,10 +1528,10 @@ def _建总览(簿: 簿计划):
         ("账上记录数", "日记账有效交易笔数", "进入本次核对的银行存款记账笔数。"),
         ("银行金额已对平比例", "银行当前已对平金额覆盖率", "收付金额分开累计；只计入已对应且差额为零的记录。"),
         ("账上金额已对平比例", "序时账当前已对平金额覆盖率", "人工查看过但仍有差额，不算已对平。"),
-        ("还需人工核对", "待处理事项数", "在待处理事项的黄色格选择结果；留存查看不计入待办。"),
+        ("还需人工核对", "待处理事项数", "待处理事项只列需要填写的项目；在黄色格选择结果。"),
         ("已完成人工核对", "已处理事项数", "已选有效结果的事项数，有差额的仍保留差额。"),
         ("人工选择有冲突", "人工选择冲突数", "同一原记录被重复采用时，需要重新选择。"),
-        ("还没找到对应的记录", "当前未对应原始记录数", "银行和账上合计笔数；未对应不等于漏记。"),
+        ("尚未确认对应的记录", "当前未对应原始记录数", "包含已配对但待人工确认的记录；真正单边记录见未对应记录表。"),
         ("期初余额差额", "期初余额差额", "银行余额减账上余额；未提供可用余额时不补零。"),
         ("余额核对情况", "余额核对", "每日和月度表保留收支、余额及差额。"),
     ]
@@ -1642,7 +1647,8 @@ def _紧凑样式(tp: 表计划, *, reading):
     for j in range(last - tp.前置空列, len(tp.列)):
         tp.列[j].隐藏 = True
     tp.tab色 = _紧凑阅读色 if reading else _紧凑留痕色
-    tp.状态 = "visible"
+    # 阅读表与留痕表全部可见，仅技术表（运行参数等）保持隐藏
+    tp.状态 = "hidden" if tp.名称 in _技术表 else "visible"
     tp.网格线 = False
     tp.缩放 = 100
     tp.左上角 = f"{_字母(first)}1"

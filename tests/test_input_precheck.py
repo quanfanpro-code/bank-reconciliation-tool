@@ -1,9 +1,10 @@
-from pathlib import Path
+﻿from pathlib import Path
 from decimal import Decimal
 
 import pandas as pd
 import pytest
-from openpyxl import Workbook
+from tests._excel假面 import Workbook, 存表, 读Excel
+from 直读XML import 读表名
 
 import input_precheck
 from application import run_reconciliation
@@ -33,7 +34,7 @@ def test_普通一行表头保持兼容(tmp_path):
     path = tmp_path / "普通表头.xlsx"
     pd.DataFrame(
         [{"日期": "2026-01-01", "收入": 100, "支出": 0, "摘要": "收款"}]
-    ).to_excel(path, index=False)
+    ).pipe(存表, path)
 
     loader = DataLoader()
     structure = loader.detect_table_structure(path)
@@ -504,7 +505,7 @@ def _write_direction_pair(
                 "摘要": "测试收款",
             }
         ]
-    ).to_excel(bank_path, index=False)
+    ).pipe(存表, bank_path)
     pd.DataFrame(
         [
             {
@@ -514,7 +515,7 @@ def _write_direction_pair(
                 "摘要": "测试收款",
             }
         ]
-    ).to_excel(journal_path, index=False)
+    ).pipe(存表, journal_path)
     mapping = {
         "date": "日期",
         "amount": "金额",
@@ -628,8 +629,8 @@ def test_最终报告包含与本次运行一致的输入预检查工作表(tmp_
     )
 
     assert result == output_path
-    assert "输入检查" in pd.ExcelFile(output_path).sheet_names
-    table = pd.read_excel(output_path, sheet_name="输入检查")
+    assert "输入检查" in 读表名(output_path)
+    table = 读Excel(output_path, sheet_name="输入检查")
     business_columns = [
         column for column in table.columns if not str(column).startswith("Unnamed:")
     ]

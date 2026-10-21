@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pandas as pd
 import pytest
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook
 
 from balance import BalanceRecalculator
 from data_loader import DataLoader, ParseErrorCollector

@@ -2,6 +2,8 @@
 from decimal import Decimal
 
 import pandas as pd
+
+from tests._excel假面 import 存表, 读Excel
 import pytest
 
 from application import run_reconciliation
@@ -115,8 +117,8 @@ def test_范围身份未完全验证必须贯穿到关系状态和正式报告(t
     银行路径 = tmp_path / f"{场景}_银行.xlsx"
     账路径 = tmp_path / f"{场景}_序时账.xlsx"
     输出路径 = tmp_path / f"{场景}_核对报告.xlsx"
-    银行.to_excel(银行路径, index=False)
-    日记账.to_excel(账路径, index=False)
+    银行.pipe(存表, 银行路径)
+    日记账.pipe(存表, 账路径)
     公共映射 = {
         "date": "日期",
         "amount": "金额",
@@ -155,7 +157,7 @@ def test_范围身份未完全验证必须贯穿到关系状态和正式报告(t
     assert all(候选.processing_status is ProcessingStatus.FLAGGED for 候选 in 匹配器.selected_candidates)
     assert all(候选.risk_level is RiskLevel.UNKNOWN for 候选 in 匹配器.selected_candidates)
 
-    报表 = pd.read_excel(输出路径, sheet_name=None)
+    报表 = 读Excel(输出路径, sheet_name=None)
     系统结论 = str(
         报表["核对结论"].loc[
             报表["核对结论"]["项目"] == "系统结论", "数值"

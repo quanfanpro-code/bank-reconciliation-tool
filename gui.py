@@ -1,4 +1,4 @@
-﻿"""
+"""
 银行流水核对工具 v3.0 — 卡片化 GUI
 
 布局结构（grid）：
@@ -26,8 +26,6 @@ from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
 from matching_policy import COUNTERPARTY_FIELD_KEYWORDS
-from 底稿筛选 import export_filtered_workpaper
-from 筛选窗口 import FilterDialog
 from 输入模板 import generate_input_templates
 from 项目记录 import LocalProjectStore
 
@@ -1751,17 +1749,11 @@ class ReconciliationApp(ctk.CTk):
             fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
             command=self.open_latest_report,
         ).grid(row=0, column=3, sticky="e", padx=(0, 6), pady=PAD_CARD[1])
-        self.btn_filter = ctk.CTkButton(
-            card, text="筛选导出", width=95, height=40,
-            fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
-            command=self.export_filtered_report,
-        )
-        self.btn_filter.grid(row=0, column=4, sticky="e", padx=(0, 6), pady=PAD_CARD[1])
         ctk.CTkButton(
             card, text="生成模板", width=95, height=40,
             fg_color=CLR_SECONDARY, hover_color=CLR_SECONDARY_HOVER,
             command=self.create_input_templates,
-        ).grid(row=0, column=5, sticky="e", padx=(0, 6), pady=PAD_CARD[1])
+        ).grid(row=0, column=4, sticky="e", padx=(0, 6), pady=PAD_CARD[1])
 
         # 弱按钮：切换主题（原页眉卡片控件挪入执行区）
         ctk.CTkButton(
@@ -1771,7 +1763,7 @@ class ReconciliationApp(ctk.CTk):
             text_color=("gray40", "gray70"),
             hover_color=("#E8E8E8", "#3A3A3A"),
             command=self.toggle_theme
-        ).grid(row=0, column=6, sticky="e", padx=(0, PAD_CARD[0]), pady=PAD_CARD[1])
+        ).grid(row=0, column=5, sticky="e", padx=(0, PAD_CARD[0]), pady=PAD_CARD[1])
 
         card.grid_columnconfigure(1, weight=1)
 
@@ -2113,54 +2105,6 @@ class ReconciliationApp(ctk.CTk):
             os.startfile(str(report))
         except Exception as exc:
             messagebox.showerror("无法打开", str(exc), parent=self)
-
-    def export_filtered_report(self):
-        dialog = FilterDialog(self)
-        self.wait_window(dialog)
-        if dialog.result is None:
-            return
-        criteria = dialog.result
-        source = dialog.source_path
-        output = filedialog.asksaveasfilename(title="另存筛选底稿", defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
-        if not output:
-            return
-        self.btn_filter.configure(state="disabled", text="筛选中…")
-        self._set_progress(0.0)
-        self.log("开始筛选导出，窗口可以继续响应；较长步骤每15秒报告一次运行状态。")
-
-        def worker():
-            done = threading.Event()
-            current_stage = ["准备筛选"]
-
-            def report_progress(value):
-                self._set_progress(value)
-
-            def report_log(message):
-                current_stage[0] = str(message)
-                self.log(message)
-
-            def heartbeat():
-                while not done.wait(15):
-                    self.log(f"筛选仍在运行：{current_stage[0]}")
-
-            threading.Thread(target=heartbeat, daemon=True).start()
-            try:
-                result = export_filtered_workpaper(
-                    source,
-                    output,
-                    criteria,
-                    progress_callback=report_progress,
-                    log_callback=report_log,
-                )
-                self.log(f"筛选底稿已保存：{result}")
-                self._safe_ui(os.startfile, str(result))
-            except Exception as exc:
-                self._safe_ui(messagebox.showerror, "筛选导出失败", str(exc), parent=self)
-            finally:
-                done.set()
-                self._safe_ui(self.btn_filter.configure, state="normal", text="筛选导出")
-
-        threading.Thread(target=worker, daemon=True).start()
 
     def create_input_templates(self):
         folder = filedialog.askdirectory(title="选择模板保存文件夹")

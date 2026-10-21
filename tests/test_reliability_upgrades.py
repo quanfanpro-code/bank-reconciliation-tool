@@ -280,10 +280,8 @@ def test_运行依赖清单覆盖桌面版和三种输入格式():
     for package in (
         "customtkinter",
         "numpy",
-        "openpyxl",
         "pandas",
         "psutil",
-        "xlrd",
     ):
         assert any(
             line.lower().startswith(package)

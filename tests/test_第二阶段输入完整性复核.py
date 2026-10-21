@@ -1,8 +1,10 @@
-"""输入完整性独立复核：余额覆盖、显式范围、逐行人口与阻断证据。"""
+﻿"""输入完整性独立复核：余额覆盖、显式范围、逐行人口与阻断证据。"""
 from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+
+from tests._excel假面 import 存表, 读Excel
 import pytest
 
 from application import run_reconciliation
@@ -112,7 +114,7 @@ def test_标准化方向阻断的问题报告保存逐行解析错误(tmp_path):
     银行, 账 = 原表(), 原表()
     银行["方向"] = ["未知方向", "无法识别方向"]
     for 名称, 数据 in [("银行.xlsx", 银行), ("序时账.xlsx", 账)]:
-        数据.to_excel(tmp_path / 名称, index=False)
+        数据.pipe(存表, tmp_path / 名称)
     with pytest.raises(InputPrecheckBlockedError) as 错:
         run_reconciliation(str(tmp_path / "银行.xlsx"), str(tmp_path / "序时账.xlsx"),
             {**映射, "mode": "single_amount_with_direction", "direction": "方向"}, 映射,
@@ -120,7 +122,7 @@ def test_标准化方向阻断的问题报告保存逐行解析错误(tmp_path):
             journal_header_rows=1, output_path=tmp_path / "正式报告.xlsx")
     assert not (tmp_path / "正式报告.xlsx").exists()
     assert 错.value.report_path
-    表 = pd.read_excel(Path(错.value.report_path), sheet_name=None)
+    表 = 读Excel(Path(错.value.report_path), sheet_name=None)
     assert "解析异常明细" in 表
     文字 = " ".join(表["解析异常明细"].fillna("").astype(str).to_numpy().ravel())
     assert "无法识别方向" in 文字 and "方向解析失败" in 文字

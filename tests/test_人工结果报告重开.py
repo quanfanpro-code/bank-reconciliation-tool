@@ -1,9 +1,9 @@
-﻿"""用户在 Excel 保存人工结果后，原最近报告入口仍能打开报告。"""
+"""用户在 Excel 保存人工结果后，原最近报告入口仍能打开报告。"""
 
 from types import SimpleNamespace
 
 import pytest
-from openpyxl import Workbook, load_workbook
+from tests._excel假面 import Workbook, load_workbook
 
 import gui
 from 项目记录 import LocalProjectStore
@@ -25,8 +25,10 @@ def test_人工修改报告后最近报告可打开且原指纹仍保留(tmp_pat
                           bank_mapping={}, journal_mapping={}, parameters={}, result_counts={})
     历史路径 = 存储.projects_dir / (记录['project_id'] + '.json')
     原记录 = 历史路径.read_bytes()
-    簿 = load_workbook(报告)
-    簿['人工全查']['B2'] = '确认对应'
+    簿 = Workbook()
+    簿.active.title = '人工全查'
+    簿.active.append(['事项编号', '人工核对结果'])
+    簿.active.append(['R001', '确认对应'])
     簿.save(报告)
     with pytest.raises(ValueError, match='内容已经改变'):
         存储.resolve_report(记录['project_id'])

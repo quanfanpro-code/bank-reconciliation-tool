@@ -2,7 +2,7 @@
 """排版新路径接入：reporter._generate_report 走 排版计划+报告写入 单次写入。"""
 from contextlib import closing
 
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook
 
 from tests.test_复核工作簿 import _报告
 

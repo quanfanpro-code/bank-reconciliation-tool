@@ -104,18 +104,49 @@ def 入选原因(item, bank, journal, income_diff, expense_diff):
     return "；".join(parts)
 
 
+def 核对动作(item, bank, journal, income_diff, expense_diff):
+    """把待办事项翻译成可以直接执行的核对动作。"""
+    if not bank:
+        return "查银行流水有无这笔账；找到后核对日期、金额和对方，选黄色格；找不到则备注原因"
+    if not journal:
+        return "查序时账有无这笔银行收付；找到后核对日期、金额和对方，选黄色格；找不到则备注原因"
+    reason = str(item.get("判断依据") or "")
+    if "冲突" in reason:
+        return "核对双方对方名称、账号等冲突信息；确属同一笔才选确认对应，否则选否定对应"
+    if "多个" in reason or "歧义" in reason:
+        action = "比较完整明细中的其他对应方案，核实原表记录后在黄色格选正确关系"
+        return action + "，并在备注写明差额原因" if income_diff or expense_diff else action
+    if income_diff or expense_diff:
+        return "核对是否同一笔并查明收支差额；在黄色格选结果，备注写明差额原因"
+    if len(bank) > 1 or len(journal) > 1:
+        return "逐笔核对双方完整组成、金额及业务范围；一致才在黄色格选确认对应"
+    return "核对日期、金额、对方名称和业务说明；一致选黄色格确认对应，否则选否定对应"
+
+
 def 记录描述(records):
     """原 紧凑报告._description。"""
     if not records:
         return "尚未找到对应记录"
     summaries = list(dict.fromkeys(str(row.get("摘要") or "") for row in records if row.get("摘要")))
-    parties = list(dict.fromkeys(str(row.get("对方及凭证") or "") for row in records if row.get("对方及凭证")))
+    parties = list(dict.fromkeys(
+        part for row in records
+        for part in str(row.get("对方及凭证") or "").split("；")
+        if part and part not in summaries
+    ))
     days = sorted({str(row["日期"])[:10] for row in records if row.get("日期")})
     day = days[0] if len(days) == 1 else days[0] + "至" + days[-1] if days else ""
+    source_rows = list(dict.fromkeys(
+        match.group(1)
+        for row in records
+        if (match := re.search(r"第(\d+)行", str(row.get("原始出处") or "")))
+    ))
+    source_hint = "原表第" + "、".join(source_rows[:3]) + "行" if source_rows else ""
+    if len(source_rows) > 3:
+        source_hint += "等"
     content = "；".join(summaries[:2] + parties[:2])
     if len(summaries) > 2 or len(parties) > 2:
         content += "等，完整组成见明细"
-    return f"{day} {len(records)}笔 " + content
+    return " ".join(part for part in (day, f"{len(records)}笔", source_hint, content) if part)
 
 
 def 记录金额(records):
@@ -287,4 +318,10 @@ def atomic_output_path(output_path):
     with TemporaryDirectory(prefix="核对暂存_", dir=destination.parent) as directory:
         temporary = Path(directory) / destination.name
         yield temporary
-        temporary.rename(destination)
+        try:
+            temporary.rename(destination)
+        except FileExistsError:
+            raise FileExistsError(
+                f"输出文件已存在，未覆盖：{destination}\n"
+                "请先关闭并移走（或改名）旧文件后再试。"
+            ) from None

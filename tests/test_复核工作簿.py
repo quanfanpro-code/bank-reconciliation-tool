@@ -2,7 +2,7 @@
 from contextlib import closing
 from decimal import Decimal
 
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook
 
 from data_structures import MatcherConfig
 from matcher import Matcher

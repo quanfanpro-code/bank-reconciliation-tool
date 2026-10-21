@@ -1849,6 +1849,16 @@ class Matcher:
                         if composition(other_position) == composition(position):
                             continue
                         if (
+                            candidate.match_type == "exact_1to1"
+                            and candidate.metrics.total_diff_li == 0
+                            and candidate.date_span_days == 0
+                            and candidate.evidence.get("business_strength", 0) >= 2
+                            and other_priority == own_priority
+                            and other.date_span_days > 0
+                        ):
+                            # 同等业务证据下，跨日备选不应否定同日逐笔关系。
+                            continue
+                        if (
                             full_group
                             and set(other.bank_idxs) <= candidate_bank
                             and set(other.journal_idxs) <= candidate_journal

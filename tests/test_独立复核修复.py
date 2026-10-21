@@ -2,7 +2,7 @@
 """独立复核发现问题的回归测试：空待查表空行、未达差异误降级、业务链交叉引用、表名错别字。"""
 import pandas as pd
 import pytest
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook
 
 from application import run_reconciliation
 from data_structures import MatcherConfig, ProcessingStatus

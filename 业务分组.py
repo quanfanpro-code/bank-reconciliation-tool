@@ -296,6 +296,11 @@ def business_evidence(bank, journal):
     )
     same_party = any(len(parties[0][key]) == 1 and parties[0][key] == parties[1][key]
                      for key in parties[0].keys() & parties[1].keys())
+    narrative_party = ""
+    if len(bank) == len(journal) == 1 and not parties[1].get("对方户名"):
+        narrative = journal[0]["summary"]
+        narrative_party = next((name for name in parties[0].get("对方户名", ())
+                                if len(name) >= 8 and name in narrative), "")
     if common_id:
         strength, basis = 4, "共同业务编号或批次：" + "、".join(
             category + " " + value
@@ -311,6 +316,8 @@ def business_evidence(bank, journal):
         strength, basis = 3, "明确对方及具体摘要共同对应"
     elif same_party:
         strength, basis = 2, "明确对方信息对应"
+    elif narrative_party:
+        strength, basis = 2, "银行对方名称完整出现在账上摘要：" + narrative_party
     elif same_summary:
         strength, basis = 1, "摘要对应"
     else:
@@ -323,7 +330,7 @@ def business_evidence(bank, journal):
             "salary_group": all(salary_sides),
             "batch_category": common_batch_category,
             "specific_summary_group": same_summary,
-            "same_party_group": same_party,
+            "same_party_group": same_party or bool(narrative_party),
             "aggregate_party_hierarchy_hint": aggregate_party_hierarchy_hint,
             "aggregate_party_categories": tuple(sorted(aggregate_party_categories)),
             "business_conflicts": tuple(conflicts)}

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook, 存表
 
 from application import run_reconciliation
 from data_structures import MatcherConfig
@@ -39,8 +39,8 @@ def _write_pair(tmp_path, bank_rows, journal_rows):
     bank_rows, journal_rows = _attach_account(bank_rows), _attach_account(journal_rows)
     bank_path = tmp_path / "银行流水.xlsx"
     journal_path = tmp_path / "序时账.xlsx"
-    pd.DataFrame(bank_rows).to_excel(bank_path, index=False)
-    pd.DataFrame(journal_rows).to_excel(journal_path, index=False)
+    存表(pd.DataFrame(bank_rows), bank_path)
+    存表(pd.DataFrame(journal_rows), journal_path)
     return bank_path, journal_path
 
 
@@ -204,7 +204,7 @@ def test_方向列数据值不参与表头层级评分(tmp_path):
         {"日期": "2026-02-14", "金额": 300, "方向": "借", "摘要": "补班日付款"},
     ]
     path = tmp_path / "混合方向.xlsx"
-    pd.DataFrame(rows).to_excel(path, index=False)
+    存表(pd.DataFrame(rows), path)
     structure = DataLoader().detect_table_structure(path)
     assert structure.header_rows == 1
     assert "日期" in structure.columns
@@ -220,6 +220,6 @@ def test_真实两级表头仍按两级识别(tmp_path):
         ["2026-01-13", None, 200, "付货款"],
     ])
     path = tmp_path / "两级表头.xlsx"
-    frame.to_excel(path, index=False, header=False)
+    存表(frame, path, header=False)
     structure = DataLoader().detect_table_structure(path)
     assert structure.header_rows == 2

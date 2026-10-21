@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""
-make_excel — 从 DataFrame 生成摩根士丹利标准格式的 Excel 报表。
-beautify — 对已有 Excel 文件只改格式不改数据（保留公式和值）。
+# -*- coding: utf-8 -*-
+"""make_excel — 从 DataFrame 生成摩根士丹利标准格式的 Excel 报表。
+beautify — 对已有 Excel 文件只改格式不改数据（值与公式原文保留；公式缓存值
+不由本工具计算，文件带自动重算标记，Excel 打开时重算）。
 
 用法:
     from make_excel import make_excel, beautify
@@ -12,161 +13,45 @@ beautify — 对已有 Excel 文件只改格式不改数据（保留公式和值
     python make_excel.py data.csv output.xlsx
     python make_excel.py --beautify input.xlsx output.xlsx
 
-依赖: pandas, openpyxl（openpyxl>=3.0，无 xlwings）
-设计: 写数据 → 上格式 → 估列宽 → 一次保存，线性流程不回头。
+引擎: 直写XML（写）+ 直读XML（读），不再依赖 openpyxl；仅支持 xlsx。
+设计: DataFrame → 排版计划.表计划 → 直写XML 一次 zip 成型。
+限制: beautify 要求表头在第 1 行（上方有空行/标题行的文件会明确报错）。
 """
 
 import argparse
 import re
-import sys
-from contextlib import contextmanager
-from tempfile import TemporaryDirectory
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from shutil import copy2
-from typing import Union, Optional
+from typing import Optional
 
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+
+from 排版共享 import (
+    A_COL_WIDTH, FMT, MAX_COL_WIDTH, MIN_COL_WIDTH, ROW_HEIGHT, SUM_KEYWORDS,
+    THEMES, atomic_output_path,
+    列类型推断, 列宽估算,
+)
+from 排版计划 import 表计划, 簿计划, 格样式, 合并样式, 列计划, 应用底层主题
+from 直写XML import 写簿
+
+__all__ = [
+    "make_excel", "beautify", "atomic_output_path",
+    "THEMES", "FMT", "SUM_KEYWORDS", "ROW_HEIGHT", "A_COL_WIDTH",
+    "MIN_COL_WIDTH", "MAX_COL_WIDTH",
+]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 格式常量 — 摩根士丹利标准
-# ═══════════════════════════════════════════════════════════════════════════
-
-# 框线（只有上下，无竖线）
-THICK = Side(style='medium', color='000000')
-DASHED = Side(style='dashed', color='808080')
-NO = Side(style=None)
-
-TOP_BORDER = Border(top=THICK, bottom=DASHED, left=NO, right=NO)
-MID_BORDER = Border(top=DASHED, bottom=DASHED, left=NO, right=NO)
-BOTTOM_BORDER = Border(top=DASHED, bottom=THICK, left=NO, right=NO)
-
-# 表头：水蓝底白字
-HDR_FILL = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
-HDR_FONT = Font(name='Arial', size=11, bold=True, color='FFFFFF')
-HDR_ALIGN = Alignment(horizontal='right', vertical='center')
-
-# 数据字体颜色（摩根系：蓝=手动输入，黑=公式结果）
-DATA_FONT_BLUE = Font(name='Arial', size=11, color='0000FF')
-DATA_FONT_BLACK = Font(name='Arial', size=11, color='000000')
-
-# 合计行样式
-SUM_FILL = PatternFill(start_color='D9E2F3', end_color='D9E2F3', fill_type='solid')
-SUM_FONT = Font(name='Arial', size=11, bold=True)
-
-# 合计行关键词（当最后一行的首列文本匹配时，视为合计行）
-SUM_KEYWORDS = ('合计', '小计', '总计', '汇总', 'sum', 'total', 'subtotal', '小計', '合計')
-
-# 数据对齐
-LEFT_ALIGN = Alignment(horizontal='left', vertical='center')
-RIGHT_ALIGN = Alignment(horizontal='right', vertical='center')
-
-# 数字格式
-FMT = {
-    'money': '#,##0.00',
-    'number': '#,##0',
-    'pct': '0.00%',
-    'date': 'yyyy/mm/dd',
-    'text': '@',
-    'unknown': '@',
-}
-
-# 布局
-ROW_HEIGHT = 18
-A_COL_WIDTH = 2
-MIN_COL_WIDTH = 10
-MAX_COL_WIDTH = 50
+# 兼容别名：测试与外部调用沿用旧名
+_infer_column_type = 列类型推断
+_estimate_column_width = 列宽估算
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 色系主题
-# ═══════════════════════════════════════════════════════════════════════════
+def _char_width(text) -> int:
+    """中文字符计2，拉丁/数字计1。"""
+    return sum(2 if ord(ch) > 127 else 1 for ch in str(text))
 
-THEMES = {
-    'default': {
-        'label': '水蓝',
-        'header_fill': '4472C4',
-        'header_font_color': 'FFFFFF',
-        'sum_fill': 'D9E2F3',
-        'sum_font_bold': True,
-        'sum_font_color': '000000',
-        'data_font_blue': '0000FF',
-        'data_font_black': '000000',
-        'desc': '经典水蓝（原摩根系默认）',
-    },
-    'deep-navy': {
-        'label': '深海蓝',
-        'header_fill': '1F4E79',
-        'header_font_color': 'FFFFFF',
-        'sum_fill': 'D6E4F0',
-        'sum_font_bold': True,
-        'sum_font_color': '000000',
-        'data_font_blue': '0000FF',
-        'data_font_black': '000000',
-        'desc': '深海蓝表头，更沉稳专业',
-    },
-    'jade': {
-        'label': '墨玉绿',
-        'header_fill': '375623',
-        'header_font_color': 'FFFFFF',
-        'sum_fill': 'E2EFDA',
-        'sum_font_bold': True,
-        'sum_font_color': '000000',
-        'data_font_blue': '0000FF',
-        'data_font_black': '000000',
-        'desc': '墨绿表头，清爽自然',
-    },
-    'slate': {
-        'label': '陨石灰蓝',
-        'header_fill': '404040',
-        'header_font_color': 'FFFFFF',
-        'sum_fill': 'D9D9D9',
-        'sum_font_bold': True,
-        'sum_font_color': '000000',
-        'data_font_blue': '0000FF',
-        'data_font_black': '000000',
-        'desc': '深灰表头 + 蓝色色阶，现代极简',
-    },
-    'burgundy': {
-        'label': '勃艮第红',
-        'header_fill': '843C0C',
-        'header_font_color': 'FFFFFF',
-        'sum_fill': 'FCE4D6',
-        'sum_font_bold': True,
-        'sum_font_color': '000000',
-        'data_font_blue': '0000FF',
-        'data_font_black': '000000',
-        'desc': '酒红表头，暖色调高级感',
-    },
-    'coral': {
-        'label': '珊瑚橙',
-        'header_fill': 'D84B4B',
-        'header_font_color': 'FFFFFF',
-        'sum_fill': 'FDE8E8',
-        'sum_font_bold': True,
-        'sum_font_color': '000000',
-        'data_font_blue': '0000FF',
-        'data_font_black': '000000',
-        'desc': '珊瑚红表头，活泼明亮',
-    },
-}
-
-AVAILABLE_THEMES = ', '.join(sorted(THEMES.keys()))
-
-
-@contextmanager
-def atomic_output_path(output_path):
-    """先在同盘临时位置完成写入，Windows 改名时拒绝覆盖同名文件。"""
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix="核对暂存_", dir=destination.parent) as directory:
-        temporary = Path(directory) / destination.name
-        yield temporary
-        temporary.rename(destination)
+AVAILABLE_THEMES = ", ".join(sorted(THEMES.keys()))
 
 
 def _validate_theme(theme_name: str):
@@ -177,247 +62,12 @@ def _validate_theme(theme_name: str):
         )
 
 
-def _build_theme_styles(theme_name: str):
-    """根据主题名构建 PatternFill / Font 对象。"""
-    _validate_theme(theme_name)  # 保险：二次校验
-    t = THEMES[theme_name]
-    return {
-        'header_fill': PatternFill(start_color=t['header_fill'], end_color=t['header_fill'], fill_type='solid'),
-        'header_font': Font(name='Arial', size=11, bold=True, color=t['header_font_color']),
-        'sum_fill': PatternFill(start_color=t['sum_fill'], end_color=t['sum_fill'], fill_type='solid'),
-        'sum_font': Font(name='Arial', size=11, bold=t['sum_font_bold'], color=t['sum_font_color']),
-        'data_font_blue': Font(name='Arial', size=11, color=t['data_font_blue']),
-        'data_font_black': Font(name='Arial', size=11, color=t['data_font_black']),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 列类型推断
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _infer_column_type(name: str, series: pd.Series) -> str:
-    """根据列名关键词 + 值特征推断列类型。"""
-    n = name.lower()
-
-    # ── 关键词匹配（优先级：pct > date > text > money）──
-    # "率"优先检测，避免"毛利率"被 money 关键词误匹配
-    if re.search(r'(率$|占比|百分比|增长率|利润率|达成率|rate$|ratio$|margin|pct|percent)', n):
-        return 'pct'
-    if re.search(r'(日期|时间|年月|期间|年份|月份|date|time|year|month)', n):
-        return 'date'
-    if re.search(r'(编号|id|单号|编码|电话|手机|备注|说明|名称|地址|描述|号码|订单号|负责人|姓名|联系人|部门|岗位|phone|email|code|desc|address)', n):
-        return 'text'
-    if re.search(r'(金额|余额|价格|收入|成本|费用|毛利额|净利|合计|总额|售价|单价|预算|支出|毛利(?!率)|返点|佣金|折扣|补贴|周转|本金|amount|balance|price|cost|revenue|total|budget|expense|commission|discount|rebate|profit|spending)', n):
-        return 'money'
-
-    # ── 值特征 ──
-    clean = series.dropna()
-    if len(clean) == 0:
-        return 'unknown'
-
-    try:
-        if pd.api.types.is_datetime64_any_dtype(clean):
-            return 'date'
-
-        if pd.api.types.is_numeric_dtype(clean):
-            sample = clean.head(20)
-            if pd.api.types.is_float_dtype(sample):
-                # 0~1 之间的浮点 → 百分比
-                if (sample >= 0).all() and (sample <= 1).all() and sample.nunique() > 2:
-                    return 'pct'
-                return 'money'
-            return 'number'
-
-        # 长数字字符串 → text
-        str_sample = clean.astype(str).head(20)
-        if str_sample.str.match(r'^\d{12,}$').any():
-            return 'text'
-    except Exception:
-        pass
-
-    return 'unknown'
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 列宽估算
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _char_width(text: str) -> int:
-    """中文字符计2，拉丁/数字计1。"""
-    return sum(2 if ord(ch) > 127 else 1 for ch in str(text))
-
-
-def _estimate_column_width(header: str, series: pd.Series) -> int:
-    """估算列宽：取表头和数据中最大字符宽度 + padding。"""
-    max_w = _char_width(header)
-    for v in series.dropna():
-        try:
-            w = _char_width(str(v))
-            if w > max_w:
-                max_w = w
-        except Exception:
-            pass
-    return max(MIN_COL_WIDTH, min(max_w + 2, MAX_COL_WIDTH))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 格式引擎
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _apply_styles(ws, df: pd.DataFrame, theme: str = 'default', fmt_override: Optional[dict] = None):
-    """对已写入数据的工作表应用摩根系格式。
-
-    fmt_override : dict, optional
-        自定义数字格式，如 {'money': '#,##0.0', 'pct': '0.0%'}。
-        合并到默认 FMT 之上，同名覆盖。
-    """
-    s = _build_theme_styles(theme)
-    # 合并自定义数字格式
-    effective_fmt = dict(FMT)
-    if fmt_override:
-        effective_fmt.update(fmt_override)
-    nrows = 1 + len(df)   # 表头 + 数据行
-    ncols = len(df.columns)
-    start_col = 2         # B 列
-
-    # 1. 行高 + A列宽 + A列格式（如果A列有数据）
-    for r in range(1, nrows + 1):
-        ws.row_dimensions[r].height = ROW_HEIGHT
-    a_has_data = any(ws.cell(row=r, column=1).value is not None for r in range(2, nrows + 1))
-    if a_has_data:
-        a_max = _char_width(str(ws.cell(row=1, column=1).value or ''))
-        for r in range(2, nrows + 1):
-            v = ws.cell(row=r, column=1).value
-            if v is not None:
-                w = _char_width(str(v))
-                if w > a_max:
-                    a_max = w
-        ws.column_dimensions['A'].width = max(MIN_COL_WIDTH, min(a_max + 2, MAX_COL_WIDTH))
-        # A列表头 + 数据格式（类型推断，右对齐/蓝色）
-        ws.cell(row=1, column=1).font = s['header_font']
-        ws.cell(row=1, column=1).fill = s['header_fill']
-        ws.cell(row=1, column=1).alignment = HDR_ALIGN
-        # A 列类型推断（与 B~K 列一致）
-        _a_col_name = str(df.columns[0]) if len(df.columns) > 0 else ''
-        _a_col_type = _infer_column_type(_a_col_name, df.iloc[:, 0]) if len(df.columns) > 0 else 'unknown'
-        _a_is_num = _a_col_type in ('money', 'number', 'pct')
-        _a_align = RIGHT_ALIGN if _a_is_num else LEFT_ALIGN
-        _a_nf = effective_fmt.get(_a_col_type)
-        for r in range(2, nrows + 1):
-            cell = ws.cell(row=r, column=1)
-            cell.alignment = _a_align
-            if _a_nf:
-                cell.number_format = 'General' if _a_col_type == 'date' and cell.data_type == 'n' else _a_nf
-            if _a_is_num:
-                cell.font = s['data_font_blue']
-            else:
-                cell.font = Font(name='Arial', size=11)
-    else:
-        ws.column_dimensions['A'].width = A_COL_WIDTH
-
-    # 2. 列宽估算 + 类型推断（一次扫描）
-    col_types = {}
-    for ci in range(ncols):
-        col_name = df.columns[ci]
-        col_letter = get_column_letter(ci + start_col)
-        col_type = _infer_column_type(str(col_name), df.iloc[:, ci])
-        col_types[ci] = col_type
-
-        est = _estimate_column_width(str(col_name), df.iloc[:, ci])
-        ws.column_dimensions[col_letter].width = est
-
-    # 3. 表头（第1行）
-    for ci in range(ncols):
-        cell = ws.cell(row=1, column=ci + start_col)
-        cell.font = s['header_font']
-        cell.fill = s['header_fill']
-        cell.alignment = HDR_ALIGN
-
-    # 4. 数据行（统一 Arial 11 + 数字格式 + 对齐 + 字体颜色）
-    for ci in range(ncols):
-        ct = col_types.get(ci, 'unknown')
-        is_num = ct in ('money', 'number', 'pct')
-        align = RIGHT_ALIGN if is_num else LEFT_ALIGN
-        nf = effective_fmt.get(ct)
-
-        for ri in range(2, nrows + 1):
-            cell = ws.cell(row=ri, column=ci + start_col)
-            # 所有单元格统一 Arial 11
-            cell.font = s['data_font_blue'] if is_num else Font(name='Arial', size=11)
-            cell.alignment = align
-            if nf:
-                # 日期列中的原始数字不应被误当作 Excel 日期序号。
-                cell.number_format = 'General' if ct == 'date' and cell.data_type == 'n' else nf
-
-    # 5. 合计行检测与特殊格式（最后一行的首列含合计关键词）
-    last_val = ws.cell(row=nrows, column=start_col).value
-    is_summary = (
-        nrows > 1
-        and last_val is not None
-        and any(kw in str(last_val) for kw in SUM_KEYWORDS)
-    )
-    if is_summary:
-        for ci in range(ncols):
-            cell = ws.cell(row=nrows, column=ci + start_col)
-            cell.font = s['sum_font']
-            cell.fill = s['sum_fill']
-
-    # 6. 边框（无竖线，上下粗中间虚线）
-    for ci in range(ncols):
-        col = ci + start_col
-        for ri in range(1, nrows + 1):
-            cell = ws.cell(row=ri, column=col)
-            if ri == 1:
-                cell.border = TOP_BORDER
-            elif ri == nrows:
-                cell.border = BOTTOM_BORDER
-            else:
-                cell.border = MID_BORDER
-    # A列边框（如果有数据）
-    if a_has_data:
-        for ri in range(1, nrows + 1):
-            cell = ws.cell(row=ri, column=1)
-            if ri == 1:
-                cell.border = TOP_BORDER
-            elif ri == nrows:
-                cell.border = BOTTOM_BORDER
-            else:
-                cell.border = MID_BORDER
-
-    # 7. 右侧空白列（宽 3）
-    last_data_col = start_col + ncols - 1
-    right_col = get_column_letter(last_data_col + 1)
-    ws.column_dimensions[right_col].width = 3
-
-    # 8. 网格线 + 冻结
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = 'A2'
-    if ncols > 0:
-        ws.auto_filter.ref = (
-            f"{get_column_letter(start_col)}1:"
-            f"{get_column_letter(last_data_col)}{max(1, nrows)}"
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 写数据
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _write_data(ws, df: pd.DataFrame):
-    """从 B2 开始写入（第1行 = 表头，A列留空）。"""
-    for ci, col_name in enumerate(df.columns):
-        ws.cell(row=1, column=ci + 2, value=col_name)
-    for ri, (_, row) in enumerate(df.iterrows()):
-        for ci, value in enumerate(row):
-            ws.cell(row=ri + 2, column=ci + 2, value=value)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # 主入口
 # ═══════════════════════════════════════════════════════════════════════════
 
 def make_excel(data, output_path: str, sheet_name: str = 'Sheet1', theme: str = 'default',
-               fmt_override: Optional[dict] = None) -> str:
+               fmt_override: Optional[dict] = None, 首列留白: bool = True) -> str:
     """生成摩根系标准格式 Excel。
 
     参数
@@ -433,6 +83,9 @@ def make_excel(data, output_path: str, sheet_name: str = 'Sheet1', theme: str = 
     fmt_override : dict, optional
         自定义数字格式，如 {'money': '#,##0.0', 'pct': '0.0%'}。
         合并到默认 FMT 之上，同名覆盖。
+    首列留白 : bool, default True
+        True 时 A 列留 2 宽空列、数据从 B 列开始（审计报告版式）；
+        False 时数据从 A 列开始（导入模板等直接填写的场景）。
 
     返回
     ----
@@ -446,21 +99,20 @@ def make_excel(data, output_path: str, sheet_name: str = 'Sheet1', theme: str = 
     else:
         sheets = list(data)
 
-    wb = Workbook()
-    for name in list(wb.sheetnames):
-        del wb[name]
-
-    for idx, (name, df) in enumerate(sheets):
+    计划 = 簿计划()
+    for name, df in sheets:
         if df is None:
             continue
         safe_name = re.sub(r'[\\/*?:\[\]]', '_', str(name))[:31]
-        ws = wb.create_sheet(title=safe_name, index=idx)
-        _write_data(ws, df)
-        _apply_styles(ws, df, theme=theme, fmt_override=fmt_override)
+        tp = 表计划(名称=safe_name, 表=df)
+        应用底层主题(tp, theme=theme, fmt_override=fmt_override, 首列留白=首列留白)
+        计划.表.append(tp)
+    if not 计划.表:
+        raise ValueError("没有可写入的工作表（全部数据为空）")
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(out))
+    写簿(计划, str(out))
     return str(out.absolute())
 
 
@@ -468,58 +120,29 @@ def make_excel(data, output_path: str, sheet_name: str = 'Sheet1', theme: str = 
 # beautify — 只改格式不改数据
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _detect_data_range(ws):
-    """检测工作表的实际数据范围。返回 (header_row, data_start, data_end, col_end) 或 None。
+def _检测数据区(t) -> tuple[int, int, int] | None:
+    """从 表读 检测数据区。返回 (表头行, 数据末行, 末列)；空表返回 None。
 
-    规则：从第1行开始找第一个非空行作为表头行；
-    从表头行之后找最后一个非空行作为数据结束；
-    跳过列A（索引列通常为空）。
+    规则：第一个非空行为表头行；最后一个非空行为数据末行；
+    末列取全表非空格最大列。表头必须在第 1 行，否则明确报错。
     """
-    # 先确定最后一列 — 扫描所有行
-    last_col = 0
-    header_row = None
-    last_data_row = 0
-
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row or 1, max_col=ws.max_column or 1):
-        r = row[0].row
-        has_data = any(cell.value is not None for cell in row)
-        if has_data and header_row is None:
-            header_row = r
-        if has_data:
-            last_data_row = r
-        for cell in row:
-            if cell.value is not None and cell.column > last_col:
-                last_col = cell.column
-
-    if header_row is None:
-        return None  # 空表
-
-    data_start = header_row + 1
-    data_end = max(last_data_row, data_start - 1)  # 至少包含表头
-    # 数据范围从 B 列（2）开始，跳过 A 列
-    start_col = 2
-    end_col = max(start_col, last_col)
-    return header_row, data_start, data_end, start_col, end_col
+    if not t.格:
+        return None
+    非空行 = sorted({r for r, _c in t.格})
+    表头行 = 非空行[0]
+    if 表头行 != 1:
+        raise ValueError(
+            f"工作表“{t.名称}”的表头不在第 1 行（在第 {表头行} 行），"
+            "beautify 暂不支持首行以上有空行或标题行的文件"
+        )
+    末列 = max(c for _r, c in t.格)
+    return 表头行, 非空行[-1], 末列
 
 
-def _sample_ws_column(ws, col, start_row, end_row, max_samples=100):
-    """从工作表列中采样非空值，返回列表。"""
-    samples = []
-    for r in range(start_row, end_row + 1):
-        v = ws.cell(row=r, column=col).value
-        if v is not None:
-            samples.append(v)
-            if len(samples) >= max_samples:
-                break
-    return samples
-
-
-def _infer_col_type_from_ws(header_value, samples):
-    """从工作表列推断类型（不依赖 pandas Series）。"""
-    name = str(header_value) if header_value is not None else ''
+def _列类型自值(表头, 值列: list) -> str:
+    """beautify 的列类型推断：关键词规则与 列类型推断 一致，值特征直接看列表。"""
+    name = str(表头) if 表头 is not None else ''
     n = name.lower()
-
-    # 关键词匹配（与 _infer_column_type 一致）
     if re.search(r'(率$|占比|百分比|增长率|利润率|达成率|rate$|ratio$|margin|pct|percent)', n):
         return 'pct'
     if re.search(r'(日期|时间|年月|期间|年份|月份|date|time|year|month)', n):
@@ -529,218 +152,151 @@ def _infer_col_type_from_ws(header_value, samples):
     if re.search(r'(金额|余额|价格|收入|成本|费用|毛利额|净利|合计|总额|售价|单价|预算|支出|毛利(?!率)|返点|佣金|折扣|补贴|周转|本金|amount|balance|price|cost|revenue|total|budget|expense|commission|discount|rebate|profit|spending)', n):
         return 'money'
 
-    if not samples:
+    样本 = [v for v in 值列 if v is not None][:100]
+    if not 样本:
         return 'unknown'
-
-    # 值采样
-    numeric_samples = [v for v in samples if isinstance(v, (int, float))]
-    str_samples = [str(v) for v in samples if not isinstance(v, (int, float))]
-
-    # 检查日期
-    from datetime import datetime, date
-    date_count = sum(1 for v in samples if isinstance(v, (datetime, date)))
-    if date_count >= len(samples) * 0.5:
+    if sum(1 for v in 样本 if isinstance(v, (datetime, date))) >= len(样本) * 0.5:
         return 'date'
-
-    if numeric_samples:
-        # 浮点检查百分比
-        float_samples = [v for v in numeric_samples if isinstance(v, float)]
-        if float_samples:
-            all_between_0_1 = all(0 < v < 1 for v in float_samples)
-            unique_gt_2 = len(set(float_samples)) > 2
-            if all_between_0_1 and unique_gt_2:
+    数值 = [v for v in 样本 if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if 数值:
+        浮点 = [v for v in 数值 if isinstance(v, float)]
+        if 浮点:
+            if all(0 < v < 1 for v in 浮点) and len(set(浮点)) > 2:
                 return 'pct'
             return 'money'
         return 'number'
-
-    # 长数字字符串
-    if any(re.match(r'^\d{12,}$', s) for s in str_samples):
+    if any(re.match(r'^\d{12,}$', str(v)) for v in 样本 if not isinstance(v, (int, float))):
         return 'text'
-
     return 'unknown'
 
 
-def _estimate_col_width_from_cells(ws, col, header_row, data_end):
-    """从工作表的表头和单元格值估算列宽。"""
-    max_w = _char_width(str(ws.cell(row=header_row, column=col).value or ''))
-    for r in range(header_row + 1, data_end + 1):
-        v = ws.cell(row=r, column=col).value
-        if v is not None:
-            try:
-                w = _char_width(str(v))
-                if w > max_w:
-                    max_w = w
-            except Exception:
-                pass
-    return max(MIN_COL_WIDTH, min(max_w + 2, MAX_COL_WIDTH))
-
-
-def _beautify_worksheet(ws, col_types_override: Optional[dict] = None, theme: str = 'default',
-                        fmt_override: Optional[dict] = None):
-    """对单个工作表应用摩根系格式（不改变任何单元格的值）。
-
-    参数
-    ----
-    col_types_override : dict, optional
-        强制指定列的类型，如 {'订单号': 'text', '金额': 'money'}。
-        列名匹配，覆盖自动推断结果。
-    theme : str
-        色系主题名。可用: """ + AVAILABLE_THEMES + """。默认 'default'。
-    fmt_override : dict, optional
-        自定义数字格式，如 {'money': '#,##0.0', 'pct': '0.0%'}。
-        合并到默认 FMT 之上，同名覆盖。
-    """
-    s = _build_theme_styles(theme)
-    # 合并自定义数字格式
-    effective_fmt = dict(FMT)
+def _重建表计划(t, theme: str, fmt_override: Optional[dict],
+                col_types: Optional[dict]) -> 表计划:
+    """把 表读 重建为套好摩根系格式的 表计划（值、公式、合并、批注、超链接保留）。"""
+    主题 = THEMES[theme]
+    有效格式 = dict(FMT)
     if fmt_override:
-        effective_fmt.update(fmt_override)
-    dr = _detect_data_range(ws)
-    if dr is None:
-        return  # 空表跳过
-    header_row, data_start, data_end, start_col, end_col = dr
+        有效格式.update(fmt_override)
 
-    # 1. 行高 + A列宽（采样A列数据估算宽度）
-    for r in range(header_row, data_end + 1):
-        ws.row_dimensions[r].height = ROW_HEIGHT
-    a_max = _char_width(str(ws.cell(row=header_row, column=1).value or ''))
-    a_has_data = False
-    for r in range(data_start, data_end + 1):
-        v = ws.cell(row=r, column=1).value
-        if v is not None:
-            a_has_data = True
+    检测 = _检测数据区(t)
+    # 全内容重建：第 1 行作表头，其余作数据行；无内容的表建空 df。
+    # 列范围只取有内容的列（纯宽度定义的尾列不重建，避免空表头被落成空串格）
+    末列 = 检测[2] if 检测 else 0
+    末行 = 检测[1] if 检测 else 0
+    # A 列完全无内容才作留白；df 只从实际起始列建，避免留白+空 A 列双重右移
+    a有数据 = any(t.格.get((r, 1)) is not None for r in range(1, 末行 + 1))
+    起建列 = 1 if a有数据 else 2
+    if 末列 < 起建列:
+        末列 = 起建列 - 1 if a有数据 else 0
+    表头 = {c: t.格.get((1, c)) for c in range(起建列, 末列 + 1)}
+    列名 = [(str(v) if v is not None else "") for v in 表头.values()]
+    # 列名去重（pandas 允许重名，但 dict 化场景会乱；追加序号保持唯一）
+    见过 = {}
+    for i, 名 in enumerate(列名):
+        if 名 in 见过:
+            见过[名] += 1
+            列名[i] = f"{名}.{见过[名]}"
+        else:
+            见过[名] = 0
+    行数据 = [[t.格.get((r, c)) for c in range(起建列, 末列 + 1)]
+              for r in range(2, 末行 + 1)]
+    df = pd.DataFrame(行数据, columns=列名, dtype=object)
+    tp = 表计划(名称=t.名称, 表=df)
+    tp.合并 = set(t.合并)
+    tp.tab色 = t.tab色
+    tp.状态 = t.状态
+
+    if 检测 is None:
+        return tp
+    表头行, 数据末行, 数据末列 = 检测
+
+    # A 列：有数据则并入数据区（前置空列=0），否则作 2 宽留白
+    if a有数据:
+        tp.前置空列 = 0
+        起列 = 1
+    else:
+        tp.前置空列 = 1
+        tp.前部列 = [列计划(宽=A_COL_WIDTH)]
+        起列 = 2
+
+    # 行高
+    for r in range(1, 数据末行 + 1):
+        tp.行计划取(r).高 = ROW_HEIGHT
+
+    # 表头样式（第 1 行，含 A 列有数据时的 A1）
+    tp.表头样式 = 格样式(
+        字体名="Arial", 字号=11, 加粗=True, 字色=主题["header_font_color"],
+        填充色=主题["header_fill"], 填充类型="solid",
+        水平="right", 垂直="center",
+        上框=("medium", "000000"), 下框=("dashed", "808080"),
+    )
+
+    # 数据列：类型推断（支持手动覆盖）+ 列宽 + 列基础样式（含中行虚线边框）
+    中虚 = ("dashed", "808080")
+    for c in range(起列, 数据末列 + 1):
+        j = c - tp.前置空列 - 1
+        名 = str(表头[c]) if 表头.get(c) is not None else ""
+        if col_types and 名 in col_types:
+            ct = col_types[名]
+        else:
+            ct = _列类型自值(表头.get(c), df.iloc[:, j].tolist())
+        cp = tp.列计划取(j)
+        w = _char_width(名)
+        for v in df.iloc[:, j].tolist():
+            if v is None:
+                continue
             try:
-                w = _char_width(str(v))
-                if w > a_max:
-                    a_max = w
+                w = max(w, _char_width(str(v)))
             except Exception:
                 pass
-    if a_has_data:
-        ws.column_dimensions['A'].width = max(MIN_COL_WIDTH, min(a_max + 2, MAX_COL_WIDTH))
-        # A列表头 + 数据格式
-        ws.cell(row=header_row, column=1).font = s['header_font']
-        ws.cell(row=header_row, column=1).fill = s['header_fill']
-        ws.cell(row=header_row, column=1).alignment = HDR_ALIGN
-        # A 列类型推断（与 B~K 列一致）
-        a_header_val = ws.cell(row=header_row, column=1).value
-        a_samples = _sample_ws_column(ws, 1, data_start, data_end)
-        a_ct = _infer_col_type_from_ws(a_header_val, a_samples)
-        a_is_num = a_ct in ('money', 'number', 'pct')
-        a_align = RIGHT_ALIGN if a_is_num else LEFT_ALIGN
-        a_nf = effective_fmt.get(a_ct)
-        for r in range(data_start, data_end + 1):
-            cell = ws.cell(row=r, column=1)
-            cell.alignment = a_align
-            if a_nf:
-                cell.number_format = 'General' if a_ct == 'date' and cell.data_type == 'n' else a_nf
-            if a_is_num:
-                val = cell.value
-                is_formula = (isinstance(val, str) and val.startswith('=')) or cell.data_type == 'f'
-                if is_formula:
-                    cell.font = s['data_font_black']
-                else:
-                    cell.font = s['data_font_blue']
-            else:
-                cell.font = Font(name='Arial', size=11)
-    else:
-        ws.column_dimensions['A'].width = A_COL_WIDTH
+        cp.宽 = max(MIN_COL_WIDTH, min(w + 2, MAX_COL_WIDTH))
+        数字列 = ct in ("money", "number", "pct")
+        cp.基础样式 = 格样式(
+            字体名="Arial", 字号=11,
+            字色=主题["data_font_blue"] if 数字列 else None,
+            水平="right" if 数字列 else "left", 垂直="center",
+            数字格式=有效格式.get(ct) or None,
+            上框=中虚, 下框=中虚,
+        )
+        # 逐格修正：公式格黑字；date 列里的原始数字回落 General
+        for ri in range(len(df)):
+            r = ri + 2
+            if (r, c) in t.公式 and 数字列:
+                tp.盖格(r, c, 格样式(字色=主题["data_font_black"]))
+            if ct == "date":
+                v = df.iat[ri, j]
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    tp.盖格(r, c, 格样式(数字格式="General"))
 
-    # 2. 列宽估算 + 类型推断（支持手动覆盖）
-    col_types = {}
-    col_headers = {}  # 列号 → 列名，用于 override 匹配
-    for c in range(start_col, end_col + 1):
-        col_letter = get_column_letter(c)
-        header_val = ws.cell(row=header_row, column=c).value
-        col_headers[c] = str(header_val) if header_val is not None else ''
+    # 合计行：末行首数据列（或 A 列）含合计关键词 → 数据区加粗 + 填充
+    首值 = t.格.get((数据末行, 1)) if a有数据 else None
+    if not 首值 or not any(kw in str(首值) for kw in SUM_KEYWORDS):
+        首值 = t.格.get((数据末行, 起列))
+    if 数据末行 > 表头行 and 首值 is not None \
+            and any(kw in str(首值) for kw in SUM_KEYWORDS):
+        for c in range(起列, 数据末列 + 1):
+            tp.盖格(数据末行, c, 格样式(
+                字体名="Arial", 字号=11, 加粗=主题["sum_font_bold"],
+                字色=主题["sum_font_color"],
+                填充色=主题["sum_fill"], 填充类型="solid"))
 
-        # 手动覆盖优先
-        if col_types_override and col_headers[c] in col_types_override:
-            ct = col_types_override[col_headers[c]]
-        else:
-            samples = _sample_ws_column(ws, c, data_start, data_end)
-            ct = _infer_col_type_from_ws(header_val, samples)
-        col_types[c] = ct
+    # 末行下框加粗
+    if 数据末行 > 1:
+        rp = tp.行计划取(数据末行)
+        rp.样式 = 合并样式(rp.样式, 格样式(上框=中虚, 下框=("medium", "000000")))
 
-        est = _estimate_col_width_from_cells(ws, c, header_row, data_end)
-        ws.column_dimensions[col_letter].width = est
+    # 右侧空白列（宽 3）
+    tp.列计划取(数据末列 - tp.前置空列).宽 = 3
 
-    # 3. 表头格式
-    for c in range(start_col, end_col + 1):
-        cell = ws.cell(row=header_row, column=c)
-        cell.font = s['header_font']
-        cell.fill = s['header_fill']
-        cell.alignment = HDR_ALIGN
+    # 批注 / 超链接保留（随样式覆盖走）
+    for (r, c), (文本, 作者) in t.批注.items():
+        tp.盖格(r, c, 格样式(批注=(文本, 作者)))
+    for (r, c), 目标 in t.超链接.items():
+        tp.盖格(r, c, 格样式(超链接=目标))
 
-    # 4. 数据行格式（统一 Arial 11 + 对齐 + 数字格式 + 字体颜色）
-    for c in range(start_col, end_col + 1):
-        ct = col_types.get(c, 'unknown')
-        is_num = ct in ('money', 'number', 'pct')
-        align = RIGHT_ALIGN if is_num else LEFT_ALIGN
-        nf = effective_fmt.get(ct)
-
-        for r in range(data_start, data_end + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.alignment = align
-            if nf:
-                cell.number_format = 'General' if ct == 'date' and cell.data_type == 'n' else nf
-            # 所有单元格统一 Arial 11
-            if is_num:
-                val = cell.value
-                is_formula = (isinstance(val, str) and val.startswith('=')) or cell.data_type == 'f'
-                if is_formula:
-                    cell.font = s['data_font_black']  # 公式=黑，不改公式值
-                else:
-                    cell.font = s['data_font_blue']   # 手动输入=蓝
-            else:
-                cell.font = Font(name='Arial', size=11)  # 文本=Arial 11
-
-    # 5. 合计行检测与特殊格式
-    # 检测最后一行的首列（列A或第一数据列）是否含合计关键词
-    first_val = ws.cell(row=data_end, column=1).value  # A 列
-    if not first_val or not any(kw in str(first_val) for kw in SUM_KEYWORDS):
-        first_val = ws.cell(row=data_end, column=start_col).value  # B 列兜底
-    is_summary = (
-        data_end > header_row
-        and first_val is not None
-        and any(kw in str(first_val) for kw in SUM_KEYWORDS)
-    )
-    if is_summary:
-        for c in range(start_col, end_col + 1):
-            cell = ws.cell(row=data_end, column=c)
-            cell.font = s['sum_font']
-            cell.fill = s['sum_fill']
-
-    # 6. 边框
-    data_rows = data_end - header_row + 1  # 表头 + 数据总行数
-    for c in range(start_col, end_col + 1):
-        for ri, r in enumerate(range(header_row, data_end + 1)):
-            cell = ws.cell(row=r, column=c)
-            if ri == 0:
-                cell.border = TOP_BORDER
-            elif ri == data_rows - 1:
-                cell.border = BOTTOM_BORDER
-            else:
-                cell.border = MID_BORDER
-    # A列边框（如果有数据）
-    if a_has_data:
-        for ri, r in enumerate(range(header_row, data_end + 1)):
-            cell = ws.cell(row=r, column=1)
-            if ri == 0:
-                cell.border = TOP_BORDER
-            elif ri == data_rows - 1:
-                cell.border = BOTTOM_BORDER
-            else:
-                cell.border = MID_BORDER
-
-    # 7. 右侧空白列（宽 3）
-    ncols = end_col - start_col + 1
-    last_data_col = start_col + ncols - 1
-    right_col = get_column_letter(last_data_col + 1)
-    ws.column_dimensions[right_col].width = 3
-
-    # 8. 网格线 + 冻结（表头在哪行就冻结在哪行下方）
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = f'A{header_row + 1}'
+    tp.网格线 = False
+    tp.冻结 = f"A{表头行 + 1}"
+    return tp
 
 
 def beautify(
@@ -752,7 +308,10 @@ def beautify(
     theme: str = 'default',
     fmt_override: Optional[dict] = None,
 ) -> str:
-    """美化已有 Excel 文件，只改格式不改数据（保留公式和值）。
+    """美化已有 Excel 文件，只改格式不改数据（保留公式原文和值）。
+
+    公式缓存值不由本工具计算：输出文件带自动重算标记，Excel 打开时重算。
+    要求各表表头在第 1 行；不满足时抛 ValueError，不静默改动布局。
 
     参数
     ----
@@ -776,7 +335,7 @@ def beautify(
     str : 输出文件的绝对路径。
     """
     _validate_theme(theme)
-    from openpyxl import load_workbook
+    from 直读XML import 读簿
 
     out = output_path or input_path
 
@@ -788,14 +347,17 @@ def beautify(
         copy2(input_path, str(bak))
         print(f'备份: {bak}')
 
-    wb = load_workbook(input_path)  # data_only=False 默认，公式保留
+    簿 = 读簿(input_path)   # 公式格取原文（"=..."），重建后仍是活公式
 
-    for ws in wb.worksheets:
-        _beautify_worksheet(ws, col_types_override=col_types, theme=theme, fmt_override=fmt_override)
+    计划 = 簿计划()
+    for t in 簿:
+        计划.表.append(_重建表计划(t, theme, fmt_override, col_types))
+    if 簿.active名 in 簿.表名列表:
+        计划.active = 簿.表名列表.index(簿.active名)
 
     out_path = Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(out_path))
+    写簿(计划, str(out_path))
     return str(out_path.absolute())
 
 

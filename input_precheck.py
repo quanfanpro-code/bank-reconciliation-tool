@@ -1,4 +1,4 @@
-﻿"""银行流水和银行日记账的自包含输入预检查。"""
+"""银行流水和银行日记账的自包含输入预检查。"""
 
 from __future__ import annotations
 
@@ -258,31 +258,21 @@ def _read_preview(path: Path, max_scan_rows: int) -> tuple[pd.DataFrame, list[tu
             [],
         )
 
-    preview = pd.read_excel(
-        path,
-        header=None,
-        nrows=max_scan_rows,
-        dtype=object,
-        keep_default_na=False,
-        na_values=[''],
-    )
-    merges: list[tuple[int, int, int, int]] = []
-    if path.suffix.lower() == ".xlsx":
-        from openpyxl import load_workbook
+    from 直读XML import 读簿, 拆坐标
 
-        workbook = load_workbook(path, read_only=False, data_only=True)
-        sheet = workbook.worksheets[0]
-        merges = [
-            (
-                merged.min_row - 1,
-                merged.max_row - 1,
-                merged.min_col - 1,
-                merged.max_col - 1,
-            )
-            for merged in sheet.merged_cells.ranges
-            if merged.min_row <= max_scan_rows
-        ]
-        workbook.close()
+    簿 = 读簿(path, 数据=True)
+    t = 簿[簿.表名列表[0]]
+    行数 = min(t.最大行, max_scan_rows)
+    preview = pd.DataFrame(list(t.行值(1, 行数)))
+    merges: list[tuple[int, int, int, int]] = []
+    for ref in t.合并:
+        if ":" not in ref:
+            continue
+        起, 讫 = ref.split(":", 1)
+        r1, c1 = 拆坐标(起)
+        r2, c2 = 拆坐标(讫)
+        if r1 <= max_scan_rows:
+            merges.append((r1 - 1, r2 - 1, c1 - 1, c2 - 1))
     return preview, merges
 
 
@@ -416,6 +406,8 @@ def detect_table_structure(
         raise FileNotFoundError(f"文件不存在：{path}")
     if path.suffix.lower() not in SUPPORTED_SUFFIXES:
         raise ValueError(f"不支持的文件格式：{path.suffix or '无后缀'}")
+    if path.suffix.lower() == ".xls":
+        raise ValueError("不支持 .xls 老格式，请在 Excel 中另存为 .xlsx 后再导入")
 
     preview, merges = _read_preview(path, max_scan_rows)
     preview = preview.dropna(axis=1, how="all")

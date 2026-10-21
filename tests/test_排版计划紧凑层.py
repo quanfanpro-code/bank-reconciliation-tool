@@ -16,7 +16,7 @@
 """
 import pandas as pd
 import pytest
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook
 
 from 排版计划 import 新建簿计划
 
@@ -107,11 +107,11 @@ def 簿():
 def test_待处理事项内容(簿):
     p = 簿.取表("待处理事项")
     assert p.前置空列 == 0
-    assert list(p.表.columns)[:3] == ["核对编号", "处理要求", "哪里需要查看"]
-    # 排序：人工全查在前，留存备查在后
-    assert _值(p, 2, "事项编号") == "I1" and _值(p, 3, "事项编号") == "I2"
-    assert _值(p, 2, "处理要求") == "逐项核对" and _值(p, 3, "处理要求") == "留存查看"
-    assert _值(p, 2, "哪里需要查看") == "金额相同，对应关系仍需确认"
+    assert list(p.表.columns)[:3] == ["核对编号", "处理要求", "核对动作"]
+    assert len(p.表) == 1  # 留存备查不是待办
+    assert _值(p, 2, "事项编号") == "I1"
+    assert _值(p, 2, "处理要求") == "逐项核对"
+    assert "黄色格" in _值(p, 2, "核对动作")
     assert _值(p, 2, "银行记录") == "2026-01-05 1笔 货款；甲公司"
     # 当前结果：缩短公式（11 层 SUBSTITUTE 包 INDEX/MATCH）
     lookup = "IFERROR(INDEX('复核事项索引'!$E$2:$E$3,MATCH($L2,'复核事项索引'!$C$2:$C$3,0)),\"\")"
@@ -120,11 +120,8 @@ def test_待处理事项内容(簿):
     assert _值(p, 2, "人工核对结果") is None
     assert len(p.验证) == 1 and p.验证[0]["sqref"] == "H2"
     assert p.验证[0]["errorStyle"] == "stop"
-    # 非人工事项：无需填写，无验证
-    assert _值(p, 3, "人工核对结果") == "本次无需填写"
     # 完整明细超链接
     assert p.覆盖[(2, 11)].超链接 == "#'人工全查'!A2"
-    assert p.覆盖[(3, 11)].超链接 == "#'核对明细'!A4"
     # 批注：原判断依据
     assert p.覆盖[(2, 3)].批注 == ("；", "原判断依据")
 
@@ -132,9 +129,9 @@ def test_待处理事项内容(簿):
 def test_人工表入口回收(簿):
     全查 = 簿.取表("人工全查")
     assert 全查.验证 == []
-    v = "IFERROR(INDEX('待处理事项'!$H$2:$H$3,MATCH(F2,'待处理事项'!$L$2:$L$3,0)),\"\")"
+    v = "IFERROR(INDEX('待处理事项'!$H$2:$H$2,MATCH(F2,'待处理事项'!$L$2:$L$2,0)),\"\")"
     assert _值(全查, 2, "人工核对结果") == f'=IF({v}="","",{v})'
-    v2 = "IFERROR(INDEX('待处理事项'!$J$2:$J$3,MATCH(F2,'待处理事项'!$L$2:$L$3,0)),\"\")"
+    v2 = "IFERROR(INDEX('待处理事项'!$J$2:$J$2,MATCH(F2,'待处理事项'!$L$2:$L$2,0)),\"\")"
     assert _值(全查, 2, "备注") == f'=IF({v2}="","",{v2})'
 
 
@@ -143,11 +140,11 @@ def test_对应明细与编号重指(簿):
     assert _值(m, 2, "对应方式") == "逐笔对应"
     assert _值(m, 2, "银行收入") == 100.0
     assert _值(m, 2, "核对编号") == (
-        "=HYPERLINK(\"#'待处理事项'!H\"&(MATCH($N2,'待处理事项'!$L$2:$L$3,0)+1),\"001\")")
+        "=HYPERLINK(\"#'待处理事项'!H\"&(MATCH($N2,'待处理事项'!$L$2:$L$2,0)+1),\"001\")")
     assert _值(m, 2, "完整明细") == (
         "=HYPERLINK(\"#'逐笔核对'!A\"&(MATCH($N2,'逐笔核对'!$C$2:$C$2,0)+1),\"查看\")")
     assert _值(簿.取表("逐笔核对"), 2, "核对编号") == (
-        "=HYPERLINK(\"#'待处理事项'!H\"&(MATCH(C2,'待处理事项'!$L$2:$L$3,0)+1),\"001\")")
+        "=HYPERLINK(\"#'待处理事项'!H\"&(MATCH(C2,'待处理事项'!$L$2:$L$2,0)+1),\"001\")")
     # 不在待处理的事项不重指
     assert _值(簿.取表("整组核对"), 2, "核对编号") == "003"
 
@@ -210,7 +207,7 @@ def test_紧凑样式与渲染(tmp_path):
     # 条件格式
     p = 簿.取表("待处理事项")
     区域集 = sorted(区域 for 区域, _ in p.条件格式)
-    assert 区域集 == ["F2:F3", "G2:G3"]
+    assert 区域集 == ["F2:F2", "G2:G2"]
 
     输出 = tmp_path / "出.xlsx"
     渲染簿计划(簿, str(输出))

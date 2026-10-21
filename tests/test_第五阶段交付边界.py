@@ -4,7 +4,7 @@ import hashlib
 
 import pandas as pd
 import pytest
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook, 存表
 
 from application import run_reconciliation
 from data_structures import MatcherConfig
@@ -22,7 +22,7 @@ def _输入(tmp_path):
                        "账户": ["A001"], "币种": ["CNY"]})
     银行, 账 = tmp_path / "银行.xlsx", tmp_path / "账.xlsx"
     for 路径 in (银行, 账):
-        表.to_excel(路径, index=False)
+        存表(表, 路径)
     return 银行, 账
 
 

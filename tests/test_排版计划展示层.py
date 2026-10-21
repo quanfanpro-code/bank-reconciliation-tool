@@ -195,7 +195,7 @@ def test_结论说明与次序(簿):
 
 def test_前部列覆盖与空缺格渲染(tmp_path):
     """渲染器：前置空列合并显式格覆盖（合计行 A 格），空缺格不落格。"""
-    from openpyxl import load_workbook
+    from tests._excel假面 import load_workbook
 
     from 排版计划 import 应用展示层, 格样式
     from 报告写入 import 渲染簿计划

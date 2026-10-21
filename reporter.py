@@ -1,7 +1,7 @@
 """
 Reporter 模块 — 核对结果报表生成器
 
-使用 make_excel deep-navy 主题输出 Excel，再通过 openpyxl 后处理添加条件格式。
+使用 排版计划+直写XML 单次成型输出 deep-navy 主题 Excel（不经 openpyxl）。
 """
 
 from typing import Optional, List, Dict, Any, Callable

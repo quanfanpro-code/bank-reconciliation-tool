@@ -4,7 +4,7 @@ from datetime import date
 from types import SimpleNamespace
 
 import pytest
-from openpyxl import load_workbook
+from tests._excel假面 import load_workbook
 
 from data_structures import MatcherConfig
 from matcher import Matcher

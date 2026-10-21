@@ -4,6 +4,8 @@ from decimal import Decimal
 
 import pandas as pd
 
+from tests._excel假面 import 读Excel
+
 from balance import build_overall_controls, check_balance_continuity
 
 
@@ -142,7 +144,7 @@ def test_系统结论披露断档位置而非全部降级(tmp_path):
     账 = [dict(r, 余额="") for r in 银行]
     输出, _ = _写带余额表(tmp_path, 银行, 账)
 
-    报表 = pd.read_excel(输出, sheet_name=None)
+    报表 = 读Excel(输出, sheet_name=None)
     结论表 = 报表["核对结论"]
     系统结论 = str(结论表.loc[结论表["项目"] == "系统结论", "数值"].iloc[0])
     assert "断档" in 系统结论 and "2026-08-11" in 系统结论

@@ -1,11 +1,9 @@
-﻿"""输出阅读布局验收：只检查既有结果的展示，不改变计算规则。"""
+"""输出阅读布局验收：只检查既有结果的展示，不改变计算规则。"""
 from contextlib import closing
-from hashlib import sha256
 
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from tests._excel假面 import load_workbook
+from tests._excel假面 import get_column_letter
 
-from 底稿筛选 import FilterCriteria, export_filtered_workpaper
 from tests.test_人工结果计算 import _报告
 
 
@@ -124,26 +122,6 @@ def test_月度发生额和缺失余额同表可见且余额不补零(tmp_path):
             if '合计' in str(total.get('月份','')):
                 assert not isinstance(total['银行-月末余额'],(int,float))
                 assert not isinstance(total['序时账-月末余额'],(int,float))
-
-
-def test_筛选新阅读表整组保留所有组成且不改计算公式(tmp_path):
-    source=_报告(tmp_path,[150,450,500],[100,200,300,500],[((0,1),(0,1,2)),((2,),(3,))])
-    before=sha256(source.read_bytes()).hexdigest()
-    with closing(load_workbook(source)) as book:
-        formulas={name:{cell.coordinate:cell.value for row in book[name] for cell in row if cell.data_type=='f'} for name in ('核对明细','复核事项索引','复核候选选项','复核候选组成')}
-    output=tmp_path/'整组筛选.xlsx'
-    export_filtered_workpaper(source,output,FilterCriteria(coverage_ratio=0.5))
-    assert sha256(source.read_bytes()).hexdigest()==before
-    with closing(load_workbook(output)) as book:
-        group=book['整组核对']
-        assert group.sheet_state=='visible'
-        rows=[(number,row) for number,row in _行(group) if row['事项编号']=='M1']
-        assert len(rows)==6
-        assert {row['原始记录号'] for _,row in rows if row.get('原始记录号')}=={'银行2','银行3','账面2','账面3','账面4'}
-        assert not group.row_dimensions[rows[0][0]].hidden
-        assert all(book['逐笔核对'].row_dimensions[number].hidden for number,row in _行(book['逐笔核对']) if row['事项编号']=='M2')
-        for name,expected in formulas.items():
-            assert {cell.coordinate:cell.value for row in book[name] for cell in row if cell.data_type=='f'}==expected
 
 
 def test_折叠组主行可直接阅读双方日期范围和业务摘要(tmp_path,monkeypatch):

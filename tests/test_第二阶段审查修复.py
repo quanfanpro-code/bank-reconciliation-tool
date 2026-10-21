@@ -1,4 +1,4 @@
-"""独立审查回归：凭证续行、范围缺失、金额口径和批次证据边界。"""
+﻿"""独立审查回归：凭证续行、范围缺失、金额口径和批次证据边界。"""
 import re
 import hashlib
 import json
@@ -7,6 +7,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+
+from tests._excel假面 import 存表, 读Excel
 import pytest
 
 from application import run_reconciliation
@@ -198,8 +200,8 @@ def test_多个币种列换序不能改变核对范围且显式映射有效(显�
 
 def 应用入口(tmp_path, 银行, 账, 银行映射=None, 账映射=None, 捕获=None):
     银行路径, 账路径 = tmp_path / "银行流水.xlsx", tmp_path / "银行存款序时账.xlsx"
-    银行.to_excel(银行路径, index=False)
-    账.to_excel(账路径, index=False)
+    银行.pipe(存表, 银行路径)
+    账.pipe(存表, 账路径)
     return run_reconciliation(
         str(银行路径), str(账路径), 银行映射 or 映射(), 账映射 or 映射(), MatcherConfig(),
         bank_skiprows=0, journal_skiprows=0, bank_header_rows=1, journal_header_rows=1,
@@ -223,7 +225,7 @@ def test_硬闸门在匹配前保留独立输入问题报告而不生成正式�
     assert not (tmp_path / "正式核对结果.xlsx").exists()
     问题路径 = getattr(错.value, "report_path", None)
     assert 问题路径, "输入冲突不能只留弹窗；异常应提供可复核的独立问题报告路径"
-    表 = pd.read_excel(Path(问题路径), sheet_name=None)
+    表 = 读Excel(Path(问题路径), sheet_name=None)
     assert "输入检查" in 表
     assert any("运行" in 名 or "映射" in 名 for 名 in 表)
     assert any("原行" in 名 or "处置" in 名 or "冲突" in 名 for 名 in 表)
@@ -258,7 +260,7 @@ def test_入口报告保留人口金额去向及文件工作表表头映射证�
     银行["借方金额"] = 银行["借方金额"].astype(object)
     银行.loc[1, "借方金额"] = "金额不明"
     输出 = 应用入口(tmp_path, 银行, 账)
-    表 = pd.read_excel(输出, sheet_name=None)
+    表 = 读Excel(输出, sheet_name=None)
     全文 = " ".join(名 + " " + " ".join(数据.fillna("").astype(str).to_numpy().ravel()) for 名, 数据 in 表.items())
     指纹 = hashlib.sha256((tmp_path / "银行流水.xlsx").read_bytes()).hexdigest()
     assert 指纹 in 全文, "交付报告须绑定实际输入文件指纹"
@@ -294,7 +296,7 @@ def test_总体余额异常不允许依赖该总体的候选无保留自动确�
     输出 = 应用入口(tmp_path, 银行, 账, 映射(balance="余额"), 映射(balance="余额"), 捕获.append)
     assert 捕获[0].selected_candidates
     assert all(候选.processing_status.value != "自动确认" for 候选 in 捕获[0].selected_candidates)
-    结论 = pd.read_excel(输出, sheet_name="核对结论").fillna("").astype(str)
+    结论 = 读Excel(输出, sheet_name="核对结论").fillna("").astype(str)
     assert "核对已自动完成" not in " ".join(结论.to_numpy().ravel())
 
 
@@ -337,7 +339,7 @@ def test_报告组成和双方待查保留原金额方向口径及凭证继承�
     银行.loc[1, ["日期", "摘要", "对方户名"]] = ["2026-01-01", "银行独有历史款", "乙公司"]
     账.loc[1, ["日期", "摘要", "对方户名"]] = ["2026-12-31", "账簿独有年末款", "丙公司"]
     输出 = 应用入口(tmp_path, 银行, 账, 映射(amount_basis="本位币"), 映射(amount_basis="本位币"))
-    表 = pd.read_excel(输出, sheet_name=None)
+    表 = 读Excel(输出, sheet_name=None)
     必需 = {"原借方列名", "原借方值", "原贷方列名", "原贷方值", "原金额列名", "原金额值",
             "原方向列名", "原方向值", "采用金额口径", "凭证是否继承"}
     for 名 in ["匹配组成", "银行侧待查", "日记账侧待查"]:

@@ -1,6 +1,8 @@
-from decimal import Decimal
+﻿from decimal import Decimal
 
 import pandas as pd
+
+from tests._excel假面 import 存表, 读Excel
 
 from application import run_reconciliation
 from data_structures import MatcherConfig
@@ -70,8 +72,8 @@ def _build_business_workbooks(tmp_path):
 
     bank_path = tmp_path / "银行.xlsx"
     journal_path = tmp_path / "日记账.xlsx"
-    pd.DataFrame(bank_rows).to_excel(bank_path, index=False)
-    pd.DataFrame(journal_rows).to_excel(journal_path, index=False)
+    pd.DataFrame(bank_rows).pipe(存表, bank_path)
+    pd.DataFrame(journal_rows).pipe(存表, journal_path)
     mapping = {
         "date": "日期",
         "amount": "金额",
@@ -107,17 +109,17 @@ def test_完整核对流程自动形成结论风险分级和待查事项(
         ),
     )
 
-    summary = pd.read_excel(output_path, sheet_name="核对结论")
-    pending = pd.read_excel(output_path, sheet_name="疑点事项")
+    summary = 读Excel(output_path, sheet_name="核对结论")
+    pending = 读Excel(output_path, sheet_name="疑点事项")
     groups = pd.concat(
         [
-            pd.read_excel(output_path, sheet_name="逐笔匹配"),
-            pd.read_excel(output_path, sheet_name="整组勾稽"),
+            读Excel(output_path, sheet_name="逐笔匹配"),
+            读Excel(output_path, sheet_name="整组勾稽"),
         ],
         ignore_index=True,
     )
-    unmatched = pd.read_excel(output_path, sheet_name="银行侧待查")
-    input_checks = pd.read_excel(output_path, sheet_name="输入检查")
+    unmatched = 读Excel(output_path, sheet_name="银行侧待查")
+    input_checks = 读Excel(output_path, sheet_name="输入检查")
 
     assert 0 <= _numeric_metric(summary, "逐笔精确匹配率") <= 1
     assert 0 <= _numeric_metric(summary, "自动完成率") <= 1
@@ -150,7 +152,7 @@ def test_大模型超时自动降级但仍生成完整报告(tmp_path, monkeypat
                 "摘要": "乙项目",
             },
         ]
-    ).to_excel(bank_path, index=False)
+    ).pipe(存表, bank_path)
     pd.DataFrame(
         [
             {
@@ -166,7 +168,7 @@ def test_大模型超时自动降级但仍生成完整报告(tmp_path, monkeypat
                 "摘要": "乙项目",
             },
         ]
-    ).to_excel(journal_path, index=False)
+    ).pipe(存表, journal_path)
     mapping = {
         "date": "日期",
         "amount": "金额",
@@ -202,9 +204,10 @@ def test_大模型超时自动降级但仍生成完整报告(tmp_path, monkeypat
         ),
     )
 
-    workbook = pd.ExcelFile(output_path)
-    assert "大模型辅助明细" in workbook.sheet_names
-    llm_details = pd.read_excel(
+    from 直读XML import 读表名
+    workbook = 读表名(output_path)
+    assert "大模型辅助明细" in workbook
+    llm_details = 读Excel(
         output_path,
         sheet_name="大模型辅助明细",
     )
