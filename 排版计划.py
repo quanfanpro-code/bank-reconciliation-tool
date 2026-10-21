@@ -358,6 +358,10 @@ def 应用通用排版(簿: 簿计划):
             cp.基础样式 = base
             if cp.隐藏:
                 continue
+            if len(df) > _快速通道行数:
+                # 大留痕表：逐格逐字算行高是纯视觉微调（用户口径"差不多"），
+                # 30 万级单元格的中文宽度计算占通用排版耗时的大头，直接跳过
+                continue
             for ri, v in enumerate(df.iloc[:, j].tolist()):
                 if isinstance(v, str):
                     lines = sum(
@@ -610,13 +614,17 @@ def 应用复核层(簿: 簿计划):
                        f'"部分原记录已由其他事项建立对应，其余仍未对应"),{formula[1:]})')
         put(ix, "当前核对结论", row, formula)
 
+    明细缓冲 = {}                 # 列名 → {行号: 公式}，整列一次性写回，替代逐格写
+    def dput(label, row, formula):
+        明细缓冲.setdefault(label, {})[row] = formula
+
     for row in range(2, 行数(detail) + 1):
         key = cell(detail, "原始记录号", row)
         lookup = f'MATCH({key},{rng(mem,"生效记录号")},0)'
-        put(detail, "当前对应", row,
-            f'=IFERROR(INDEX({rng(mem,"事项编号")},{lookup}),"")')
-        put(detail, "当前核对编号", row,
-            "=" + find(ix, "核对编号", cell(detail, "当前对应", row)))
+        dput("当前对应", row,
+             f'=IFERROR(INDEX({rng(mem,"事项编号")},{lookup}),"")')
+        dput("当前核对编号", row,
+             "=" + find(ix, "核对编号", cell(detail, "当前对应", row)))
         initial_id = str(_读值(sheets[detail], row, headers[detail]["事项编号"]))
         initial = find(ix, "当前核对结论", cell(detail, "事项编号", row))
         if option_rows.get(initial_id):
@@ -624,14 +632,22 @@ def 应用复核层(簿: 簿计划):
             initial = (f'IF({choice}<>"","该记录当前未对应；请按当前对应列查看",'
                        f'IF({find(ix,"核对方式",cell(detail,"事项编号",row))}="自动确认",'
                        f'"原对应已被替代，该记录当前未对应",{initial}))')
-        put(detail, "当前核对结果", row,
-            f'=IFERROR(INDEX({rng(mem,"显示结果")},{lookup}),{initial})')
-        put(detail, "已对平金额", row,
-            f'=IFERROR(INDEX({rng(mem,"已对平")},{lookup})*ABS({cell(detail,"金额",row)}),0)')
+        dput("当前核对结果", row,
+             f'=IFERROR(INDEX({rng(mem,"显示结果")},{lookup}),{initial})')
+        dput("已对平金额", row,
+             f'=IFERROR(INDEX({rng(mem,"已对平")},{lookup})*ABS({cell(detail,"金额",row)}),0)')
         for category in ("收入", "支出"):
-            put(detail, "已确认" + category + "差", row,
-                f'=IF({cell(detail,"当前对应",row)}<>"",'
-                f'{cell(detail,category+"差贡献",row)},0)')
+            dput("已确认" + category + "差", row,
+                 f'=IF({cell(detail,"当前对应",row)}<>"",'
+                 f'{cell(detail,category+"差贡献",row)},0)')
+
+    for label, 值表 in 明细缓冲.items():
+        tp_d = sheets[detail]
+        idx = headers[detail][label] - tp_d.前置空列 - 1
+        列 = tp_d.表.iloc[:, idx].tolist()
+        for row, v in 值表.items():
+            列[row - 2] = v
+        tp_d.表[label] = 列          # 按列名整体替换，允许 dtype 变为文本（公式列）
 
     monthly = sheets["月度核对"]
     for row in range(2, 行数("月度核对") + 1):
@@ -1096,9 +1112,14 @@ def _展示样式(tp: 表计划):
                                  左框=("", None), 右框=("", None)))
 
     last_main = None
+    # 大表：整列取值 + 跳过逐格行高微调（视觉近似，用户口径"差不多"）
+    大表 = len(df) > _快速通道行数
+    列数组 = ({label: df.iloc[:, col - 偏 - 1].tolist() for label, col in hs.items()
+             if 0 <= col - 偏 - 1 < len(df.columns)} if 大表 else {})
+    行别列 = 列数组.get("行别")
     for ri in range(len(df)):
         row = ri + 2
-        kind = _读值(tp, row, hs["行别"]) if grouped else ""
+        kind = 行别列[ri] if 大表 else (_读值(tp, row, hs["行别"]) if grouped else "")
         main = kind == "核对事项"
         other = "其他对应" in str(kind)
         if main:
@@ -1120,7 +1141,7 @@ def _展示样式(tp: 表计划):
         height = 40
         for label, col in hs.items():
             j = col - 偏 - 1
-            v = df.iat[ri, j]
+            v = 列数组[label][ri] if 大表 else df.iat[ri, j]
             if label == "人工核对结果" and manual and main:
                 tp.盖格(row, col, 格样式(填充色="FFF2CC", 填充类型="solid"))
             elif label == "人工核对结果" and child:
@@ -1128,7 +1149,8 @@ def _展示样式(tp: 表计划):
             if isinstance(v, str) and v.startswith("=HYPERLINK("):
                 tp.盖格(row, col, 格样式(字体名="微软雅黑", 字号=10, 加粗=False,
                                          字色="0563C1", 下划线="single"))
-            if label not in hidden and not (isinstance(v, str) and v.startswith("=")):
+            if not 大表 and label not in hidden \
+                    and not (isinstance(v, str) and v.startswith("=")):
                 width = _展示列宽.get(label, 14)
                 lines = sum(max(1, int((_中文宽(part) + width - 1) // width))
                             for part in str(v or "").split("\n"))
