@@ -1633,30 +1633,47 @@ def _紧凑样式(tp: 表计划, *, reading):
 
     # 数据行：金额列宽按内容扩、阅读表逐字宽算行高；非阅读表行高抹成 15
     # （快速通道大表只扫前 2000 行定列宽，不再逐行建行计划，行高走表级默认）
+    # 逐格 pandas 标量读取是热点：先把扫描区整列转成 Python 列表，再纯列表遍历
     大表 = len(df) > _快速通道行数
-    扫描 = 2000 if 大表 else len(df)
-    for ri in range(扫描):
-        row = ri + 2
-        height = 15
+    扫描 = min(2000, len(df)) if 大表 else len(df)
+    if 扫描:
+        列数组 = {}
         for label, column in hs.items():
-            v = _读值(tp, row, column)
-            if v is None:
-                continue
-            cp = tp.列计划取(column - tp.前置空列 - 1)
-            if isinstance(v, (int, float, _Decimal)) and not isinstance(v, bool) \
-                    and any(k in label for k in ("金额", "余额", "收入", "支出", "差额")):
-                cp.宽 = max(cp.宽 or 0, len(f"{v:,.2f}") + 1)
-            if reading and label not in hidden \
-                    and not (isinstance(v, str) and v.startswith("=")):
-                width = cp.宽 or 0
-                tw = sum(1.5 if _uni.east_asian_width(ch) in ("W", "F") else 0.75
-                         for ch in str(v))
-                height = max(height, _math.ceil(tw / max(1, width - 1)) * 12 + 3)
-        rp = tp.行计划取(row)
-        rp.高 = height
-        if not reading:
-            rp.隐藏 = False
-            rp.收起 = False
+            idx = column - tp.前置空列 - 1
+            if 0 <= idx < len(df.columns):
+                列数组[label] = df.iloc[:扫描, idx].tolist()
+        金额标签 = {label for label in 列数组
+                    if any(k in label for k in ("金额", "余额", "收入", "支出", "差额"))}
+        for label in 金额标签:
+            cp = tp.列计划取(hs[label] - tp.前置空列 - 1)
+            for v in 列数组[label]:
+                if isinstance(v, (int, float, _Decimal)) and not isinstance(v, bool):
+                    w = len(f"{v:,.2f}") + 1
+                    if w > (cp.宽 or 0):
+                        cp.宽 = w
+        for ri in range(扫描):
+            height = 15
+            if reading:
+                for label, 值列 in 列数组.items():
+                    if label in hidden:
+                        continue
+                    v = 值列[ri]
+                    if v is None:
+                        continue
+                    if isinstance(v, float) and _math.isnan(v):
+                        continue
+                    if isinstance(v, str) and v.startswith("="):
+                        continue
+                    cp = tp.列计划取(hs[label] - tp.前置空列 - 1)
+                    width = cp.宽 or 0
+                    tw = sum(1.5 if _uni.east_asian_width(ch) in ("W", "F") else 0.75
+                             for ch in str(v))
+                    height = max(height, _math.ceil(tw / max(1, width - 1)) * 12 + 3)
+            rp = tp.行计划取(ri + 2)
+            rp.高 = height
+            if not reading:
+                rp.隐藏 = False
+                rp.收起 = False
     if 大表 and not reading:
         for rp in tp.行.values():
             rp.隐藏 = False

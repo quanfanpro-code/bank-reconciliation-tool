@@ -8,6 +8,7 @@ sharedStrings，公式格 <f> 不带缓存值、calcPr fullCalcOnLoad 打开时�
 import math
 import zipfile
 from datetime import datetime as _dt, date as _date
+from decimal import Decimal as _Decimal
 from xml.sax.saxutils import escape as _xesc
 
 from 排版计划 import 合并样式, 簿计划
@@ -244,6 +245,36 @@ def _数字文本(v):
     return None
 
 
+def _值类别(v):
+    """普通格样式缓存的值类别：格变换只按这些类别分支。"""
+    if isinstance(v, str):
+        if v.startswith("=HYPERLINK("):
+            return "超链公式"
+        return "公式" if v.startswith("=") else "文本"
+    if isinstance(v, (_dt, _date)):
+        return "日期"
+    if isinstance(v, bool):
+        return "布尔"
+    if isinstance(v, (int, float, _Decimal)):
+        return "数字"
+    return "其他"
+
+
+_代表值表 = {
+    "文本": "文本",
+    "公式": "=A1",
+    "超链公式": '=HYPERLINK("#a!A1","查看")',
+    "数字": 1.0,
+    "布尔": True,
+    "日期": _date(2026, 1, 5),
+    "其他": None,
+}
+
+
+def _代表值(v):
+    return _代表值表[_值类别(v)]
+
+
 def _冻结解析(冻结):
     if not 冻结:
         return None
@@ -274,10 +305,12 @@ class _表写出:
             self.sst序.append(v)
         return i
 
-    def 格(self, 行号, 列号, s, v, 强制空=False, 省样式=False):
+    def 格(self, 行号, 列号, s, v, 强制空=False, 省样式=False, 直接索引=None):
         ref = f"{_字母(列号)}{行号}"
         if 省样式:
             属 = f' r="{ref}"'
+        elif 直接索引 is not None:
+            属 = f' r="{ref}" s="{直接索引}"'
         else:
             索引 = self.样式表.xf(s) if s is not None else 0
             属 = f' r="{ref}"' + (f' s="{索引}"' if (索引 or s is not None) else "")
@@ -319,6 +352,7 @@ class _表写出:
                       for j in range(len(df.columns))]
 
         行样式 = {行号: rp.样式 for 行号, rp in tp.行.items() if rp.样式 is not None}
+        常见样式 = {}                 # (列, 值类别) → xf 索引
         覆盖 = tp.覆盖
         后覆盖 = tp.后覆盖
         空缺 = tp.空缺格
@@ -440,10 +474,24 @@ class _表写出:
                 cov = 覆盖.get((行号, 列号))
                 s2 = 后覆盖.get((行号, 列号)) if 后覆盖 else None
                 列名 = str(df.columns[j]) if j < len(df.columns) else ""
-                if 大表 and rs is None and cov is None and s2 is None:
-                    样 = 列默认[j] if j < len(列默认) else None
-                    # 普通格不写 s 属性：样式由 <col style> 兜底（快速通道的关键）
-                    t = self.格(行号, 列号, None, v, 省样式=True)
+                if rs is None and cov is None and s2 is None:
+                    if 大表:
+                        # 普通格不写 s 属性：样式由 <col style> 兜底（快速通道的关键）
+                        t = self.格(行号, 列号, None, v, 省样式=True)
+                        行片.append(t) if t else None
+                        continue
+                    # 普通格：按（列, 值类别）缓存最终样式索引，免每格重复合并/变换
+                    if v is None and not 物化:
+                        continue
+                    key = (j, _值类别(v))
+                    索引 = 常见样式.get(key)
+                    if 索引 is None:
+                        s0 = 合并样式(None, tp.列[j].基础样式 if j < len(tp.列) else None)
+                        if tp.格变换 is not None:
+                            s0 = tp.格变换(s0, _代表值(v), 列名)
+                        索引 = self.样式表.xf(s0)
+                        常见样式[key] = 索引
+                    t = self.格(行号, 列号, None, v, 强制空=(v is None), 直接索引=索引)
                     行片.append(t) if t else None
                     continue
                 样 = tp.列[j].基础样式 if j < len(tp.列) else None
