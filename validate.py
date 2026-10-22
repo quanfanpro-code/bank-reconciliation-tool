@@ -143,6 +143,9 @@ def validate_config_params(
         if not is_valid:
             return False, message
 
+    if float(clearly_trivial_threshold.strip()) > float(performance_materiality.strip()):
+        return False, "明显微小错报临界值不能大于实际执行重要性水平"
+
     is_valid, message = _validate_int(
         auto_confirm_score,
         "自动确认最低综合可信度",

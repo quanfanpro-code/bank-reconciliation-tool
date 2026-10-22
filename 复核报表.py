@@ -30,7 +30,7 @@ def _brief(row):
     fields = row.get('aux_text_fields', {})
     fields = fields if isinstance(fields, dict) else {}
     parts = [pd.Timestamp(row['date']).strftime('%Y-%m-%d'), str(row.get('summary', ''))]
-    parts.extend(str(v) for k, v in fields.items() if v is not None and str(v).strip() and str(v) not in parts and any(s in k for s in ('对方', '单位', '凭证', '业务', '批次', '客户', '供应商')))
+    parts.extend(str(v) for k, v in fields.items() if v is not None and str(v).strip() and str(v) not in parts and any(s in k for s in ('对方', '单位', '凭证', '业务', '批次', '客户', '供应商', '附言', '用途')))
     voucher = str(row.get('voucher_no', '') or '')
     if voucher and voucher not in parts:
         parts.append('凭证' + voucher)
@@ -105,7 +105,7 @@ def build_review_tables(reporter, tables):
             sign = 1 if side == 'bank' else -1
             fields = row.get('aux_text_fields', {})
             fields = fields if isinstance(fields, dict) else {}
-            party = '；'.join(str(v) for k, v in fields.items() if v is not None and any(s in k for s in ('对方', '单位', '凭证', '业务', '批次', '客户', '供应商')))
+            party = '；'.join(str(v) for k, v in fields.items() if v is not None and any(s in k for s in ('对方', '单位', '凭证', '业务', '批次', '客户', '供应商', '附言', '用途')))
             voucher = str(row.get('voucher_no', '') or '')
             if voucher and voucher not in party:
                 party += ('；' if party else '') + '凭证' + voucher
@@ -136,4 +136,10 @@ def build_review_tables(reporter, tables):
     for name in ('核对明细','人工全查','人工抽样','月度差异组成','其他对应供选择'):
         result[name].insert(0,'核对编号',result[name]['事项编号'].map(display_numbers))
     result['核对明细'].insert(result['核对明细'].columns.get_loc('当前对应'),'当前核对编号','')
-    return build_display_tables(result)
+    result = build_display_tables(result)
+    from 事项说明 import 整理业务证据
+    # 归纳列与原事项索引共用对象；两个证据表与阅读表一同交付。
+    combined = {**tables, **result}
+    整理业务证据(combined)
+    result.update({name: combined[name] for name in ('事项证据', '每日差异证据')})
+    return result

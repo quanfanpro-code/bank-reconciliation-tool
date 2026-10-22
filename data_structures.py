@@ -23,6 +23,10 @@ MEET_IN_MIDDLE_THRESHOLD = 15  # 候选数超过此值时使用折半枚举算�
 # 日期偏移量优先级
 DATE_OFFSET_PRIORITIES = [0, 1, 3]  # 优先级: 同日(0) -> 相差1天 -> 相差3天
 
+# 沿用原默认搜索范围，独立于审计重要性；窗内只生成候选，不代表确认匹配。
+AMOUNT_CANDIDATE_WINDOW_LI = 5000 * 10000
+VOUCHER_CANDIDATE_WINDOW_LI = 100000 * 10000
+
 # ==========================================
 # 数据结构 (Data Structures)
 # ==========================================
@@ -229,6 +233,15 @@ class MatcherConfig:
     clearly_trivial_threshold: Decimal = Decimal("5000.00")
     auto_confirm_score: int = 70
     batch_min_count: int = 10
+
+    def __post_init__(self):
+        for label, value in (("实际执行重要性水平", self.performance_materiality),
+                             ("明显微小错报临界值", self.clearly_trivial_threshold)):
+            amount = Decimal(str(value))
+            if not amount.is_finite() or amount < 0:
+                raise ValueError(label + "必须是有限的非负金额")
+        if Decimal(str(self.clearly_trivial_threshold)) > Decimal(str(self.performance_materiality)):
+            raise ValueError("明显微小错报临界值不能大于实际执行重要性水平")
 
 class WorkerExceptionLogger:
     """Worker异常记录器 - 用于记录并行匹配过程中的异常"""

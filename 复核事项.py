@@ -7,6 +7,7 @@ import pandas as pd
 from data_structures import ProcessingStatus, RiskLevel
 from matching_policy import build_difference_components, build_group_metrics, risk_level_for
 from precision_engine import PrecisionEngine
+from 业务事件 import business_identity
 
 
 def build_review_items(matcher) -> list[dict]:
@@ -84,6 +85,22 @@ def build_review_items(matcher) -> list[dict]:
         rows = frame.loc[list(indexes)]
         amounts = [int(value) for value in rows["amount_decimal"]]
         impact = sum(abs(value) for value in amounts)
+        correction = bool(event and event.event_type == "账内冲销重记" and event.net_amount_li == 0)
+        bank_reversal = False
+        if side == "bank" and event and event.net_amount_li == 0 and len(indexes) == 2:
+            pair = [frame.loc[index] for index in indexes]
+            party = business_identity(pair[0])[1]
+            explicit = any(any(word in str(row.get("summary", "")) + str(row.get("aux_text_fields", {}))
+                               for word in ("冲正", "拒绝入账")) for row in pair)
+            same_day = pd.Timestamp(pair[0]["date"]).normalize() == pd.Timestamp(pair[1]["date"]).normalize()
+            bank_reversal = bool(explicit and same_day and party and business_identity(pair[1])[1] == party
+                                 and all(sum(pd.Timestamp(row["date"]).normalize() == pd.Timestamp(p["date"]).normalize()
+                                             and int(row["amount_decimal"]) == int(p["amount_decimal"])
+                                             and business_identity(row)[1] == party
+                                             for _, row in frame.iterrows()) == 1 for p in pair))
+        closed = correction or bank_reversal
+        if closed:
+            impact = 0
         control = getattr(matcher, "overall_control", None)
         days = [pd.Timestamp(value).normalize() for value in rows["date"]]
         hit_windows = [window for window in getattr(control, "affected_windows", ())
@@ -96,14 +113,16 @@ def build_review_items(matcher) -> list[dict]:
         identity = f"{side_name}-原行" + "-".join(str(value) for value in original_rows)
         reason = "程序未找到足以建立跨双方对应关系的候选"
         if event:
-            reason = f"{event.event_type}：{event.relationship_formula}；{event.evidence_basis}；尚未与另一侧建立对应"
+            reason = f"{event.event_type}：{event.relationship_formula}；{event.evidence_basis}"
+            if not closed:
+                reason += "；尚未与另一侧建立对应"
         if limited:
             reasons = list(getattr(control, "reasons", ()))
             reasons.extend(f"余额断档窗口{start:%Y-%m-%d}至{end:%Y-%m-%d}" for start, end in hit_windows)
             reason += "；核对范围受限" + ("：" + "；".join(reasons) if reasons else "")
         item = make_item(
             identity, indexes if side == "bank" else (), indexes if side == "journal" else (),
-            "同侧业务链" if event else f"{side_name}未对应", risk, impact, impact, reason,
+            "账内更正已闭合" if correction else "银行冲正已闭合" if bank_reversal else "同侧业务链" if event else f"{side_name}未对应", risk, impact, impact, reason,
         )
         if event:
             item["同侧业务链ID"] = event.event_id
@@ -112,7 +131,7 @@ def build_review_items(matcher) -> list[dict]:
         for index in indexes:
             row = frame.loc[index]
             amount = int(row["amount_decimal"])
-            if amount:
+            if amount and not closed:
                 direction = "收入" if amount > 0 else "支出"
                 kind = ("银行已记公司未记-" if side == "bank" else "公司已记银行未记-") + direction
                 pool_parts[(pd.Timestamp(row["date"]).strftime("%Y-%m"), kind)].append((item, abs(amount)))
@@ -138,7 +157,12 @@ def build_review_items(matcher) -> list[dict]:
 
     for item in items:
         risk = item["风险等级"]
-        if item["程序结论"] in {ProcessingStatus.AUTO_CONFIRMED.value, ProcessingStatus.GROUP_RECONCILED.value} and risk == RiskLevel.NORMAL.value:
+        if item["程序结论"] in {"账内更正已闭合", "银行冲正已闭合"} and risk == RiskLevel.NORMAL.value:
+            item["核对方式"] = "留存备查"
+            item["入选原因"] = ("同日同对方唯一付款与明确银行冲正闭合，不另寻账上支付；原始收支差额仍保留"
+                                if item["程序结论"] == "银行冲正已闭合" else
+                                "已明确关联原凭证的同日冲销重记，净额为零，不另寻银行交易；原始收支差额仍保留")
+        elif item["程序结论"] in {ProcessingStatus.AUTO_CONFIRMED.value, ProcessingStatus.GROUP_RECONCILED.value} and risk == RiskLevel.NORMAL.value:
             item["核对方式"] = "自动确认"
             item["入选原因"] = "程序已确认对应关系"
         elif risk in {RiskLevel.HIGH.value, RiskLevel.UNKNOWN.value}:

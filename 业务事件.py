@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -11,7 +12,7 @@ import pandas as pd
 from data_structures import BusinessClue, BusinessEvent
 
 
-RETURN_WORDS = ("退款", "退回", "退汇", "冲销", "撤销", "退票", "红字")
+RETURN_WORDS = ("退款", "退回", "退汇", "冲销", "冲正", "拒绝入账", "撤销", "退票", "红字")
 FEE_WORDS = ("手续费", "佣金", "结算费", "账户管理费", "网银费", "汇费", "转账费", "短信费")
 
 
@@ -41,9 +42,16 @@ def _field(row: pd.Series, names: tuple[str, ...]) -> str:
 
 
 def business_identity(row: pd.Series) -> tuple[str, str]:
+    fields = row.get("aux_text_fields", {})
+    names = ("对方", "户名", "客户", "供应商")
+    entries = [*(fields.items() if isinstance(fields, dict) else ()), *row.items()]
+    party = next((str(value).strip() for key, value in entries
+                  if any(name in str(key) for name in names)
+                  and not any(word in str(key) for word in ("科目", "行名", "开户行", "银行", "账号", "帐号", "卡号"))
+                  and value is not None and str(value).strip() not in {"", "nan", "None"}), "")
     return (
         _field(row, ("业务编号", "批次号", "回单号", "申请单号", "订单号")),
-        _field(row, ("对方", "户名", "客户", "供应商")),
+        party,
     )
 
 
@@ -97,6 +105,39 @@ def detect_same_side_events(
     events: list[BusinessEvent] = []
     clues: list[BusinessClue] = []
     consumed: set[int] = set()
+
+    # 明示引用原凭证的同日冲销和重记，只闭合这两条账内更正，不占用原付款。
+    if source == "journal":
+        for reverse_idx in ordered:
+            reverse = frame.loc[reverse_idx]
+            ref = re.fullmatch(r"\[冲销(\d{4})[./-](\d{1,2})[./-](\d{1,2})\s+([^\d\s-]+)-?(\d+)号凭证\](.+)", str(reverse.get("summary", "")).strip())
+            if not ref or reverse_idx in consumed:
+                continue
+            year, month, day, word, number, body = ref.groups()
+            original_day = f"{year}-{int(month):02d}-{int(day):02d}"
+            if original_day > str(reverse["date"])[:10]:
+                continue
+            amount = int(reverse["amount_decimal"])
+            originals = [i for i in ordered if str(frame.loc[i, "date"])[:10] == original_day
+                         and str(frame.loc[i].get("voucher_no", "")).lstrip("0") == number.lstrip("0")
+                         and str(frame.loc[i].get("voucher_word", "")) == word
+                         and int(frame.loc[i, "amount_decimal"]) == -amount
+                         and str(frame.loc[i].get("summary", "")).strip() == body.strip()]
+            replacements = [i for i in ordered if i != reverse_idx and i not in consumed
+                            and pd.Timestamp(frame.loc[i, "date"]).normalize() == pd.Timestamp(reverse["date"]).normalize()
+                            and int(frame.loc[i, "amount_decimal"]) == -amount
+                            and str(frame.loc[i].get("summary", "")).strip() == body.strip()]
+            if not amount or len(originals) != 1 or len(replacements) != 1:
+                continue
+            indexes = (reverse_idx, replacements[0])
+            events.append(BusinessEvent(
+                event_id=_stable_id("COR", source, indexes), source=source,
+                event_type="账内冲销重记", row_idxs=indexes, net_amount_li=0,
+                relationship_formula="明确冲销＋同日同业务重记＝零；原付款保持原对应",
+                evidence_basis=f"明示引用{original_day} {word}-{number}原凭证；原凭证存在且金额反向；重记摘要完整相同且唯一，不新增银行收付",
+                review_status="账内更正已闭合",
+            ))
+            consumed.update(indexes)
 
     # 三段链：原付款/收款、明确退回、再次付款/收款。
     for middle_pos in range(1, len(ordered) - 1):

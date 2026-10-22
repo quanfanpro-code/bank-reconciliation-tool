@@ -9,7 +9,7 @@ import math
 import zipfile
 from datetime import datetime as _dt, date as _date
 from decimal import Decimal as _Decimal
-from xml.sax.saxutils import escape as _xesc
+from xml.sax.saxutils import escape as _xesc, quoteattr as _qattr
 
 from 排版计划 import 合并样式, 簿计划
 
@@ -204,7 +204,7 @@ class _样式表:
             片.append(f'<numFmts count="{len(self._numfmt列表)}">')
             for 代码 in self._numfmt列表:
                 i = self._numfmt[代码]
-                片.append(f'<numFmt numFmtId="{i}" formatCode="{_xesc(代码)}"/>')
+                片.append(f'<numFmt numFmtId="{i}" formatCode={_qattr(代码)}/>')
             片.append("</numFmts>")
         片.append(f'<fonts count="{max(1, len(self._font列表))}">')
         片.extend(self._font列表 or ["<font><sz val='11'/><name val='Calibri'/></font>"])

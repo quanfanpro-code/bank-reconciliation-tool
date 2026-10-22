@@ -1,4 +1,4 @@
-"""疑点分层处置测试：明显微小零差额自动确认 + 中风险等距抽样。"""
+"""疑点分层处置：小额保留原判断，只影响风险和中风险等距抽样。"""
 
 from decimal import Decimal
 
@@ -99,7 +99,7 @@ def _report_records(rows):
     return pd.DataFrame(records)
 
 
-def test_明显微小零差额弱证据匹配自动确认():
+def test_明显微小零差额弱证据仍是疑点并按低风险留存():
     candidate = _candidate(
         bank_amounts=[Decimal("3000")],
         journal_amounts=[Decimal("3000")],
@@ -108,9 +108,8 @@ def test_明显微小零差额弱证据匹配自动确认():
 
     status, risk, reason = route_candidate(candidate, MatcherConfig())
 
-    assert status is ProcessingStatus.AUTO_CONFIRMED
-    assert risk is RiskLevel.NORMAL
-    assert "金额明显微小自动确认" in reason
+    assert status is ProcessingStatus.FLAGGED
+    assert risk is RiskLevel.LOW
     assert "候选歧义" in reason
     assert "业务依据不足" in reason
 

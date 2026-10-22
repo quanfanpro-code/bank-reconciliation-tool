@@ -211,15 +211,9 @@ def _amount_score(candidate: MatchCandidate, config: MatcherConfig) -> int:
     difference = candidate.metrics.total_diff_li
     if difference == 0:
         return 40
-    trivial_li = max(
-        1,
-        PrecisionEngine.to_integer_li(config.clearly_trivial_threshold),
-    )
-    if difference <= trivial_li:
-        return max(20, round(40 - 20 * difference / trivial_li))
     group_amount = max(1, candidate.metrics.group_amount_li)
     relative_difference = min(1.0, difference / group_amount)
-    return max(0, round(20 * (1 - relative_difference)))
+    return max(0, round(40 * (1 - relative_difference)))
 
 
 def _date_score(candidate: MatchCandidate, config: MatcherConfig) -> int:
@@ -415,18 +409,6 @@ def route_candidate(
             and not hard_conflict):
         status = ProcessingStatus.GROUP_RECONCILED
         reasons.insert(0, "交易组收支分别闭合")
-    elif (
-        candidate.metrics.total_diff_li == 0
-        and has_relationship_risk
-        and not hard_conflict
-        and candidate.metrics.group_amount_li
-        <= PrecisionEngine.to_integer_li(config.clearly_trivial_threshold)
-    ):
-        return (
-            ProcessingStatus.AUTO_CONFIRMED,
-            RiskLevel.NORMAL,
-            "金额明显微小自动确认（原疑点：" + "；".join(reasons) + "）",
-        )
     elif candidate.metrics.total_diff_li > 0:
         status = ProcessingStatus.AUTO_CLASSIFIED
         reasons.insert(0, "存在可量化金额差异")

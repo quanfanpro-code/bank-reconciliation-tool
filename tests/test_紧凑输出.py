@@ -11,22 +11,19 @@ from 排版计划 import _紧凑阅读表 as 阅读表, _紧凑阅读色 as 阅�
 from tests.test_人工结果计算 import _报告, excel, _打开, _表
 
 
-def test_五张蓝色阅读表与绿色完整留痕均可见(tmp_path):
+def test_业务阅读表可见且绿色计算留痕默认隐藏(tmp_path):
     path = _报告(tmp_path, [150, 450, 500], [100, 200, 300, 500, 700],
                  [((0, 1), (0, 1, 2)), ((2,), (3,))])
     with closing(load_workbook(path)) as book:
-        assert tuple(book.sheetnames[:5]) == 阅读表
-        技术表 = {"运行参数", "大模型辅助明细", "解析异常明细"}
-        assert all(sheet.sheet_state == ('hidden' if sheet.title in 技术表 else 'visible')
+        assert tuple(book.sheetnames[:len(阅读表)]) == 阅读表
+        assert all(sheet.sheet_state == ('visible' if sheet.title in 阅读表 else 'hidden')
                    for sheet in book)
         for sheet in book:
             assert sheet.sheet_properties.tabColor.rgb == '00' + (阅读颜色 if sheet.title in 阅读表 else 留痕颜色)
             assert sheet.freeze_panes in (None, 'A2')
-            if sheet.max_row > 1:
-                assert sheet.row_dimensions[2].height < 60
             for row in sheet:
                 for cell in row:
-                    if cell.value is not None:
+                    if cell.value is not None and not (sheet.title == '核对总览' and cell.row in (2, 3)):
                         assert cell.font.name == 'MiSans' and cell.font.sz == 9
             first = min(identify_columns(sheet).values())
             assert all(sheet.column_dimensions[get_column_letter(column)].hidden for column in range(1, first))
@@ -54,7 +51,7 @@ def test_缺少余额明确显示未提供而不补零(tmp_path):
         assert pending.cell(2, headers['支出差额']).value == 0
 
 
-def test_全部自动确认时仍有五张阅读表但不增加人工待办(tmp_path, monkeypatch):
+def test_全部自动确认时保留阅读表但不增加人工待办(tmp_path, monkeypatch):
     from data_structures import ProcessingStatus, RiskLevel
     from reporter import Reporter
     generate = Reporter.generate_report
@@ -69,13 +66,13 @@ def test_全部自动确认时仍有五张阅读表但不增加人工待办(tmp_
     monkeypatch.setattr(Reporter, 'generate_report', confirmed)
     path = _报告(tmp_path, [100], [100], [((0,), (0,))])
     with closing(load_workbook(path)) as book:
-        assert tuple(book.sheetnames[:5]) == 阅读表
+        assert tuple(book.sheetnames[:len(阅读表)]) == 阅读表
         assert book['待处理事项'].max_row == 1
         assert not book['待处理事项'].data_validations.dataValidation
         assert book['对应明细'].max_row == 2
 
 
-def test_长说明留在批注且大额金额列足够宽(tmp_path, monkeypatch):
+def test_完整业务说明直接列示且大额金额列足够宽(tmp_path, monkeypatch):
     import tests.test_人工结果计算 as calculation
     frame = calculation._df
 
@@ -91,8 +88,7 @@ def test_长说明留在批注且大额金额列足够宽(tmp_path, monkeypatch)
         sheet = book['对应明细']
         headers = identify_columns(sheet)
         cell = sheet.cell(2, headers['银行记录'])
-        assert len(str(cell.value)) <= 32
-        assert cell.comment and len(cell.comment.text) > 100
+        assert '设备采购付款说明' * 30 in str(cell.value)
         money = get_column_letter(headers['银行收入'])
         assert sheet.column_dimensions[money].width >= len(f'{value:,.2f}') + 1
         assert sheet.cell(2, headers['银行收入']).value == value

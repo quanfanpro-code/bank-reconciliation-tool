@@ -1167,6 +1167,9 @@ class Reporter:
             ("组合最大深度", config.max_dfs_depth),
             ("批量最少笔数", config.batch_min_count),
             ("最大候选数", config.max_candidates),
+            ("普通候选金额搜索窗（元，仅生成候选）", 5000),
+            ("完整凭证候选金额搜索窗（元，仅生成候选）", 100000),
+            ("搜索窗与审计重要性关系", "独立；沿用原默认搜索范围，强业务编号候选可超窗，金额不相等始终保留差额"),
             (
                 "组合搜索每来源节点上限",
                 config.combination_node_limit_per_source,
@@ -2119,6 +2122,20 @@ class Reporter:
             date_format,
         )
         tables.update(build_review_tables(self, tables))
+        # 单边表使用与人工处置相同的最终月度累计分级，不能一律写成范围未知。
+        index = tables["复核事项索引"].set_index("事项编号")
+        records = tables["核对明细"]
+        for name, source in (("银行侧待查", "银行流水"), ("日记账侧待查", "序时账")):
+            by_row = {}
+            for r in records.loc[records["来源"] == source].to_dict("records"):
+                row_number = int(str(r["原始记录号"]).removeprefix("银行").removeprefix("账面"))
+                by_row[row_number] = r["事项编号"]
+            table = tables[name]
+            if not table.empty:
+                identities = table["原文件行号"].map(lambda value: by_row[int(value)])
+                for field in ("风险等级", "判断依据"):
+                    table[field] = identities.map(index[field]).to_numpy()
+                table["建议动作"] = identities.map(index["核对方式"]).to_numpy()
         return {
             name: self._safe_table(frame)
             for name, frame in tables.items()

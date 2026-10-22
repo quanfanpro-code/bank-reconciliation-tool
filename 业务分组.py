@@ -11,7 +11,7 @@ _GROUP_ID_MARKER = (
 )
 _TRANSACTION_ID_MARKER = r"回单(?:编?号)?|(?:交易)?流水(?:编?号)?|交易编号"
 _ID_MARKER = rf"(?:{_GROUP_ID_MARKER}|{_TRANSACTION_ID_MARKER})"
-_GENERIC_SUMMARIES = {"转账", "汇款", "收款", "付款", "货款", "往来款"}
+_GENERIC_SUMMARIES = {"转账", "汇款", "收款", "付款", "货款", "往来款", "电汇", "汇兑", "网银转账", "跨行转账"}
 _GROUP_ID_PRIORITY = ("批次", "业务", "结算", "合同", "订单", "其他编号")
 
 
@@ -19,7 +19,7 @@ def _is_generic_summary(value):
     normalized = _normalize_text(value)
     if normalized in _GENERIC_SUMMARIES:
         return True
-    return bool(re.fullmatch(r"(?:支付|付|收取|收到|采购|销售)?(?:转账|汇款|收款|付款|货款|往来款)", normalized))
+    return bool(re.fullmatch(r"(?:支付|付|收取|收到|采购|销售)?(?:转账|转款|汇款|收款|付款|货款|往来款)", normalized))
 
 
 def _batch_category(text):
@@ -77,6 +77,14 @@ def _group_boundary_ids(ids):
     return frozenset()
 
 
+def _mentions_party(name, narrative):
+    """完整单位名称或带日期/付款动作边界的个人姓名，不采纳公司简称片段。"""
+    return bool((len(name) >= 8 and name in narrative)
+                or (re.fullmatch(r"[\u4e00-\u9fff]{2,4}", name)
+                    and re.search(r"(?:^|[0-9]|支付|收到|收回|收|付|转)" + re.escape(name)
+                                  + r"(?=报销|差旅|交通|工资|借款|备用金|申请|费用|还款|补贴|餐费|$)", narrative)))
+
+
 def row_business(row):
     fields = dict(row.get("aux_text_fields", {}) or {})
     field_evidence = row.get("aux_text_evidence", {})
@@ -114,7 +122,9 @@ def row_business(row):
         if critical_category:
             parties[critical_category].add(_normalize_text(value))
         else:
-            texts.append(value)
+            # 科目、核算项目和开户行不是支付用途，不能把社保/奖金都判成工资。
+            if not re.search(r"科目|核算项目|行名|开户行|银行名称", str(label)):
+                texts.append(value)
             for match in re.finditer(r"(" + _ID_MARKER + r")\s*[:：#]?\s*([A-Za-z0-9][A-Za-z0-9_./-]*)", value):
                 identifier = (_id_category(match.group(1)), _normalize_id(match.group(2)))
                 if identifier[0] == "交易流水":
@@ -122,6 +132,11 @@ def row_business(row):
                 else:
                     ids.add(identifier)
     text = " ".join(texts)
+    broad_purpose = (not texts or all(_is_generic_summary(t) or _normalize_text(t) in {"税费等", "税费", "税费社保"} for t in texts))
+    tax_social_text = text + " " + " ".join(
+        value for value in parties.get("对方户名", ()) if broad_purpose and value == "税费社保")
+    tax_social = {kind for kind, pattern in (("税费", r"税|教育附加"), ("社保公积金", r"社保|公积金"))
+                  if re.search(pattern, tax_social_text)}
     row_date = row["date"]
     batch_category = _batch_category(text)
     salary = batch_category == "工资"
@@ -142,6 +157,11 @@ def row_business(row):
     if salary:
         parties["对方户名"] -= {"工资", "工资汇总", "代发工资", "员工工资", "职工工资", "工资总额"}
     return {"ids": ids, "transaction_ids": transaction_ids,
+            "unspecified_purpose": not texts or all(_is_generic_summary(t) for t in texts),
+            "tax_social_purposes": tax_social,
+            "transfer_purpose": bool(re.search(r"转款|往来转账|往来款", text)),
+            "deposit_contra": "银行存款" in str(fields.get("对方科目名称", "")),
+            "balance": row.get("balance"),
             "salary": salary, "batch_category": batch_category,
             "periods": periods,
             "summary": _normalize_text(row.get("summary", "")),
@@ -154,6 +174,15 @@ def row_business(row):
 def business_evidence(bank, journal):
     """按原始每行检查冲突，避免把多名员工拼成一个交易对手。"""
     conflicts = []
+    tax_social = (bank[0].get("tax_social_purposes", set()) & journal[0].get("tax_social_purposes", set())
+                  if len(bank) == len(journal) == 1 else set())
+    transfer = bool(len(bank) == len(journal) == 1
+                    and journal[0].get("deposit_contra") and journal[0].get("transfer_purpose")
+                    and bank[0]["date"] == journal[0]["date"]
+                    and (bank[0].get("transfer_purpose")
+                         or (bank[0].get("unspecified_purpose")
+                             and bank[0].get("balance") is not None
+                             and bank[0]["balance"] == journal[0].get("balance"))))
     ids = [set().union(*(r["ids"] for r in rows)) for rows in (bank, journal)]
     id_values = []
     for values in ids:
@@ -223,16 +252,18 @@ def business_evidence(bank, journal):
             or (all(years) and years[0] != years[1])):
         conflicts.append("工资期间不同")
     salary_sides = [all(r["salary"] for r in rows) for rows in (bank, journal)]
-    if any(r["salary"] for r in bank + journal) and not all(salary_sides):
+    if (any(r["salary"] for r in bank + journal) and not all(salary_sides)
+            and any(not r["salary"] and not r.get("unspecified_purpose") for r in bank + journal)):
         conflicts.append("工资与其他用途混合")
     batch_categories = [
         {r.get("batch_category", "") for r in rows if r.get("batch_category", "")}
         for rows in (bank, journal)
     ]
     batch_sides = [all(r.get("batch_category", "") for r in rows) for rows in (bank, journal)]
-    if any(batch_categories) and not all(batch_sides):
+    if (not tax_social and any(batch_categories) and not all(batch_sides)
+            and any(not r.get("batch_category") and not r.get("unspecified_purpose") for r in bank + journal)):
         conflicts.append("批量业务与其他用途混合")
-    elif (
+    elif not tax_social and all(batch_categories) and (
         any(len(values) > 1 for values in batch_categories)
         or (
             all(batch_categories)
@@ -297,10 +328,16 @@ def business_evidence(bank, journal):
     same_party = any(len(parties[0][key]) == 1 and parties[0][key] == parties[1][key]
                      for key in parties[0].keys() & parties[1].keys())
     narrative_party = ""
+    bank_names = parties[0].get("对方户名", set())
+    narrative_names = {name for name in bank_names if any(_mentions_party(name, r["summary"]) for r in journal)}
+    narrative_group = bool(len(bank_names) == 1 and narrative_names == bank_names
+                           and all(any(_mentions_party(name, r["summary"]) for name in bank_names) for r in journal))
+    if len(bank_names) > 1 and narrative_names and narrative_names != bank_names and not common_id:
+        conflicts.append("银行对方组成未被账上业务说明完整覆盖")
     if len(bank) == len(journal) == 1 and not parties[1].get("对方户名"):
         narrative = journal[0]["summary"]
-        narrative_party = next((name for name in parties[0].get("对方户名", ())
-                                if len(name) >= 8 and name in narrative), "")
+        narrative_party = next((name for name in sorted(parties[0].get("对方户名", ()))
+                                if _mentions_party(name, narrative)), "")
     if common_id:
         strength, basis = 4, "共同业务编号或批次：" + "、".join(
             category + " " + value
@@ -308,6 +345,12 @@ def business_evidence(bank, journal):
         )
     elif common_transaction_id:
         strength, basis = 4, "共同交易流水号或回单号"
+    elif narrative_party or narrative_group:
+        strength, basis = 3, "银行对方名称完整出现在账上具体业务说明：" + (narrative_party or next(iter(bank_names)))
+    elif tax_social:
+        strength, basis = 2, "银行税费社保扣款范围涵盖账上明确用途：" + "、".join(sorted(tax_social))
+    elif transfer:
+        strength, basis = 2, "转款用途与账上银行存款对转科目对应；同日金额及其他证据共同核验"
     elif all(salary_sides):
         strength, basis = 2, "工资用途及发放日期、期间对应"
     elif common_batch_category:
@@ -316,8 +359,6 @@ def business_evidence(bank, journal):
         strength, basis = 3, "明确对方及具体摘要共同对应"
     elif same_party:
         strength, basis = 2, "明确对方信息对应"
-    elif narrative_party:
-        strength, basis = 2, "银行对方名称完整出现在账上摘要：" + narrative_party
     elif same_summary:
         strength, basis = 1, "摘要对应"
     else:
@@ -330,7 +371,7 @@ def business_evidence(bank, journal):
             "salary_group": all(salary_sides),
             "batch_category": common_batch_category,
             "specific_summary_group": same_summary,
-            "same_party_group": same_party or bool(narrative_party),
+            "same_party_group": same_party or bool(narrative_party) or narrative_group,
             "aggregate_party_hierarchy_hint": aggregate_party_hierarchy_hint,
             "aggregate_party_categories": tuple(sorted(aggregate_party_categories)),
             "business_conflicts": tuple(conflicts)}

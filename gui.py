@@ -1032,8 +1032,8 @@ class AdvancedConfigDialog(ctk.CTkToplevel):
     def __init__(self, parent, current_values):
         super().__init__(parent)
         self.title("高级匹配参数")
-        self.geometry("620x650")
-        self.minsize(560, 560)
+        self.geometry("680x760")
+        self.minsize(620, 560)
         self.transient(parent)
         self.grab_set()
         self.result = None
@@ -1045,6 +1045,10 @@ class AdvancedConfigDialog(ctk.CTkToplevel):
                 "allow_mixed_sign",
                 "allow_zero_match",
                 "allow_greedy_fallback",
+                "tolerance_days",
+                "dfs_window",
+                "similarity_threshold",
+                "similarity_high",
             }
         }
         self.allow_mixed_sign_var = ctk.BooleanVar(
@@ -1086,18 +1090,16 @@ class AdvancedConfigDialog(ctk.CTkToplevel):
         )
         body.grid_columnconfigure(1, weight=1)
         field_labels = [
-            ("日期容差（天）", "tolerance_days"),
-            ("组合窗口（天）", "dfs_window"),
-            ("组合最大深度", "dfs_depth"),
-            ("批量最少笔数", "batch_min_count"),
-            ("贪心尝试次数", "greedy_attempts"),
-            ("随机种子（-1为随机）", "random_seed"),
-            ("文字相似度阈值", "similarity_threshold"),
-            ("高相似度阈值", "similarity_high"),
-            ("每笔最大候选数", "max_candidates"),
-            ("内存限制（GB）", "memory_limit"),
+            ("自动确认分数门槛", "auto_confirm_score", "普通候选达到此分数，且业务依据充分、没有冲突或歧义，才可能自动确认。满分100，默认70；70分不表示70%的准确率。"),
+            ("组合最大深度", "dfs_depth", "普通组合时，对面最多尝试合并多少笔；调大会更慢，已识别的完整业务组不受此限制。"),
+            ("批量最少笔数", "batch_min_count", "同日同额达到此笔数，才启动一类工资、代发汇总查找；不是所有工资分组的门槛。"),
+            ("贪心尝试次数", "greedy_attempts", "快速补找时换顺序尝试的次数；不是把整套核对重跑多次。"),
+            ("随机种子（-1为随机）", "random_seed", "固定数字便于重复查验；-1表示每次换随机顺序，不会提高业务证据的可信度。"),
+            ("每笔最大候选数", "max_candidates", "控制每笔搜索保留的候选范围，越大通常越慢；普通组合目前最多取30条。"),
+            ("内存限制（GB）", "memory_limit", "程序内存超过此值后会减少同时处理的任务；不是保证内存绝不超过这个数。"),
         ]
-        for row_index, (label, key) in enumerate(field_labels):
+        for index, (label, key, explanation) in enumerate(field_labels):
+            row_index = index * 2
             ctk.CTkLabel(
                 body,
                 text=label,
@@ -1120,46 +1122,32 @@ class AdvancedConfigDialog(ctk.CTkToplevel):
                 padx=(0, 12),
                 pady=5,
             )
-        checkbox_row = len(field_labels)
-        ctk.CTkCheckBox(
-            body,
-            text="允许异号组合",
-            variable=self.allow_mixed_sign_var,
-        ).grid(
-            row=checkbox_row,
-            column=0,
-            sticky="w",
-            padx=12,
-            pady=(12, 5),
-        )
-        ctk.CTkCheckBox(
-            body,
-            text="允许零金额匹配",
-            variable=self.allow_zero_match_var,
-        ).grid(
-            row=checkbox_row,
-            column=1,
-            sticky="w",
-            padx=12,
-            pady=(12, 5),
-        )
-        ctk.CTkCheckBox(
-            body,
-            text="启用贪心兜底",
-            variable=self.allow_greedy_var,
-        ).grid(
-            row=checkbox_row + 1,
-            column=0,
-            sticky="w",
-            padx=12,
-            pady=5,
-        )
+            ctk.CTkLabel(
+                body, text=explanation, text_color=("gray40", "gray70"),
+                wraplength=520, justify="left", anchor="w",
+            ).grid(row=row_index + 1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 9))
+        checkbox_row = len(field_labels) * 2
+        checkboxes = [
+            ("允许异号组合", self.allow_mixed_sign_var, "允许正数和负数一起寻找组合，但不能靠收支抵销认定对平；专门的退款、冲正识别不受此开关影响。"),
+            ("允许零金额匹配", self.allow_zero_match_var, "金额确实为0的记录也可参与相关匹配；金额为空或读取失败不会按0元处理。"),
+            ("启用贪心兜底", self.allow_greedy_var, "普通组合未找到结果且仍有搜索余量时，快速补找可能对应；找到后仍须检查业务依据。"),
+        ]
+        for index, (label, variable, explanation) in enumerate(checkboxes):
+            row_index = checkbox_row + index * 2
+            ctk.CTkCheckBox(body, text=label, variable=variable).grid(
+                row=row_index, column=0, columnspan=2, sticky="w", padx=12, pady=(5, 3),
+            )
+            ctk.CTkLabel(
+                body, text=explanation, text_color=("gray40", "gray70"),
+                wraplength=520, justify="left", anchor="w",
+            ).grid(row=row_index + 1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 9))
+        date_row = checkbox_row + len(checkboxes) * 2
         ctk.CTkLabel(
             body,
-            text="日期显示格式",
+            text="日期读取格式",
             anchor="w",
         ).grid(
-            row=checkbox_row + 2,
+            row=date_row,
             column=0,
             sticky="w",
             padx=12,
@@ -1176,12 +1164,16 @@ class AdvancedConfigDialog(ctk.CTkToplevel):
             values=date_formats,
             state="readonly",
         ).grid(
-            row=checkbox_row + 2,
+            row=date_row,
             column=1,
             sticky="ew",
             padx=(0, 12),
             pady=5,
         )
+        ctk.CTkLabel(
+            body, text="按原文件的日、月、年顺序读取日期；auto表示自动识别，避免把01/02的日月读反。",
+            text_color=("gray40", "gray70"), wraplength=520, justify="left", anchor="w",
+        ).grid(row=date_row + 1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 9))
 
         footer = ctk.CTkFrame(self, fg_color="transparent")
         footer.grid(
@@ -1430,11 +1422,12 @@ class ReconciliationApp(ctk.CTk):
         self.llm_status_var = ctk.StringVar()
         self._refresh_llm_status()
 
-        # 首页只保留用户确认过的三个核心策略
+        # 常用日期范围与原有审计策略放在同一卡片，沿用原参数变量。
         params = [
             ("实际执行重要性水平", self.performance_materiality_var),
             ("明显微小错报临界值", self.clearly_trivial_threshold_var),
-            ("自动确认最低综合可信度", self.auto_confirm_score_var),
+            ("日期容差（天）", self.tolerance_days_var),
+            ("组合窗口（天）", self.dfs_window_var),
         ]
 
         for i, (label, var) in enumerate(params):
@@ -1463,7 +1456,7 @@ class ReconciliationApp(ctk.CTk):
             )
         ctk.CTkLabel(
             card,
-            text="按重要性水平对疑点分级，核对自动完成。",
+            text="日期容差用于逐笔对应，组合窗口用于多笔合并。\n重要性只决定疑点处置，不代替匹配判断。",
             text_color=("gray40", "gray70"),
             wraplength=260,
             justify="left",
@@ -1651,6 +1644,7 @@ class ReconciliationApp(ctk.CTk):
             return
         values = dialog.result
         variable_map = {
+            "auto_confirm_score": self.auto_confirm_score_var,
             "tolerance_days": self.tolerance_days_var,
             "dfs_window": self.dfs_window_var,
             "dfs_depth": self.dfs_depth_var,

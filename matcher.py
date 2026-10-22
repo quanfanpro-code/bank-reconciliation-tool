@@ -43,7 +43,8 @@ from data_structures import (
     ProcessingStatus,
     WorkerExceptionLogger,
     DFS_CONFIDENCE_HIGH_THRESHOLD, DFS_CONFIDENCE_MEDIUM_THRESHOLD,
-    MEET_IN_MIDDLE_THRESHOLD, DATE_OFFSET_PRIORITIES
+    MEET_IN_MIDDLE_THRESHOLD, DATE_OFFSET_PRIORITIES,
+    AMOUNT_CANDIDATE_WINDOW_LI, VOUCHER_CANDIDATE_WINDOW_LI,
 )
 from llm_assistant import (
     ONLINE_ALLOWED_FIELDS,
@@ -665,9 +666,7 @@ def _process_single_source_with_diagnostics(args: Tuple) -> _CombinationTaskResu
         window_indices = [item[2] for item in indexed]
         window_stable_keys = [item[3] for item in indexed]
 
-        trivial_tolerance_li = PrecisionEngine.to_integer_li(
-            config.clearly_trivial_threshold
-        )
+        trivial_tolerance_li = AMOUNT_CANDIDATE_WINDOW_LI
         exact_single_exists = any(
             int(amount) == target_val for amount in window_amounts
         )
@@ -1651,11 +1650,26 @@ class Matcher:
                     f"（{window[0]:%Y-%m-%d}至{window[1]:%Y-%m-%d}）内关系降级"
                     for window in hit_windows
                 ]
+        self._refresh_atomic_candidate_eligibility(candidate)
         self._score_existing_candidate(candidate)
         self.candidates.append(candidate)
         self._candidate_ids.add(candidate_id)
         self._candidate_index_keys.add(index_key)
         return candidate
+
+    @staticmethod
+    def _refresh_atomic_candidate_eligibility(candidate: MatchCandidate) -> None:
+        """凭证含多笔真实支付时，允许有独立业务证据的同日逐笔对应。"""
+        if (candidate.evidence.get("atomic_group_subset")
+                and len(candidate.bank_idxs) == len(candidate.journal_idxs) == 1
+                and candidate.date_span_days == 0 and candidate.metrics.total_diff_li == 0
+                and candidate.evidence.get("business_strength", 0) >= 2
+                and not candidate.evidence.get("business_conflicts")
+                and not candidate.evidence.get("shared_business_id")
+                and candidate.evidence.get("ineligible_reason") == "候选只包含完整凭证的一部分，禁止拆分凭证凑数"):
+            candidate.evidence.pop("selection_ineligible", None)
+            candidate.evidence.pop("ineligible_reason", None)
+            candidate.evidence["independent_payment_in_voucher"] = True
 
     @staticmethod
     def _candidate_component_positions(
@@ -1705,6 +1719,8 @@ class Matcher:
 
     def _refresh_candidate_ambiguity(self) -> None:
         """候选全部生成后，以固定上限保存稳定的直接竞争关系样本。"""
+        for candidate in self.candidates:
+            self._refresh_atomic_candidate_eligibility(candidate)
         candidates = [
             candidate for candidate in self.candidates
             if not candidate.evidence.get("selection_ineligible")
@@ -1853,10 +1869,12 @@ class Matcher:
                             and candidate.metrics.total_diff_li == 0
                             and candidate.date_span_days == 0
                             and candidate.evidence.get("business_strength", 0) >= 2
-                            and other_priority == own_priority
-                            and other.date_span_days > 0
+                            and other.evidence.get("business_strength", 0) <= candidate.evidence.get("business_strength", 0)
+                            and not other.evidence.get("shared_business_id")
+                            and not other.evidence.get("shared_transaction_id")
+                            and (other.date_span_days > 0 or other.metrics.total_diff_li > 0)
                         ):
-                            # 同等业务证据下，跨日备选不应否定同日逐笔关系。
+                            # 不能用业务证据没有增强的跨日、带差额拼组否定同日确切对应。
                             continue
                         if (
                             full_group
@@ -1925,10 +1943,43 @@ class Matcher:
 
     def _add_closed_candidate_groups(self) -> None:
         """把多解但整体借贷相等的竞争组归并为可自动确认的整组关系。"""
+        # 复用逐笔候选整理完整凭证，避免把未载用途的同一工资批次拆成几十项单边待办。
+        exact_by_journal: Dict[int, List[MatchCandidate]] = {}
+        for candidate in self.candidates:
+            if (len(candidate.bank_idxs) == len(candidate.journal_idxs) == 1
+                    and candidate.metrics.total_diff_li == 0 and candidate.date_span_days == 0
+                    and not has_business_conflict(candidate)
+                    and (not candidate.evidence.get("selection_ineligible")
+                         or candidate.evidence.get("atomic_group_subset"))):
+                exact_by_journal.setdefault(candidate.journal_idxs[0], []).append(candidate)
+        for journal_group in self._atomic_groups.get("journal", []):
+            if not all(index in exact_by_journal for index in journal_group):
+                continue
+            pairs = [c for index in journal_group for c in exact_by_journal[index]]
+            bank_idxs = sorted({i for c in pairs for i in c.bank_idxs})
+            journal_idxs = sorted(journal_group)
+            if (len(bank_idxs) != len(journal_idxs)
+                    or sorted(int(self.bank.loc[i, "amount_decimal"]) for i in bank_idxs)
+                    != sorted(int(self.journal.loc[i, "amount_decimal"]) for i in journal_idxs)):
+                continue
+            evidence = business_evidence([self._business_rows["bank"][i] for i in bank_idxs],
+                                         [self._business_rows["journal"][i] for i in journal_idxs])
+            if evidence["business_conflicts"]:
+                continue
+            strong = all(c.evidence.get("business_strength", 0) >= 2 for c in pairs)
+            if strong:
+                evidence["business_strength"] = max(2, evidence["business_strength"])
+                evidence["business_basis"] = "同日完整凭证各笔均有独立业务依据，双方逐笔金额组成与合计一致"
+            self._add_candidate(bank_idxs, journal_idxs, "observed_voucher_payments", "完整凭证支付组成",
+                                resolves_full_group=strong, complete_business_group=strong,
+                                represents_full_observed_group=True,
+                                precomputed_business_evidence=evidence)
         exact_candidates = [
             candidate
             for candidate in self.candidates
             if candidate.metrics.total_diff_li == 0
+            and candidate.date_span_days == 0
+            and candidate.evidence.get("business_strength", 0) >= 2
             and not candidate.evidence.get("closed_group_fallback")
             and not candidate.evidence.get("selection_ineligible")
             and not has_business_conflict(candidate)
@@ -1985,7 +2036,8 @@ class Matcher:
                     or (
                         same_amount_multiset
                         and group_evidence.get("same_party_group", False)
-                        and group_evidence.get("specific_summary_group", False)
+                        and len({self._business_rows[side][i]["date"] for side, indices in
+                                 (("bank", bank_idxs), ("journal", journal_idxs)) for i in indices}) == 1
                         and not group_evidence["batch_category"]
                     )
                 )
@@ -2083,16 +2135,9 @@ class Matcher:
         ):
             return
 
-        performance_li = PrecisionEngine.to_integer_li(
-            self.config.performance_materiality
-        )
         request_sequence = len(self.llm_records)
         for group in self._group_ambiguous_candidates():
-            eligible = [
-                candidate
-                for candidate in group
-                if candidate.metrics.group_amount_li <= performance_li
-            ]
+            eligible = list(group)
             if not eligible:
                 continue
             if (
@@ -3032,9 +3077,7 @@ class Matcher:
         journal_groups: List[Tuple[Any, Tuple[int, ...]]],
     ) -> None:
         """把完整日记账凭证作为一个候选单位，金额有差异时也不拆行凑数。"""
-        performance_li = PrecisionEngine.to_integer_li(
-            self.config.performance_materiality
-        )
+        search_window_li = VOUCHER_CANDIDATE_WINDOW_LI
         self._reset_candidate_search_stage("atomic_voucher")
         bank_buckets: Dict[Tuple[int, pd.Timestamp], Dict[str, Any]] = {}
         bank_by_profile_key = self._global_profile_indexes["bank"]
@@ -3097,8 +3140,8 @@ class Matcher:
             candidate_dates = ordered_bank_dates[journal_sign]
             start = bisect.bisect_left(candidate_dates, date_min)
             end = bisect.bisect_right(candidate_dates, date_max)
-            amount_min = journal_total - performance_li
-            amount_max = journal_total + performance_li
+            amount_min = journal_total - search_window_li
+            amount_max = journal_total + search_window_li
             eligible_bank_indexes: Set[int] = set()
             for date_position in range(start, end):
                 bank_date = candidate_dates[date_position]
@@ -3360,11 +3403,9 @@ class Matcher:
                     )
 
     def match_tolerance(self) -> None:
-        """生成日期容差和明显微小金额差异候选。"""
+        """在独立搜索金额窗内生成日期容差和金额差异候选。"""
         self._reset_candidate_search_stage("tolerance")
-        trivial_li = PrecisionEngine.to_integer_li(
-            self.config.clearly_trivial_threshold
-        )
+        trivial_li = AMOUNT_CANDIDATE_WINDOW_LI
         buckets: Dict[Tuple[int, pd.Timestamp], Dict[str, Any]] = {}
         days_by_sign: Dict[int, Set[pd.Timestamp]] = {-1: set(), 0: set(), 1: set()}
         for row in self.journal[["amount_decimal", "date"]].itertuples():

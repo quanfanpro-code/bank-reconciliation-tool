@@ -1248,14 +1248,17 @@ from copy import copy as _copy
 from datetime import date as _date, datetime as _dt
 from decimal import Decimal as _Decimal
 
-_紧凑阅读表 = ("核对总览", "待处理事项", "月度核对", "每日统计", "对应明细")
+_紧凑阅读表 = ("核对总览", "待处理事项", "月度核对", "每日统计", "对应明细", "事项证据", "每日差异证据", "非工作日交易")
 _紧凑阅读色 = "BDD7EE"
 _紧凑留痕色 = "C6E0B4"
 _紧凑人工方式 = ("人工全查", "人工抽样")
 _紧凑列宽 = {"核对编号": 7, "处理要求": 9, "对应方式": 9, "核对动作": 45,
              "银行记录": 46, "序时账记录": 46, "人工核对结果": 19, "当前结果": 21,
              "备注": 20, "完整明细": 7, "核对依据": 26, "日期": 11, "月份": 10,
-             "需查看": 13, "余额说明": 21, "项目": 27, "结果": 43, "怎么看": 47}
+             "需查看": 49, "余额说明": 21, "项目": 27, "结果": 43, "怎么看": 64,
+             "程序归纳与具体问题": 48, "结论与待答问题": 48,
+             "业务内容": 55, "相关事项与核查说明": 55, "证据说明": 35,
+             "返回填写": 10, "查看完整事项": 13, "行别": 15}
 
 
 def _查找(簿: 簿计划, name, label, key, key_label="事项编号", default='""'):
@@ -1341,9 +1344,11 @@ def _写事项(簿: 簿计划):
     items = [{label: _读值(ix, row, col) for label, col in hs_ix.items()}
              for row in range(2, len(ix.表) + 1 + 1)]
     priority = {"人工全查": 0, "人工抽样": 1, "留存备查": 2, "自动确认": 3}
-    items.sort(key=lambda it: (priority.get(it["核对方式"], 2), int(it["核对编号"])))
+    items.sort(key=lambda it: (priority.get(it["核对方式"], 2),
+                               0 if it["风险等级"] == "范围未知" else 1,
+                               -abs(float(it.get("影响金额") or 0)), int(it["核对编号"])))
     numbers = {it["事项编号"]: it["核对编号"] for it in items}
-    待处理列 = ["核对编号", "处理要求", "核对动作", "银行记录", "序时账记录",
+    待处理列 = ["核对编号", "处理要求", "程序归纳与具体问题", "银行记录", "序时账记录",
                 "收入差额", "支出差额", "人工核对结果", "当前结果", "备注",
                 "完整明细", "事项编号"]
     对应列 = ["核对编号", "对应方式", "银行记录", "银行收入", "银行支出",
@@ -1352,6 +1357,9 @@ def _写事项(簿: 簿计划):
     pending_data, pending_extra = [], []
     matched_data, matched_extra = [], []
     pending_rows = {}
+    evidence_rows = {}
+    for r, identity in enumerate(簿.取表("事项证据").表["事项编号"], 2):
+        evidence_rows.setdefault(identity, r)
     for it in items:
         identity = it["事项编号"]
         bank = records[identity]["银行流水"]
@@ -1362,10 +1370,12 @@ def _写事项(簿: 簿计划):
         if mode in _紧凑人工方式:
             pending_data.append([
                 it["核对编号"],
-                {"人工全查": "逐项核对", "人工抽样": "抽中核对"}[mode],
-                _action(it, bank, journal, bi - ji, be - je),
-                _description(bank), _description(journal), bi - ji, be - je,
-                "", "", "", "查看", identity])
+                {"人工全查": "逐项核对", "人工抽样": "抽中核对"}[mode] + "\n" + it["风险等级"] + f"；影响{it['影响金额']:,.2f}元",
+                it["程序结论"] + "\n" + it.get("程序归纳", "") + "\n入选原因：" + str(it.get("入选原因") or "")
+                + "\n需要你回答：" + str(it.get("具体问题") or _action(it, bank, journal, bi-ji, be-je)),
+                it.get("双方银行说明") or _description(bank), it.get("双方账上说明") or _description(journal),
+                float(_Decimal(str(bi))- _Decimal(str(ji))), float(_Decimal(str(be))- _Decimal(str(je))),
+                "", "", "", "查看完整证据", identity])
             row = len(pending_data) + 1
             pending_rows[identity] = row
             pending_extra.append((it, row))
@@ -1373,7 +1383,7 @@ def _写事项(簿: 簿计划):
             matched_data.append([
                 it["核对编号"],
                 "逐笔对应" if len(bank) == len(journal) == 1 else "整组对应",
-                _description(bank), bi, be, _description(journal), ji, je,
+                it.get("双方银行说明") or _description(bank), bi, be, it.get("双方账上说明") or _description(journal), ji, je,
                 bi - ji, be - je, "", it.get("判断依据") or "", "查看", identity])
             matched_extra.append((it, len(bank) == len(journal) == 1,
                                   len(matched_data) + 1))
@@ -1388,8 +1398,6 @@ def _写事项(簿: 簿计划):
 
     for it, row in pending_extra:
         identity = it["事项编号"]
-        for col in (3, 4, 5):
-            _text计划(待处理, row, col, 待处理.表.iat[row - 2, col - 1], 100)
         待处理.盖格(row, 3, 格样式(批注=(
             "；".join(str(it.get(k) or "") for k in ("入选原因", "判断依据")),
             "原判断依据")))
@@ -1415,15 +1423,12 @@ def _写事项(簿: 簿计划):
                 _写值(人工tp, source_row, hs_m[label], f'=IF({value}="","",{value})')
         else:
             _写值(待处理, row, 8, "本次无需填写")
-        target_row = first_record.get(identity, 2)
-        link = (f"#'{target[0]}'!A{target[1]}" if target
-                else f"#'核对明细'!A{target_row}")
+        target_row = evidence_rows[identity]
+        link = f"#'事项证据'!A{target_row}"
         待处理.盖格(row, 11, 格样式(超链接=link))
 
     for it, single, row in matched_extra:
         identity = it["事项编号"]
-        for col in (3, 6, 12):
-            _text计划(对应, row, col, 对应.表.iat[row - 2, col - 1], 32)
         key = f"$N{row}"
         _写值(对应, row, 11,
               _short_result(_查找(簿, "复核事项索引", "当前核对结论", key)))
@@ -1431,7 +1436,7 @@ def _写事项(簿: 簿计划):
             _写值(对应, row, 1,
                   f'=HYPERLINK("#\'待处理事项\'!H"&(MATCH({key},'
                   f"'待处理事项'!$L$2:$L${end},0)+1),\"{it['核对编号']}\")")
-        detail_name = "逐笔核对" if single else "整组核对"
+        detail_name = "事项证据"
         dt = 簿.取表(detail_name)
         hs_d = _列定位(dt)
         dkey = _字母(hs_d["事项编号"])
@@ -1442,6 +1447,20 @@ def _写事项(簿: 簿计划):
 
     for name in _紧凑人工方式:
         簿.取表(name).验证 = []
+    evidence = 簿.取表("事项证据")
+    hs_e = _列定位(evidence)
+    for row in range(2, len(evidence.表)+2):
+        identity = _读值(evidence, row, hs_e["事项编号"])
+        if identity in pending_rows:
+            _写值(evidence, row, hs_e["返回填写"], "返回黄色填写格")
+            evidence.盖格(row, hs_e["返回填写"], 格样式(超链接=f"#'待处理事项'!H{pending_rows[identity]}"))
+    daily_evidence = 簿.取表("每日差异证据")
+    hs_de = _列定位(daily_evidence)
+    for row in range(2, len(daily_evidence.表)+2):
+        identity = _读值(daily_evidence, row, hs_de["事项编号"])
+        if identity in evidence_rows:
+            _写值(daily_evidence, row, hs_de["查看完整事项"], "查看本项完整证据")
+            daily_evidence.盖格(row, hs_de["查看完整事项"], 格样式(超链接=f"#'事项证据'!A{evidence_rows[identity]}"))
     for name in ("逐笔核对", "整组核对", "未对应记录"):
         tp = 簿.取表(name)
         hs = _列定位(tp)
@@ -1485,6 +1504,10 @@ def _期间标记(簿: 簿计划, name):
     diff_labels = [l for l in ("收入金额差额", "支出金额差额", "余额差额", "余额衔接差")
                    if l in hs]
     column = hs["需查看"]
+    daily_rows = {}
+    if daily:
+        for r, value in enumerate(簿.取表("每日差异证据").表["日期"], 2):
+            daily_rows.setdefault(str(value)[:10], r)
     for row in range(2, len(tp.表) + 2):
         period = _读值(tp, row, hs["日期" if daily else "月份"])
         if not daily and "合计" in str(period):
@@ -1492,6 +1515,29 @@ def _期间标记(簿: 簿计划, name):
         tests = [f"AND(ISNUMBER({_字母(hs[l])}{row}),{_字母(hs[l])}{row}<>0)"
                  for l in diff_labels]
         missing = [f"NOT(ISNUMBER({_字母(hs[l])}{row}))" for l in balance_labels]
+        if daily:
+            reasons = []
+            for label, title in (("收入金额差额", "收入差"), ("支出金额差额", "支出差"), ("余额差额", "余额差")):
+                value = _读值(tp, row, hs[label]) if label in hs else None
+                if isinstance(value, (int, float, _Decimal)) and abs(_Decimal(str(value))) >= _Decimal("0.0001"):
+                    reasons.append(f"{title}{value:,.2f}元")
+            flag = "有差额：" if reasons else ""
+            if str(period)[:10] in anomaly_days:
+                reasons.append("余额不连续，需核实漏行或余额取值")
+                flag = "余额不连续："
+            for label, title in (("收入笔数差额", "收款笔数差"), ("支出笔数差额", "付款笔数差")):
+                value = _读值(tp, row, hs[label]) if label in hs else None
+                if isinstance(value, (int, float, _Decimal)) and value:
+                    reasons.append(f"{title}{int(value)}笔，核实拆分/跨日")
+            if reasons:
+                flag = flag or "笔数不同："
+                target = daily_rows.get(str(period)[:10], 2)
+                caption = flag + "；".join(reasons) + "；点击看当日双方记录及相关事项"
+                _写值(tp, row, column, f'=HYPERLINK("#\'每日差异证据\'!A{target}","{caption}")')
+            elif any(not isinstance(_读值(tp, row, hs[label]), (int, float, _Decimal)) for label in balance_labels):
+                target = daily_rows.get(str(period)[:10], 2)
+                _写值(tp, row, column, f'=HYPERLINK("#\'每日差异证据\'!A{target}","余额未提供：未实施余额比较；点击看当日收支及事项证据")')
+            continue
         if (daily and str(period)[:10] in anomaly_days) or (
                 not daily
                 and str(period)[:7] in {day[:7] for day in anomaly_days}):
@@ -1522,6 +1568,8 @@ def _建总览(簿: 簿计划):
     结论 = 簿.取表("核对结论")
     hs_c = _列定位(结论)
     rows = [
+        ("实际执行重要性水平", "实际执行重要性水平", "单项或同月同来源同方向累计疑点超过此金额，列高风险全查；不用于证明交易匹配。"),
+        ("明显微小错报临界值", "明显微小错报临界值", "影响金额不超过此值列低风险备查；超过此值且不超过重要性列中风险，按高风险项数等距抽样；小额仍须有匹配证据。"),
         ("核对范围", "核对范围", "资料有缺口时，结果要结合原始说明查看。"),
         ("资料情况", "范围说明", ""),
         ("银行记录数", "银行有效交易笔数", "进入本次核对的银行交易笔数。"),
@@ -1531,13 +1579,13 @@ def _建总览(簿: 簿计划):
         ("还需人工核对", "待处理事项数", "待处理事项只列需要填写的项目；在黄色格选择结果。"),
         ("已完成人工核对", "已处理事项数", "已选有效结果的事项数，有差额的仍保留差额。"),
         ("人工选择有冲突", "人工选择冲突数", "同一原记录被重复采用时，需要重新选择。"),
-        ("尚未确认对应的记录", "当前未对应原始记录数", "包含已配对但待人工确认的记录；真正单边记录见未对应记录表。"),
+        ("当前尚未生效对应的记录", "当前未对应原始记录数", "包括已配对待确认及单边记录，不能解释为全部没找到对应；下方单列初始真正单边。"),
         ("期初余额差额", "期初余额差额", "银行余额减账上余额；未提供可用余额时不补零。"),
         ("余额核对情况", "余额核对", "每日和月度表保留收支、余额及差额。"),
     ]
     if 簿.取表("非工作日交易") is not None:
         rows.extend([
-            ("非工作日银行收付笔数", "非工作日银行收付笔数", "已对平的记录也保留提示；完整清单在绿色非工作日交易表。"),
+            ("非工作日银行收付笔数", "非工作日银行收付笔数", "已对平记录也保留日历提示；点击查看非工作日交易完整业务。"),
             ("非工作日银行收款笔数", "非工作日银行收款笔数", ""),
             ("非工作日银行收款金额", "非工作日银行收款金额", ""),
             ("非工作日银行付款笔数", "非工作日银行付款笔数", ""),
@@ -1546,6 +1594,11 @@ def _建总览(簿: 簿计划):
         ])
     out = []
     for title, label, explanation in rows:
+        if label in ("实际执行重要性水平", "明显微小错报临界值"):
+            value = next((_读值(结论, r, hs_c["数值"]) for r in range(2, len(结论.表)+2)
+                          if _读值(结论, r, hs_c["项目"]) == label), "未提供")
+            out.append([title, value, explanation])
+            continue
         value = _查找(簿, "核对结论", "数值", '"' + label + '"', "项目", '"未提供"')
         if label == "核对范围":
             for old, new in (("范围受限", "资料有缺口，部分结果需核实"),
@@ -1568,7 +1621,12 @@ def _建总览(簿: 簿计划):
     簿.表.append(tp)
     for i, (title, label, explanation) in enumerate(rows):
         row = i + 2
-        _text计划(tp, row, 3, tp.表.iat[row - 2, 2], 40)
+        if row not in (2, 3):
+            _text计划(tp, row, 3, tp.表.iat[row - 2, 2], 90)
+        else:
+            for col in (1, 2, 3):
+                tp.后覆盖[(row, col)] = 格样式(加粗=True, 填充色="FFF2CC", 填充类型="solid", 字号=11)
+            tp.盖格(row, 2, 格样式(数字格式='#,##0.00" 元"'))
         if "比例" in title:
             tp.盖格(row, 2, 格样式(数字格式="0.00%"))
         elif "差额" in title or "金额" in title:
@@ -1579,7 +1637,7 @@ def _建总览(簿: 簿计划):
         rng = f"'{name}'!${column}$2:${column}${max(2, len(t.表) + 1)}"
         row = len(tp.表) + 2
         tp.表.loc[len(tp.表)] = [title,
-                                 f'=COUNTIF({rng},"有差额")+COUNTIF({rng},"余额不连续")',
+                                 f'=COUNTIF({rng},"有差额*")+COUNTIF({rng},"余额不连续*")',
                                  "打开" + name + "，筛选“需查看”列。"]
         tp.盖格(row, 3, 格样式(超链接=f"#'{name}'!A1"))
     search = _查找(簿, "核对结论", "数值", '"组合搜索完整性"', "项目")
@@ -1587,10 +1645,30 @@ def _建总览(簿: 簿计划):
         "对应查找情况",
         f'=IF({search}="范围受限","部分查找未完成",'
         f'IF({search}="存在多解","有多种可能对应","已在程序设定的范围内查找"))',
-        "未找到不等于没有对应，详细检查范围见绿色运行参数表。"]
+        "未找到不等于没有对应；搜索限制及原始参数保留在隐藏追溯表。"]
+    parameters = 簿.取表("运行参数")
+    if parameters is not None:
+        values = dict(zip(parameters.表["参数名称"], parameters.表["参数值"]))
+        truncated = values.get("组合候选发生截断的来源笔数", 0)
+        depth_limited = values.get("组合搜索深度受限来源笔数", 0)
+        fallback = values.get("确定性降级组数", 0)
+        tp.表.loc[len(tp.表)] = ["查找限制及影响",
+            f"组合候选截断来源{truncated}笔，深度受限{depth_limited}笔；{fallback}个竞争组采用确定性降级选择",
+            "上述计数会重叠，不能相加当作异常笔数；候选和深度均有上限，未穷尽所有组合，剩余事项不能理解为已证明不存在对应。"]
+    ix = 簿.取表("复核事项索引").表
+    single_count = len(簿.取表("未对应记录").表)
+    tp.表.loc[len(tp.表)] = ["初始真正单边记录数", single_count,
+                              "本次程序初始只在一侧有记录的笔数；双方业务内容直接在事项证据中列示。"]
+    paired_pending = set(ix.loc[ix["核对方式"].isin(_紧凑人工方式) & ix["匹配ID"].fillna("").ne(""), "事项编号"])
+    paired_count = int(簿.取表("核对明细").表["事项编号"].isin(paired_pending).sum())
+    tp.表.loc[len(tp.表)] = ["初始已配对待人工核对记录数", paired_count,
+                              "这些记录已有候选对应，待决定是否采用；与真正单边分别展示。"]
+    modes = ix["核对方式"].value_counts()
+    for title, mode in (("全查事项数", "人工全查"), ("中风险抽中事项数", "人工抽样"), ("留存备查事项数", "留存备查"), ("程序已确认事项数", "自动确认")):
+        tp.表.loc[len(tp.表)] = [title, int(modes.get(mode, 0)), "按本次标准分流；备查及程序已确认均不计入待办。"]
     tp.表.loc[len(tp.表)] = [
         "使用方法", "先看总览和每日、月度差额，再处理黄色格。",
-        "浅蓝色表用于阅读；浅绿色表保留完整记录和计算依据。"]
+        "待处理事项一项一处填写；事项证据可一次点击直达全部组成；绿色追溯表默认隐藏。"]
 
 
 def _做变换(reading):
@@ -1624,7 +1702,7 @@ def _紧凑样式(tp: 表计划, *, reading):
     """翻译 紧凑报告.format_compact_sheet。"""
     hs = _列定位(tp)
     df = tp.表
-    hidden = {"事项编号"} if tp.名称 in ("待处理事项", "对应明细") else set()
+    hidden = {"事项编号"} if tp.名称 in ("待处理事项", "对应明细", "事项证据", "每日差异证据") else set()
     if reading and tp.名称 in ("每日统计", "月度核对"):
         hidden.update(l for l in hs
                       if "笔数" in l or "变动净额" in l
@@ -1643,12 +1721,13 @@ def _紧凑样式(tp: 表计划, *, reading):
             label, 14 if amount
             else 28 if any(k in label for k in ("摘要", "原因", "说明", "依据", "记录"))
             else 16)
+        if label == "需查看" and tp.名称 == "月度核对":
+            cp.宽 = 13
     last = max(hs.values(), default=1)
     for j in range(last - tp.前置空列, len(tp.列)):
         tp.列[j].隐藏 = True
     tp.tab色 = _紧凑阅读色 if reading else _紧凑留痕色
-    # 阅读表与留痕表全部可见，仅技术表（运行参数等）保持隐藏
-    tp.状态 = "hidden" if tp.名称 in _技术表 else "visible"
+    tp.状态 = "visible" if reading else "hidden"
     tp.网格线 = False
     tp.缩放 = 100
     tp.左上角 = f"{_字母(first)}1"
@@ -1702,12 +1781,17 @@ def _紧凑样式(tp: 表计划, *, reading):
                     if isinstance(v, float) and _math.isnan(v):
                         continue
                     if isinstance(v, str) and v.startswith("="):
+                        if tp.名称 == "每日统计" and label == "需查看" and "HYPERLINK" in v:
+                            height = max(height, 51)
                         continue
                     cp = tp.列计划取(hs[label] - tp.前置空列 - 1)
                     width = cp.宽 or 0
-                    tw = sum(1.5 if _uni.east_asian_width(ch) in ("W", "F") else 0.75
-                             for ch in str(v))
-                    height = max(height, _math.ceil(tw / max(1, width - 1)) * 12 + 3)
+                    if tp.名称 in ("待处理事项", "对应明细", "事项证据", "每日差异证据"):
+                        lines = sum(max(1, _math.ceil(sum(1.5 if _uni.east_asian_width(ch) in ("W", "F") else 0.75 for ch in line) / max(1, width-1))) for line in str(v).split("\n"))
+                        height = max(height, min(409, lines*12+3))
+                    else:
+                        tw = sum(1.5 if _uni.east_asian_width(ch) in ("W", "F") else 0.75 for ch in str(v))
+                        height = max(height, _math.ceil(tw / max(1, width - 1)) * 12 + 3)
             rp = tp.行计划取(ri + 2)
             rp.高 = height
             if not reading:
@@ -1757,7 +1841,7 @@ def 应用紧凑层(簿: 簿计划):
         if len(t.表) > 0:
             t.条件格式.append((
                 f"{column}2:{column}{len(t.表) + 1}",
-                条件规则(公式=[f'OR({column}2="有差额",{column}2="余额不连续")'],
+                条件规则(公式=[f'OR(LEFT({column}2,3)="有差额",LEFT({column}2,6)="余额不连续")'],
                          填充色="FFF2CC", 字色="9C0006")))
     order = [簿.取表(n) for n in _紧凑阅读表]
     簿.表 = order + [t for t in 簿.表 if all(t is not o for o in order)]
