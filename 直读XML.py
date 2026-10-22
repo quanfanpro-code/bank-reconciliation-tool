@@ -23,6 +23,39 @@ _REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _PKGREL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
 _HEADER_RE = re.compile(r"^([A-Z]+)([0-9]+)$")
+_公式片段 = re.compile(
+    r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[[^\]]*\]|'
+    r'(?<![\w.])(?:\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}|\$?[1-9]\d*:\$?[1-9]\d*|'
+    r'\$?[A-Za-z]{1,3}\$?[1-9]\d*)(?![\w.(!])')
+
+
+def _平移共享公式(公式, 起点, 终点):
+    """按 A1 引用规则展开 Excel 保存的共享公式，保留引号、表名和绝对引用。"""
+    起行, 起列 = 拆坐标(起点)
+    终行, 终列 = 拆坐标(终点)
+    def 平移地址(地址):
+        m = re.fullmatch(r'(\$?)([A-Za-z]+)?(\$?)(\d+)?', 地址)
+        列锁, 列文, 行锁, 行文 = m.groups()
+        if 列文:
+            列 = 字母转列(列文)
+            if 列 > 16384:
+                return 地址
+            列 += 0 if 列锁 else 终列 - 起列
+            if not 1 <= 列 <= 16384:
+                return '#REF!'
+            列文 = 列转字母(列)
+        if 行文:
+            行 = int(行文) + (0 if (行锁 or (not 列文 and 列锁)) else 终行 - 起行)
+            if not 1 <= 行 <= 1048576:
+                return '#REF!'
+            行文 = str(行)
+        return 列锁 + (列文 or '') + 行锁 + (行文 or '')
+    def 替换(m):
+        文 = m.group()
+        if 文[0] in ('"', "'", '['):
+            return 文
+        return ':'.join(平移地址(x) for x in 文.split(':'))
+    return _公式片段.sub(替换, 公式)
 
 # openpyxl 认定的内置日期格式编号
 _内置日期格式 = frozenset(range(14, 23)) | frozenset(range(27, 37)) | frozenset(range(45, 48)) | frozenset(range(50, 59))
@@ -335,6 +368,7 @@ class 簿读:
         t = 表读("", "visible")
         流 = z.open(目标)
         状 = None
+        共享定义, 共享引用 = {}, []
         for 事件, 元 in ET.iterparse(流, events=("start", "end")):
             tag = 元.tag
             if 事件 == "start":
@@ -406,9 +440,15 @@ class 簿读:
                     t.打印["setup"] = dict(元.attrib)
                 elif tag == _NS + "hyperlink":
                     ref = 元.get("ref")
-                    目标2 = 元.get("location") or 元.get(_REL + "id") or ""
+                    位置 = 元.get('location')
+                    目标2 = ('#' + 位置) if 位置 is not None else (元.get(_REL + "id") or "")
                     try:
-                        t.超链接[拆坐标(ref)] = 目标2
+                        首, _, 尾 = ref.partition(':')
+                        首行, 首列 = 拆坐标(首)
+                        尾行, 尾列 = 拆坐标(尾 or 首)
+                        for 行 in range(首行, 尾行 + 1):
+                            for 列 in range(首列, 尾列 + 1):
+                                t.超链接[(行, 列)] = 目标2
                     except ValueError:
                         pass
             else:
@@ -425,6 +465,11 @@ class 簿读:
                         f = 元.find(_NS + "f")
                         if f is not None:
                             t.公式[行列] = f.text or ""
+                            if f.get('t') == 'shared':
+                                if f.text:
+                                    共享定义[f.get('si')] = (ref, f.text)
+                                else:
+                                    共享引用.append((行列, ref, f.get('si')))
                         if 元.get("s"):
                             t.格样式索引[行列] = int(元.get("s"))
                         t.最大行 = max(t.最大行, 行列[0])
@@ -446,6 +491,14 @@ class 簿读:
                 elif tag == _NS + "sheetPr":
                     状 = None
         流.close()
+        for 行列, ref, si in 共享引用:
+            if si not in 共享定义:
+                raise ValueError(f'{目标}!{ref} 缺少共享公式定义 {si}')
+            起点, 公式 = 共享定义[si]
+            展开 = _平移共享公式(公式, 起点, ref)
+            t.公式[行列] = 展开
+            if not self.数据模式:
+                t.格[行列] = '=' + 展开
         return t
 
     def _读表附属(self, z, 目标, t: 表读):

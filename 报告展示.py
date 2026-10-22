@@ -92,10 +92,19 @@ def build_display_tables(tables):
             manual_rows[mode].append(main)
             if grouped:
                 manual_rows[mode].extend(_组成(item, records))
-            # 其他候选只是供选择的说明，不把候选金额重复计入原始组成列。
+            # 一套候选只列一行摘要，完整组成集中保留在其他对应供选择。
+            候选组 = defaultdict(list)
             for other in alternatives[item['事项编号']]:
-                side = '银行' if other['来源'] == '银行流水' else '序时账'
-                manual_rows[mode].append({'核对编号': item['核对编号'], '事项编号': item['事项编号'], '行别': other['可选结果'].replace('采用', ''), side + '记录': str(other['摘要及对方']) + f"\n金额 {other['金额']:,.2f}", '核对原因': other['关系说明'], '原始出处': other['原始出处']})
+                候选组[other['可选结果']].append(other)
+            for label, group in 候选组.items():
+                行 = {'核对编号': item['核对编号'], '事项编号': item['事项编号'],
+                     '行别': label.replace('采用', ''), '核对原因': group[0]['关系说明'],
+                     '原始出处': '完整组成集中见其他对应供选择；候选不是新增交易'}
+                for side, source in (('银行', '银行流水'), ('序时账', '序时账')):
+                    组成 = [r for r in group if r['来源'] == source]
+                    收, 支 = _收支(组成)
+                    行[side+'记录'] = f'{len(组成)}笔；收入 {收:,.2f}；支出 {支:,.2f}'
+                manual_rows[mode].append(行)
     tables['逐笔核对'] = pd.DataFrame(pair_rows, columns=['核对编号', '银行日期', '银行记录', '银行金额', '序时账日期', '序时账记录', '序时账金额', '差额', '当前核对结论', '核对依据', '核对方式', '银行原始出处', '序时账原始出处', '事项编号', '银行记录号', '序时账记录号'])
     tables['整组核对'] = pd.DataFrame(group_rows, columns=[x for x in 组展示列 if x not in ('人工核对结果', '备注', '填报编号', '银行金额', '序时账金额', '差额')])
     tables['未对应记录'] = pd.DataFrame(single_rows, columns=['核对编号', '来源', '日期', '摘要', '对方及凭证', '金额', '当前核对结果', '核对方式', '原始出处', '事项编号', '原始记录号'])

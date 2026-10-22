@@ -111,31 +111,21 @@ def 整理业务证据(tables):
         bank, journal = records[identity]["银行流水"], records[identity]["序时账"]
         summary, question = 归纳事项(item, bank, journal)
         explanations[identity] = (summary, question, 组成说明(bank), 组成说明(journal))
+        方案数 = len({r['可选结果'] for r in alternatives[identity]})
         evidence.append({"核对编号": item["核对编号"], "事项编号": identity, "行别": "事项结论与合计",
                          "结论与待答问题": item["程序结论"] + "；" + item["核对方式"] + "\n" + summary + "\n" + question,
                          "银行记录": 组成说明(bank), "序时账记录": 组成说明(journal),
-                         "证据说明": item["判断依据"]})
+                         "证据说明": item["判断依据"],
+                         "其他方案": f'{方案数}套候选方案，点击集中查看（不是新增交易）' if 方案数 else ''})
         for side, group in (("银行", bank), ("序时账", journal)):
             for r in group:
                 amount = Decimal(str(r["金额"]))
                 evidence.append({"核对编号": item["核对编号"], "事项编号": identity, "行别": side + "组成",
                                  side + "记录": 记录内容(r), side + "收入": float(max(amount, Decimal(0))),
                                  side + "支出": float(max(-amount, Decimal(0))), "证据说明": r["原始出处"]})
-        groups = defaultdict(list)
-        for r in alternatives[identity]:
-            groups[r["可选结果"]].append(r)
-        for label, group in groups.items():
-            totals = {source: 收支([r for r in group if r["来源"] == source]) for source in ("银行流水", "序时账")}
-            evidence.append({"核对编号": item["核对编号"], "事项编号": identity, "行别": label + "合计",
-                             "结论与待答问题": f"此方案仅供选择，未计入已确认：银行收入{totals['银行流水'][0]:,.2f}、支出{totals['银行流水'][1]:,.2f}；账上收入{totals['序时账'][0]:,.2f}、支出{totals['序时账'][1]:,.2f}"})
-            for r in group:
-                side = "银行" if r["来源"] == "银行流水" else "序时账"
-                evidence.append({"核对编号": item["核对编号"], "事项编号": identity, "行别": label + "组成",
-                                 side + "记录": str(r["摘要及对方"]) + f"；金额{r['金额']:,.2f}元",
-                                 "证据说明": r["关系说明"]})
     for pos, name in enumerate(("程序归纳", "具体问题", "双方银行说明", "双方账上说明")):
         items[name] = items["事项编号"].map(lambda identity: explanations[identity][pos])
-    tables["事项证据"] = pd.DataFrame(evidence, columns=["核对编号", "行别", "结论与待答问题", "银行记录", "银行收入", "银行支出", "序时账记录", "序时账收入", "序时账支出", "证据说明", "返回填写", "事项编号"])
+    tables["事项证据"] = pd.DataFrame(evidence, columns=["核对编号", "行别", "结论与待答问题", "银行记录", "银行收入", "银行支出", "序时账记录", "序时账收入", "序时账支出", "证据说明", "返回填写", "事项编号", "其他方案"])
 
     daily_records = defaultdict(list)
     for sides in records.values():

@@ -6,10 +6,11 @@ sharedStrings，公式格 <f> 不带缓存值、calcPr fullCalcOnLoad 打开时�
 结构规范照 minimax-xlsx 技能的 minimal_xlsx 模板（D:/BaiduSyncdisk/workbuddy skills）。
 """
 import math
+import re
 import zipfile
 from datetime import datetime as _dt, date as _date
 from decimal import Decimal as _Decimal
-from xml.sax.saxutils import escape as _xesc, quoteattr as _qattr
+from xml.sax.saxutils import escape as _xml_escape, quoteattr as _qattr
 
 from 排版计划 import 合并样式, 簿计划
 
@@ -17,6 +18,30 @@ _HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
 _NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
 
 _列字母 = {}
+_超链接上限 = 65530
+_非法XML字符 = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]')
+
+
+def _xesc(文本):
+    """属性与文本统一转义，避免名称、验证提示或链接中的引号破坏 XML。"""
+    return _xml_escape(文本, {'"': '&quot;', "'": '&apos;'})
+
+
+def _合并超链接(超链集):
+    """同列连续且同目标的格共用一个链接对象，每个原单元格仍可点击。"""
+    区间, 最近列 = [], {}
+    for ref, 目标 in 超链集:
+        列, 行文 = re.fullmatch(r'([A-Z]+)(\d+)', ref).groups()
+        行 = int(行文)
+        上个 = 最近列.get(列)
+        if 上个 is not None and 上个[2] + 1 == 行 and 上个[3] == 目标:
+            上个[2] = 行
+        else:
+            上个 = [列, 行, 行, 目标]
+            区间.append(上个)
+            最近列[列] = 上个
+    return [(f'{列}{首}' + (f':{列}{尾}' if 首 != 尾 else ''), 目标)
+            for 列, 首, 尾, 目标 in 区间]
 
 
 def _字母(col):
@@ -64,6 +89,7 @@ class _样式表:
         self.fill(None, None)
         self._fill[("gray125", None)] = 1
         self._fill列表.append('<fill><patternFill patternType="gray125"/></fill>')
+        self.xf(None)              # 0 号必须始终为默认样式，不能由首个表头占用
 
     # ---- 数字格式 ----
     def numfmt(self, 代码):
@@ -316,6 +342,12 @@ class _表写出:
 
     def 格(self, 行号, 列号, s, v, 强制空=False, 省样式=False, 直接索引=None):
         ref = f"{_字母(列号)}{行号}"
+        if isinstance(v, str):
+            if _非法XML字符.search(v):
+                raise ValueError(f'{self.tp.名称}!{ref} 含 XML 不允许的字符，未写出报告')
+            上限 = 8192 + 1 if v.startswith('=') else 32767
+            if len(v) > 上限:
+                raise ValueError(f'{self.tp.名称}!{ref} 内容超过 Excel 长度上限，未写出报告')
         if 省样式:
             属 = f' r="{ref}"'
         elif 直接索引 is not None:
@@ -496,7 +528,9 @@ class _表写出:
                 cov = 覆盖.get((行号, 列号))
                 s2 = 后覆盖.get((行号, 列号)) if 后覆盖 else None
                 列名 = str(df.columns[j]) if j < len(df.columns) else ""
-                if rs is None and cov is None and s2 is None:
+                列样 = tp.列[j].基础样式 if j < len(tp.列) else None
+                有附属 = 列样 is not None and (列样.超链接 or 列样.批注)
+                if rs is None and cov is None and s2 is None and not 有附属:
                     if 大表:
                         # 普通格不写 s 属性：样式由 <col style> 兜底（快速通道的关键）
                         t = self.格(行号, 列号, None, v, 省样式=True)
@@ -588,12 +622,16 @@ class _表写出:
                 片.append(f"<dataValidation{属}>{f1}</dataValidation>")
             片.append("</dataValidations>")
 
-        # ---- hyperlinks：按 openpyxl 旧路径方式走 rels（金样/测试按 target 读回） ----
-        超链 = getattr(self, "超链集", None)
+        # ---- hyperlinks：簿内跳转用 location，外部链接才建立关系 ----
+        超链 = _合并超链接(getattr(self, "超链集", []))
+        self.超链集 = 超链
+        if len(超链) > _超链接上限:
+            raise ValueError(f'{tp.名称} 超链接数量 {len(超链):,} 超过 Excel 上限 {_超链接上限:,}，未写出报告')
         if 超链:
             片.append("<hyperlinks>")
             for k, (ref, 目标) in enumerate(超链):
-                片.append(f'<hyperlink ref="{ref}" r:id="rIdH{k + 1}"/>')
+                指向 = f'location="{_xesc(目标[1:])}"' if 目标.startswith('#') else f'r:id="rIdH{k + 1}"'
+                片.append(f'<hyperlink ref="{ref}" {指向}/>')
             片.append("</hyperlinks>")
 
         # ---- 打印 ----
@@ -697,7 +735,7 @@ def 写簿(计划: 簿计划, 输出路径: str) -> None:
     定义名 = []
     for 序, tp in enumerate(计划.表):
         p = tp.打印 or {}
-        名 = _xesc(tp.名称)
+        名 = _xesc(tp.名称.replace("'", "''"))
         if p.get("title_rows"):
             定义名.append(f'<definedName name="_xlnm.Print_Titles" localSheetId="{序}">'
                          f"'{名}'!{p['title_rows'].split(':')[0].join(('$', ''))}"
@@ -781,6 +819,8 @@ def 写簿(计划: 簿计划, 输出路径: str) -> None:
                 条.append('<Relationship Id="rIdLegacy" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" '
                           f'Target="../drawings/vmlDrawing{k}.vml"/>')
             for k, (_, 目标) in enumerate(超链集):
+                if 目标.startswith('#'):
+                    continue
                 条.append(f'<Relationship Id="rIdH{k + 1}" '
                           'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
                           f'Target="{_xesc(目标)}" TargetMode="External"/>')

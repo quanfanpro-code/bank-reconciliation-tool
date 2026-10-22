@@ -19,7 +19,8 @@ def test_业务阅读表可见且绿色计算留痕默认隐藏(tmp_path):
         assert all(sheet.sheet_state == ('visible' if sheet.title in 阅读表 else 'hidden')
                    for sheet in book)
         for sheet in book:
-            assert sheet.sheet_properties.tabColor.rgb == '00' + (阅读颜色 if sheet.title in 阅读表 else 留痕颜色)
+            # Excel 保存后会规范化颜色 alpha；实际颜色比较末六位。
+            assert sheet.sheet_properties.tabColor.rgb[-6:] == (阅读颜色 if sheet.title in 阅读表 else 留痕颜色)
             assert sheet.freeze_panes in (None, 'A2')
             for row in sheet:
                 for cell in row:

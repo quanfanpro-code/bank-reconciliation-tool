@@ -1449,8 +1449,13 @@ def _写事项(簿: 簿计划):
         簿.取表(name).验证 = []
     evidence = 簿.取表("事项证据")
     hs_e = _列定位(evidence)
+    方案首行 = {}
+    for row, identity in enumerate(簿.取表('其他对应供选择').表['事项编号'], 2):
+        方案首行.setdefault(identity, row)
     for row in range(2, len(evidence.表)+2):
         identity = _读值(evidence, row, hs_e["事项编号"])
+        if '其他方案' in hs_e and _读值(evidence, row, hs_e['其他方案']) and identity in 方案首行:
+            evidence.盖格(row, hs_e['其他方案'], 格样式(超链接=f"#'其他对应供选择'!A{方案首行[identity]}"))
         if identity in pending_rows:
             _写值(evidence, row, hs_e["返回填写"], "返回黄色填写格")
             evidence.盖格(row, hs_e["返回填写"], 格样式(超链接=f"#'待处理事项'!H{pending_rows[identity]}"))

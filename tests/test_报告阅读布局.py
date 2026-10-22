@@ -7,7 +7,7 @@ from tests._excel假面 import get_column_letter
 from tests.test_人工结果计算 import _报告
 
 
-可见表 = {'核对结论','非工作日交易','月度核对','逐笔核对','整组核对','人工全查','人工抽样','未对应记录'}
+可见表 = {'核对总览','待处理事项','月度核对','每日统计','对应明细','事项证据','每日差异证据','非工作日交易'}
 原始金额列 = ('银行收入','银行支出','序时账收入','序时账支出')
 
 
@@ -23,10 +23,12 @@ def _行(sheet):
 
 
 def _隐藏身份(sheet):
+    # 旧阅读表现作为整张隐藏的计算留痕表，身份列须完整保留。
+    assert sheet.sheet_state == 'hidden'
     headers=_头(sheet)
     for key in ('事项编号','原始记录号'):
         if key in headers:
-            assert sheet.column_dimensions[get_column_letter(headers[key])].hidden
+            assert any(sheet.cell(r, headers[key]).value for r in range(2, sheet.max_row+1))
 
 
 def test_八个固定阅读入口及一对一并排单边完整(tmp_path):
@@ -49,7 +51,7 @@ def test_八个固定阅读入口及一对一并排单边完整(tmp_path):
         _隐藏身份(unmatched)
 
 
-def test_两对三先汇总后分块组成可折叠且不重复加总(tmp_path):
+def test_两对三先汇总后分块组成默认展开且不重复加总(tmp_path):
     path=_报告(tmp_path,[150,450],[100,200,300],[((0,1),(0,1,2))])
     with closing(load_workbook(path)) as book:
         sheet=book['整组核对']
@@ -65,7 +67,7 @@ def test_两对三先汇总后分块组成可折叠且不重复加总(tmp_path):
         assert '复核事项索引' in main['当前核对结论']
         for number,row in rows[1:]:
             assert sheet.row_dimensions[number].outlineLevel==1
-            assert sheet.row_dimensions[number].hidden
+            assert not sheet.row_dimensions[number].hidden
             assert row['事项编号']=='M1' and row['原始记录号']
             assert sheet.cell(number,header['当前记录结果']).data_type=='f'
             assert '核对明细' in row['当前记录结果']
@@ -95,7 +97,12 @@ def test_人工组只在主行填一次且原组成展开替代金额不混加(t
         assert len(mains)==1 and mains[0][1]['填报编号']=='M1'
         assert all(not row.get('填报编号') for _,row in rows if row['行别']!='核对事项')
         inputs=[number for number,_ in rows if any(sheet.cell(number,header['人工核对结果']).coordinate in validation.sqref for validation in sheet.data_validations.dataValidation)]
-        assert inputs==[mains[0][0]]
+        assert inputs==[]
+        待办=book['待处理事项']
+        待办头=_头(待办)
+        本项=[number for number,row in _行(待办) if row['事项编号']=='M1']
+        assert len(本项)==1
+        assert any(待办.cell(本项[0],待办头['人工核对结果']).coordinate in validation.sqref for validation in 待办.data_validations.dataValidation)
         original=[(number,row) for number,row in rows if row['行别'] in ('银行组成','序时账组成')]
         assert len(original)==5
         assert all(not sheet.row_dimensions[number].hidden for number,_ in original)
@@ -124,7 +131,7 @@ def test_月度发生额和缺失余额同表可见且余额不补零(tmp_path):
                 assert not isinstance(total['序时账-月末余额'],(int,float))
 
 
-def test_折叠组主行可直接阅读双方日期范围和业务摘要(tmp_path,monkeypatch):
+def test_展开组主行可直接阅读双方日期范围和业务摘要(tmp_path,monkeypatch):
     import pandas as pd
     import tests.test_人工结果计算 as calculation
     original_df=calculation._df
@@ -138,7 +145,7 @@ def test_折叠组主行可直接阅读双方日期范围和业务摘要(tmp_pat
     with closing(load_workbook(path)) as book:
         rows=_行(book['整组核对'])
         main=rows[0][1]
-        assert all(book['整组核对'].row_dimensions[number].hidden for number,_ in rows[1:])
+        assert all(not book['整组核对'].row_dimensions[number].hidden for number,_ in rows[1:])
         for column,first,last in [('银行记录','2026-01-05','2026-01-06'),('序时账记录','2026-01-07','2026-01-09')]:
             text=str(main[column])
             assert first in text and last in text and '设备款' in text
@@ -206,12 +213,13 @@ def test_新阅读表原始危险文本继续作为文本转义(tmp_path,monkeyp
 def test_人工表排序后Excel计算跳转目标仍指向本事项填写格(excel,tmp_path):
     path=_报告(tmp_path,[100,200],[100,200],[((0,),(0,)),((1,),(1,))])
     with _打开(excel,path) as book:
-        manual=book.Worksheets('人工全查')
+        manual=book.Worksheets('待处理事项')
         headers=list(manual.UsedRange.Value[0])
-        before=[row['事项编号'] for row in _表(book,'人工全查')]
-        manual.UsedRange.Sort(Key1=manual.Cells(2,headers.index('事项编号')+1),Order1=2,Header=1)
-        after=[row['事项编号'] for row in _表(book,'人工全查')]
-        assert before!=after and after==sorted(before,reverse=True)
+        before=[row['事项编号'] for row in _表(book,'待处理事项')]
+        数据区域=manual.Range(manual.Cells(2,1),manual.Cells(manual.UsedRange.Rows.Count,len(headers)))
+        数据区域.Sort(manual.Cells(2,headers.index('事项编号')+1),1)
+        after=[row['事项编号'] for row in _表(book,'待处理事项')]
+        assert before!=after and after==sorted(before)
         excel.CalculateFullRebuild()
         pairs=book.Worksheets('逐笔核对')
         pair_headers=list(pairs.UsedRange.Value[0])
@@ -227,8 +235,8 @@ def test_人工表排序后Excel计算跳转目标仍指向本事项填写格(ex
             excel.Goto(Reference=book.Worksheets(sheet_name).Range(address))
         else:
             cell.Hyperlinks(1).Follow(NewWindow=False,AddHistory=False)
-        assert excel.ActiveSheet.Name=='人工全查'
-        assert manual.Cells(excel.ActiveCell.Row,headers.index('填报编号')+1).Value=='M1'
+        assert excel.ActiveSheet.Name=='待处理事项'
+        assert manual.Cells(excel.ActiveCell.Row,headers.index('事项编号')+1).Value=='M1'
         assert excel.ActiveCell.Column==headers.index('人工核对结果')+1
 
 def test_空数据真实报告月度只有表头且不造零余额或年度合计(tmp_path):

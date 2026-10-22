@@ -2154,6 +2154,8 @@ class Reporter:
         """完整报告成功且未取消时才交付，失败不留下正式半成品。"""
         with atomic_output_path(output_path) as temporary:
             self._generate_report(str(temporary), config, bank_path, journal_path, date_format)
+            from Excel验证 import 验证Excel报告
+            验证Excel报告(temporary, logger=self._log, cancel_check=cancel_check)
             if cancel_check:
                 cancel_check()
 
