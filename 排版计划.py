@@ -124,7 +124,7 @@ def 新建簿计划(tables: dict) -> 簿计划:
     """把 {表名: DataFrame} 初始化为裸簿计划（默认样式，未排版）。"""
     计划 = 簿计划()
     for 名称, df in tables.items():
-        计划.表.append(表计划(名称=名称, 表=df))
+        计划.表.append(表计划(名称=名称, 表=df.copy(deep=True)))
     return 计划
 
 
@@ -1311,6 +1311,14 @@ def _含坐标(sqref, coord):
     return False
 
 
+def _人工填写原值(值):
+    """旧报告的回显公式不是人工输入；真实选择和备注原样保留。"""
+    文 = 值.lstrip("' \t\r\n") if isinstance(值, str) else ''
+    if 文.startswith('=IF(') and 'INDEX(' in 文 and '待处理事项' in 文:
+        return None
+    return 值
+
+
 def _写事项(簿: 簿计划):
     """翻译 紧凑报告._write_items：建待处理事项/对应明细，回收人工表入口。"""
     from 排版共享 import (记录金额 as _amounts, 记录描述 as _description,
@@ -1407,8 +1415,8 @@ def _写事项(簿: 簿计划):
         target = manual.get(identity)
         if target:
             name, source_row, hs_m, original = target
-            _写值(待处理, row, 8, original.get("人工核对结果") or None)
-            _写值(待处理, row, 10, original.get("备注") or None)
+            _写值(待处理, row, 8, _人工填写原值(original.get("人工核对结果")) or None)
+            _写值(待处理, row, 10, _人工填写原值(original.get("备注")) or None)
             人工tp = 簿.取表(name)
             old_coord = f"{_字母(hs_m['人工核对结果'])}{source_row}"
             for v in 人工tp.验证:

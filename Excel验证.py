@@ -8,7 +8,45 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
+def 检查人工填写区(路径):
+    """程序公式不得混入选择格；重算后也不能把无效选择当作正常报告交付。"""
+    from 直读XML import _表目标, _读共享串
+    ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+    with zipfile.ZipFile(路径) as 包:
+        目标 = next((部件 for 名, 部件, _ in _表目标(包) if 名 == '待处理事项'), None)
+        if 目标 is None:
+            return 0
+        串 = _读共享串(包)
+        def 值(c):
+            v = c.findtext(ns+'v')
+            if c.get('t') == 's' and v is not None:
+                return 串[int(v)]
+            if c.get('t') == 'inlineStr':
+                return ''.join(t.text or '' for t in c.iter(ns+'t'))
+            return v or ''
+        数据 = ET.fromstring(包.read(目标)).find(ns+'sheetData')
+        if 数据 is None or not len(数据):
+            return 0
+        列名 = {''.join(x for x in c.get('r') if x.isalpha()): 值(c) for c in 数据[0]}
+        if '人工核对结果' not in 列名.values():
+            raise RuntimeError('填写区缺少人工核对结果列，未交付报告')
+        行数 = 0
+        for row in list(数据)[1:]:
+            行数 += 1
+            for c in row:
+                字段 = 列名.get(''.join(x for x in c.get('r') if x.isalpha()))
+                文 = str(值(c)).lstrip("' \t\r\n")
+                if 字段 == '人工核对结果' and (c.find(ns+'f') is not None or 文.startswith('=')):
+                    raise RuntimeError(f'填写区 待处理事项!{c.get("r")} 包含公式或公式文本，未交付报告')
+                if 字段 == '备注' and 文.startswith('=IF(') and 'INDEX(' in 文 and '待处理事项' in 文:
+                    raise RuntimeError(f'填写区 待处理事项!{c.get("r")} 包含程序回显公式，未交付报告')
+                if 字段 == '当前结果' and '选择无效' in 文:
+                    raise RuntimeError(f'填写区 待处理事项!{c.get("r")} 存在无效选择，未交付报告')
+        return 行数
+
+
 def 验证Excel报告(路径, *, logger=None, cancel_check=None):
+    检查人工填写区(路径)
     try:
         import pythoncom
         import win32com.client
@@ -93,6 +131,7 @@ def 验证Excel报告(路径, *, logger=None, cancel_check=None):
                     elif 元.tag == ns+'row':
                         元.clear()
     结果['公式数'] = 公式数
+    结果['人工填写行数'] = 检查人工填写区(路径)
     if logger:
         logger(f'Excel实际打开和重算验证通过：{结果["工作表数"]} 张表，{公式数:,} 个公式，无公式错误')
     return 结果
