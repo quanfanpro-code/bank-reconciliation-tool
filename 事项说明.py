@@ -76,19 +76,19 @@ def 归纳事项(item, bank, journal):
     elif item.get("核对方式", "").startswith("人工") and reason:
         parts.append("尚未确认原因：" + reason)
     if not bank or not journal:
-        question = "这笔单边收付是否在另一侧漏记、跨日/跨月记账或不属于本账户？本报告列出了本侧完整业务；请在黄色结果格选择保留未对应，并在备注写明查明的原因；已在其他事项对应的记录不重复确认。"
+        question = "这笔单边收付是否在另一侧漏记、跨日/跨月记账或不属于本账户？请查原始流水、序时账及凭证，在黄色格记录核查结论和原因；尚未查明可留空。"
     elif di or de:
-        question = f"这些记录是否属于同一业务？收入差{di:,.2f}元、支出差{de:,.2f}元各是什么原因，是否有组成漏列？确认时选择“确认对应并保留差额”，原因填备注；关系不成立则否定。"
+        question = f"这些记录是否属于同一业务？收入差{di:,.2f}元、支出差{de:,.2f}元各是什么原因，是否有组成漏列？请查原始凭证，自由记录核查结论及差额原因；填写不会改变原始差额。"
     elif "冲突" in reason:
-        question = "双方列示的对方、用途或业务编号为何不同，能否证明属于同一业务？依据成立选择确认对应，否则否定；具体解释填备注。"
+        question = "双方列示的对方、用途或业务编号为何不同，能否证明属于同一业务？请查原始凭证，在黄色格记录核查结论，具体依据填备注。"
     elif (any("工资" in str(r.get("摘要", "")) for r in journal)
           and ("业务依据不足" in reason or "缺少足以证明" in reason)):
         parts.append("账上列为工资，银行记录未提供可核实的工资用途或与账上共同的员工标识；金额组成相同尚不能证明人员归属")
         question = "请用工资表确认本处列出的银行收款人名单，是否就是账上完整凭证所记的工资及感恩父母基金；确认整组范围后在黄色格填写，差额或名单变化写备注。"
     elif "歧义" in reason:
-        question = "下列原对应和其他方案中，哪一套属于这项业务？请比较完整组成后在黄色格选对应方案，备注写明选择依据。"
+        question = "本项存在多种可能对应，程序列出的线索并未穷尽。请查双方完整记录及原始凭证，自由记录查明的情况和依据，无需从候选中选择。"
     else:
-        question = "双方金额相同，日期、对方和用途是否足以证明同一业务？请在黄色格确认或否定，具体判断依据填备注。"
+        question = "双方金额相同，日期、对方和用途是否足以证明同一业务？请查原始记录，在黄色格自由记录核查结论，具体依据填备注。"
     if item.get("核对方式") == "自动确认":
         question = "程序已有充分证据确认，本项无需人工填写；完整组成留存供查阅。"
     elif item.get("核对方式") == "留存备查":
@@ -101,7 +101,7 @@ def 整理业务证据(tables):
     for r in tables["核对明细"].to_dict("records"):
         records[r["事项编号"]][r["来源"]].append(r)
     alternatives = defaultdict(list)
-    for r in tables["其他对应供选择"].to_dict("records"):
+    for r in tables["其他对应线索"].to_dict("records"):
         alternatives[r["事项编号"]].append(r)
     items = tables["复核事项索引"]
     evidence = []
@@ -111,12 +111,12 @@ def 整理业务证据(tables):
         bank, journal = records[identity]["银行流水"], records[identity]["序时账"]
         summary, question = 归纳事项(item, bank, journal)
         explanations[identity] = (summary, question, 组成说明(bank), 组成说明(journal))
-        方案数 = len({r['可选结果'] for r in alternatives[identity]})
+        方案数 = len({r['线索编号'] for r in alternatives[identity]})
         evidence.append({"核对编号": item["核对编号"], "事项编号": identity, "行别": "事项结论与合计",
                          "结论与待答问题": item["程序结论"] + "；" + item["核对方式"] + "\n" + summary + "\n" + question,
                          "银行记录": 组成说明(bank), "序时账记录": 组成说明(journal),
                          "证据说明": item["判断依据"],
-                         "其他方案": f'{方案数}套候选方案，点击集中查看（不是新增交易）' if 方案数 else ''})
+                         "其他线索": f'{方案数}套参考线索，点击查看（未穷尽所有可能，无需选择）' if 方案数 else ''})
         for side, group in (("银行", bank), ("序时账", journal)):
             for r in group:
                 amount = Decimal(str(r["金额"]))
@@ -125,7 +125,7 @@ def 整理业务证据(tables):
                                  side + "支出": float(max(-amount, Decimal(0))), "证据说明": r["原始出处"]})
     for pos, name in enumerate(("程序归纳", "具体问题", "双方银行说明", "双方账上说明")):
         items[name] = items["事项编号"].map(lambda identity: explanations[identity][pos])
-    tables["事项证据"] = pd.DataFrame(evidence, columns=["核对编号", "行别", "结论与待答问题", "银行记录", "银行收入", "银行支出", "序时账记录", "序时账收入", "序时账支出", "证据说明", "返回填写", "事项编号", "其他方案"])
+    tables["事项证据"] = pd.DataFrame(evidence, columns=["核对编号", "行别", "结论与待答问题", "银行记录", "银行收入", "银行支出", "序时账记录", "序时账收入", "序时账支出", "证据说明", "返回填写", "事项编号", "其他线索"])
 
     daily_records = defaultdict(list)
     for sides in records.values():

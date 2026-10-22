@@ -66,12 +66,7 @@ def build_review_tables(reporter, tables):
                 owner[(side, idx)] = item
         choices = []
         if candidate is not None:
-            choices.append(('确认对应并保留差额' if item['差异金额'] else '确认对应', candidate))
-            for alternative in candidate.evidence.get('alternative_candidate_ids', ()):
-                other = candidates.get(alternative)
-                if other and (other.bank_idxs, other.journal_idxs) != (candidate.bank_idxs, candidate.journal_idxs):
-                    if all((other.bank_idxs, other.journal_idxs) != (x.bank_idxs, x.journal_idxs) for _, x in choices):
-                        choices.append((f'采用其他对应{len(choices)}', other))
+            choices.append(('程序建议对应', candidate))
         for number, (label, choice) in enumerate(choices):
             option_id = item_id + f'|{number}'
             difference = float(choice.metrics.total_diff_li) / 10000
@@ -86,8 +81,19 @@ def build_review_tables(reporter, tables):
                     source_row = frame.loc[idx]
                     key = _record_key(side, source_row, idx)
                     members.append({'选项编号': option_id, '事项编号': item_id, '原始记录号': key})
-                    if number:
-                        comparisons.append({'事项编号': item_id, '可选结果': label, '来源': '银行流水' if side == 'bank' else '序时账', '日期': source_row['date'], '摘要及对方': _brief(source_row), '金额': float(source_row['amount']), '关系说明': choice.processing_reason or choice.evidence.get('business_basis', ''), '原始出处': origin(side,source_row,idx)})
+        # 其他候选只供查阅，不进入人工选项及生效组成。
+        if candidate is not None:
+            seen = {(candidate.bank_idxs, candidate.journal_idxs)}
+            for alternative in candidate.evidence.get('alternative_candidate_ids', ()):
+                other = candidates.get(alternative)
+                if other is None or (other.bank_idxs, other.journal_idxs) in seen:
+                    continue
+                label = f'参考线索{len(seen)}'
+                seen.add((other.bank_idxs, other.journal_idxs))
+                for side, indexes in (('bank', other.bank_idxs), ('journal', other.journal_idxs)):
+                    for idx in indexes:
+                        source_row = getattr(matcher, side).loc[idx]
+                        comparisons.append({'事项编号': item_id, '线索编号': label, '来源': '银行流水' if side == 'bank' else '序时账', '日期': source_row['date'], '摘要及对方': _brief(source_row), '金额': float(source_row['amount']), '关系说明': other.processing_reason or other.evidence.get('business_basis', ''), '原始出处': origin(side,source_row,idx)})
         mode = item['核对方式']
         if mode in manual:
             bank_rows = [matcher.bank.loc[x] for x in item['银行索引']]
@@ -128,12 +134,12 @@ def build_review_tables(reporter, tables):
         '人工全查': _frame(manual['人工全查'],人工列),
         '人工抽样': _frame(manual['人工抽样'],人工列),
         '月度差异组成': _frame(contributions,['月份','事项编号','收入差额','支出差额','净发生额差','已确认收入差','未确认收入差','已确认支出差','未确认支出差','当前核对结论']),
-        '其他对应供选择': _frame(comparisons,['事项编号','可选结果','来源','日期','摘要及对方','金额','关系说明','原始出处']),
+        '其他对应线索': _frame(comparisons,['事项编号','线索编号','来源','日期','摘要及对方','金额','关系说明','原始出处']),
         '复核事项索引': _frame(index_rows,索引列),
         '复核候选选项': _frame(options,选项列),
         '复核候选组成': _frame(members,成员列),
     }
-    for name in ('核对明细','人工全查','人工抽样','月度差异组成','其他对应供选择'):
+    for name in ('核对明细','人工全查','人工抽样','月度差异组成','其他对应线索'):
         result[name].insert(0,'核对编号',result[name]['事项编号'].map(display_numbers))
     result['核对明细'].insert(result['核对明细'].columns.get_loc('当前对应'),'当前核对编号','')
     result = build_display_tables(result)

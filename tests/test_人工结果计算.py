@@ -24,6 +24,7 @@ def excel():
     try:
         app.Visible = False
         app.DisplayAlerts = False
+        app.IgnoreRemoteRequests = True
         yield app
     finally:
         app.Quit()
@@ -91,14 +92,14 @@ def _结论(book):
 
 
 def _选择(excel,book,identity,value):
-    for name in ['人工全查','人工抽样']:
+    for name in ['待处理事项']:
         sheet=book.Worksheets(name)
         values=sheet.UsedRange.Value
         headers=list(values[0])
         for number,row in enumerate(values[1:],2):
             data=dict(zip(headers,row))
-            if data.get('事项编号')==identity and data.get('行别')=='核对事项':
-                sheet.Cells(number,headers.index('人工核对结果')+1).Value=value
+            if data.get('事项编号')==identity:
+                sheet.Cells(number,headers.index('核查结论')+1).Value=value
                 excel.CalculateFullRebuild()
                 return
     raise AssertionError(f'找不到人工填写事项：{identity}')
@@ -114,7 +115,7 @@ def _覆盖(book,bank,journal):
     assert summary['序时账当前已对平金额覆盖率']==pytest.approx(journal)
 
 
-def test_未填确认差额及否定均按真实金额计算(excel,tmp_path):
+def test_未填及自由结论均保留真实差额与程序配对(excel,tmp_path):
     path=_报告(tmp_path,[100],[90],[((0,),(0,))])
     with _打开(excel,path) as book:
         summary=_结论(book)
@@ -124,22 +125,22 @@ def test_未填确认差额及否定均按真实金额计算(excel,tmp_path):
         assert '待人工' in _表(book,'复核事项索引')[0]['当前核对结论']
         original={key:value for key,value in _表(book,'月度核对')[0].items() if key in ['银行-收入金额','序时账-收入金额','收入金额差额','支出金额差额']}
         assert original['收入金额差额']==10
-        _选择(excel,book,'M1','确认对应并保留差额')
+        _选择(excel,book,'M1','已核查，差额为手续费，凭证另附')
         assert _结论(book)['待处理事项数']==0
         assert _结论(book)['已处理事项数']==1
         _覆盖(book,0,0)
         monthly=_表(book,'月度核对')[0]
         assert all(monthly[key]==value for key,value in original.items())
-        assert monthly['已确认收入差']==10
-        assert monthly['未确认收入差']==0
-        assert all(row['当前对应']=='M1' for row in _明细(book).values())
-        _选择(excel,book,'M1','否定对应')
-        assert all(not row['当前对应'] and '未对应' in row['当前核对结果'] for row in _明细(book).values())
+        assert monthly['已确认收入差']==0
+        assert monthly['未确认收入差']==10
+        assert all(not row['当前对应'] for row in _明细(book).values())
+        _选择(excel,book,'M1','发现差异，尚待补充资料')
+        assert all(not row['当前对应'] and '已记录核查结论' in row['当前核对结果'] for row in _明细(book).values())
         _覆盖(book,0,0)
         assert _表(book,'月度核对')[0]['未确认收入差']==10
 
 
-def test_采用替代关系释放原账行且单边选择不抹掉有效对应(excel,tmp_path):
+def test_结论提及其他凭证也不自动采用或释放原始行(excel,tmp_path):
     path=_报告(tmp_path,[100],[100,100],[((0,),(0,))],[(0,(0,),(1,))])
     with _打开(excel,path) as book:
         untouched=_明细(book)
@@ -153,66 +154,68 @@ def test_采用替代关系释放原账行且单边选择不抹掉有效对应(e
             '月度仍有未对应':bool(month_statuses) and all('仍有未对应' in value for value in month_statuses),
         }
         assert initial_state=={'未对应原始记录数':3,'单边待人工':True,'月度仍有未对应':True}, (initial_state,single_status,month_statuses)
-        _选择(excel,book,'M1','采用其他对应1')
+        _选择(excel,book,'M1','原凭证有误，实际应查另一张凭证')
         rows=_明细(book)
-        assert rows['银行2']['当前对应']=='M1'
-        assert rows['账面3']['当前对应']=='M1'
-        assert not rows['账面2']['当前对应']
-        assert '未对应' in rows['账面2']['当前核对结果']
+        assert all(not row['当前对应'] for row in rows.values())
+        assert '已记录核查结论' in rows['账面2']['当前核对结果']
         assert '已确认' not in rows['账面2']['当前核对结果']
-        _覆盖(book,1,0.5)
+        _覆盖(book,0,0)
         contributions=_表(book,'月度差异组成')
         assert len(contributions)==2
         initial=next(row for row in contributions if row['事项编号']=='M1')
         assert initial['收入差额']==0
-        assert initial['已确认收入差']==100
-        assert initial['未确认收入差']==-100
+        assert initial['已确认收入差']==0
+        assert initial['未确认收入差']==0
         single=rows['账面3']['事项编号']
-        _选择(excel,book,single,'保留未对应')
-        assert _明细(book)['账面3']['当前对应']=='M1'
+        _选择(excel,book,single,'已查明，重复记账待处理')
+        assert not _明细(book)['账面3']['当前对应']
         item=next(row for row in _表(book,'复核事项索引') if row['事项编号']==single)
-        assert item['当前核对结论']=='原记录已由其他事项建立对应'
-        _覆盖(book,1,0.5)
+        assert '已记录核查结论' in item['当前核对结论']
+        _覆盖(book,0,0)
 
 
-def test_两个人工选择重叠时双方都不计有效覆盖(excel,tmp_path):
+def test_两项结论不会导致交易重新分配或重复占用(excel,tmp_path):
     path=_报告(tmp_path,[100,200],[100,200],[((0,),(0,)),((1,),(1,))],[(1,(0,),(1,))])
     with _打开(excel,path) as book:
-        _选择(excel,book,'M1','确认对应')
-        _选择(excel,book,'M2','采用其他对应1')
-        assert _结论(book)['人工选择冲突数']==2
+        _选择(excel,book,'M1','已查原始凭证，详见备注')
+        _选择(excel,book,'M2','已查另一张凭证，详见备注')
+        assert _结论(book)['已处理事项数']==2
         assert all(not row['当前对应'] for row in _明细(book).values())
-        assert all('重复' in row['当前核对结论'] for row in _表(book,'复核事项索引'))
+        assert all('已记录核查结论' in row['当前核对结论'] for row in _表(book,'复核事项索引'))
         _覆盖(book,0,0)
 
 
 def test_人工表整行排序后填写不串事项且完整组成可追溯(excel,tmp_path):
     path=_报告(tmp_path,[40,60,200],[100,200],[((0,1),(0,)),((2,),(1,))])
     with _打开(excel,path) as book:
-        sheet=book.Worksheets('人工全查')
-        rows=_表(book,'人工全查')
+        sheet=book.Worksheets('待处理事项')
+        rows=_表(book,'待处理事项')
         assert all(row['事项编号'] for row in rows)
         before=[row['事项编号'] for row in rows]
         headers=list(sheet.UsedRange.Value[0])
-        sheet.UsedRange.Sort(Key1=sheet.Cells(2,headers.index('事项编号')+1), Order1=2, Header=1)
-        after=[row['事项编号'] for row in _表(book,'人工全查')]
+        # 只排序数据区，避免Excel把中文表头作为普通记录参与排序。
+        sheet.Range(sheet.Cells(2, 1), sheet.Cells(sheet.UsedRange.Rows.Count, len(headers))).Sort(
+            Key1=sheet.Cells(2,headers.index('事项编号')+1), Order1=1, Header=2)
+        after=[row['事项编号'] for row in _表(book,'待处理事项')]
         assert after!=before
-        assert after==sorted(before,reverse=True)
-        _选择(excel,book,'M1','确认对应')
-        _选择(excel,book,'M2','否定对应')
+        assert after==sorted(before)
+        _选择(excel,book,'M1','组内记录已查，见备注')
+        _选择(excel,book,'M2','尚有差异')
         details=_明细(book)
-        assert all(details[key]['当前对应']=='M1' for key in ['银行2','银行3','账面2'])
-        assert all(not details[key]['当前对应'] for key in ['银行4','账面3'])
-        _覆盖(book,1/3,1/3)
+        assert len(details)==5 and all(not row['当前对应'] for row in details.values())
+        index={row['事项编号']:row for row in _表(book,'复核事项索引')}
+        assert index['M1']['人工核对结果']=='组内记录已查，见备注'
+        assert index['M2']['人工核对结果']=='尚有差异'
+        _覆盖(book,0,0)
 
 
-def test_粘贴非法人工结果仍待核对且不增加覆盖(excel,tmp_path):
+def test_粘贴自由文字可记录但不增加覆盖(excel,tmp_path):
     path=_报告(tmp_path,[100],[100],[((0,),(0,))])
     with _打开(excel,path) as book:
-        _选择(excel,book,'M1','随意粘贴的无效选项')
-        assert _表(book,'复核事项索引')[0]['当前核对结论']=='选择无效'
-        assert _结论(book)['人工全查未核对数']==1
-        assert _结论(book)['待处理事项数']==1
-        assert _结论(book)['已处理事项数']==0
+        _选择(excel,book,'M1','已向企业询问，等待回单')
+        assert '已记录核查结论' in _表(book,'复核事项索引')[0]['当前核对结论']
+        assert _结论(book)['人工全查未核对数']==0
+        assert _结论(book)['待处理事项数']==0
+        assert _结论(book)['已处理事项数']==1
         assert all(not row['当前对应'] for row in _明细(book).values())
         _覆盖(book,0,0)

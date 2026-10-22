@@ -520,11 +520,6 @@ def 应用复核层(簿: 簿计划):
     ix, op, mem, detail = "复核事项索引", "复核候选选项", "复核候选组成", "核对明细"
     index_rows = {str(_读值(sheets[ix], r, headers[ix]["事项编号"])): r
                   for r in range(2, 行数(ix) + 1)}
-    option_rows = _defaultdict(list)
-    for row in range(2, 行数(op) + 1):
-        item_id = str(_读值(sheets[op], row, headers[op]["事项编号"]))
-        option_rows[item_id].append(row)
-
     # 稳定编号查找人工输入
     for item_id, row in index_rows.items():
         key = cell(ix, "事项编号", row)
@@ -546,44 +541,18 @@ def 应用复核层(簿: 簿计划):
                 put(mode, "当前核对结论", row,
                     "=" + find(ix, "当前核对结论", cell(mode, "事项编号", row)))
                 continue
-            choices = [_读值(sheets[op], r, headers[op]["选择文字"])
-                       for r in option_rows.get(str(item_id), [])]
-            choices.append("否定对应" if choices else "保留未对应")
-            tp.验证.append({
-                "type": "list",
-                "formula1": '"' + ",".join(choices) + '"',
-                "allow_blank": True,
-                "errorTitle": "请选择本事项的结果",
-                "error": "请选择下拉列表中的对应结果。",
-                "showErrorMessage": True,
-                "errorStyle": "stop",
-                "sqref": cell(mode, "人工核对结果", row),
-            })
             put(mode, "当前核对结论", row,
                 "=" + find(ix, "当前核对结论", cell(mode, "事项编号", row)))
 
     for row in range(2, 行数(op) + 1):
-        key = cell(op, "事项编号", row)
-        choice = find(ix, "人工核对结果", key)
-        put(op, "人工选中", row, f'=--({choice}={cell(op,"选择文字",row)})')
+        put(op, "人工选中", row, 0)
+        put(op, "选择冲突", row, 0)
+        # 人工结论仅留痕，不能让任何候选配对生效或失效。
+        put(op, "有效对应", row, f'=--({cell(op,"自动确认",row)}=1)')
 
     for row in range(2, 行数(mem) + 1):
-        opt = cell(mem, "选项编号", row)
-        key = cell(mem, "原始记录号", row)
-        put(mem, "人工占用", row, "=" + find(op, "人工选中", opt, "选项编号", "0"))
-        put(mem, "占用次数", row,
-            f'=SUMIF({rng(mem,"原始记录号")},{key},{rng(mem,"人工占用")})')
-
-    for row in range(2, 行数(op) + 1):
-        opt = cell(op, "选项编号", row)
-        manual = cell(op, "人工选中", row)
-        choice = find(ix, "人工核对结果", cell(op, "事项编号", row))
-        put(op, "选择冲突", row,
-            f'=COUNTIFS({rng(mem,"选项编号")},{opt},{rng(mem,"占用次数")},">1")')
-        put(op, "有效对应", row,
-            f'=IF({manual}=1,--({cell(op,"选择冲突",row)}=0),'
-            f'IF(AND({cell(op,"自动确认",row)}=1,{choice}=""),'
-            f'--(SUMIF({rng(mem,"选项编号")},{opt},{rng(mem,"占用次数")})=0),0))')
+        put(mem, "人工占用", row, 0)
+        put(mem, "占用次数", row, 0)
 
     for row in range(2, 行数(mem) + 1):
         opt = cell(mem, "选项编号", row)
@@ -596,28 +565,12 @@ def 应用复核层(簿: 簿计划):
             f'--({find(op,"差异金额",opt,"选项编号","1")}=0),0)')
 
     for item_id, row in index_rows.items():
-        key = cell(ix, "事项编号", row)
         choice = cell(ix, "人工核对结果", row)
-        selected = f'SUMIFS({rng(op,"人工选中")},{rng(op,"事项编号")},{key})'
-        conflict = f'SUMIFS({rng(op,"选择冲突")},{rng(op,"事项编号")},{key},{rng(op,"人工选中")},1)'
-        effective = f'SUMIFS({rng(op,"有效对应")},{rng(op,"事项编号")},{key})'
         mode = _读值(sheets[ix], row, headers[ix]["核对方式"])
-        default = ("待人工核对" if mode in ("人工全查", "人工抽样")
-                   else "原对应被人工选择替代，记录未对应" if mode == "自动确认"
-                   else "留存备查，未作人工确认")
-        formula = (f'=IF({choice}="否定对应","原对应已否定，记录恢复未对应",'
-                   f'IF({choice}="保留未对应","已人工核对，保留未对应",'
-                   f'IF({selected}>0,IF({conflict}>0,"所选对应重复使用原记录",'
-                   f'"已确认所选对应；原始差额及期间保留"),'
-                   f'IF({effective}>0,"程序已确认对应",'
-                   f'IF({choice}<>"","选择无效","{default}")))))')
-        if not option_rows.get(item_id):
-            all_records = f'COUNTIF({rng(detail,"事项编号")},{key})'
-            effective_records = (f'COUNTIFS({rng(detail,"事项编号")},{key},'
-                                 f'{rng(detail,"当前对应")},"?*")')
-            formula = (f'=IF({effective_records}>0,'
-                       f'IF({effective_records}={all_records},"原记录已由其他事项建立对应",'
-                       f'"部分原记录已由其他事项建立对应，其余仍未对应"),{formula[1:]})')
+        if mode in ("人工全查", "人工抽样"):
+            formula = f'=IF(LEN(TRIM({choice}))>0,"已记录核查结论；程序疑点及对应关系保留","待人工核对")'
+        else:
+            formula = "程序已确认对应" if mode == "自动确认" else "留存备查，未作人工确认"
         put(ix, "当前核对结论", row, formula)
 
     明细缓冲 = {}                 # 列名 → {行号: 公式}，整列一次性写回，替代逐格写
@@ -631,13 +584,7 @@ def 应用复核层(簿: 簿计划):
              f'=IFERROR(INDEX({rng(mem,"事项编号")},{lookup}),"")')
         dput("当前核对编号", row,
              "=" + find(ix, "核对编号", cell(detail, "当前对应", row)))
-        initial_id = str(_读值(sheets[detail], row, headers[detail]["事项编号"]))
         initial = find(ix, "当前核对结论", cell(detail, "事项编号", row))
-        if option_rows.get(initial_id):
-            choice = find(ix, "人工核对结果", cell(detail, "事项编号", row))
-            initial = (f'IF({choice}<>"","该记录当前未对应；请按当前对应列查看",'
-                       f'IF({find(ix,"核对方式",cell(detail,"事项编号",row))}="自动确认",'
-                       f'"原对应已被替代，该记录当前未对应",{initial}))')
         dput("当前核对结果", row,
              f'=IFERROR(INDEX({rng(mem,"显示结果")},{lookup}),{initial})')
         dput("已对平金额", row,
@@ -740,25 +687,21 @@ def _结论汇总(簿: 簿计划, sheets: dict, headers: dict, rng):
     set_value("中风险抽中待核查数", f'=COUNTIF({rng(ix,"核对方式")},"人工抽样")')
     set_value("当前未对应原始记录数",
               f'=COUNTA({rng("核对明细","原始记录号")})-COUNTIF({rng("核对明细","当前对应")},"?*")')
-    set_value("使用顺序", "先看月度发生额和余额，再看核对明细；人工全查及人工抽样只在黄色格选择结果。多笔业务的组成直接展开。")
+    set_value("使用顺序", "先看月度发生额和余额，再查疑点与原始明细；在待处理事项黄色格自由记录核查结论和备注，可以留空，无需选择配对。")
     set_value("金额差额口径", "收入与支出分别比较，差额不相互抵销。人工表金额为各侧净额，差额为收入差和支出差绝对值之和；原始各笔金额见组成。")
-    set_value("当前覆盖率口径", "只统计有效对应且差额为零的原记录绝对金额；已人工查看但仍未对应或仍有差额，不计作已对平。")
+    set_value("当前覆盖率口径", "只统计程序已确认且差额为零的原记录绝对金额；人工结论及备注不改变配对或覆盖率。")
     set_value("月度说明", "月度始终显示双方原始发生额和余额；已确认差表示对应关系已确认，金额与记账月份均未改写；月度差异组成可查看仍未确认部分。")
     set_value("专题说明", "退款冲销重付、手续费及净额、截止性差异、重复线索及余额检查等，有事项时直接显示；月度笔数与解释分项列、技术留存表可在Excel取消隐藏查看。")
     pending = []
     for mode in ("人工全查", "人工抽样"):
         mode_range = rng(ix, "核对方式")
-        choice = rng(ix, "人工核对结果")
         set_value(mode + "事项数", f'=COUNTIF({mode_range},"{mode}")')
-        expression = (f'COUNTIFS({mode_range},"{mode}",{choice},"")'
-                      f'+COUNTIFS({mode_range},"{mode}",{rng(ix,"当前核对结论")},"选择无效")'
-                      f'+COUNTIFS({mode_range},"{mode}",{rng(ix,"当前核对结论")},"所选对应重复使用原记录")')
+        expression = f'COUNTIFS({mode_range},"{mode}",{rng(ix,"当前核对结论")},"待人工核对")'
         pending.append(expression)
         set_value(mode + "未核对数", "=" + expression)
     set_value("待处理事项数", "=" + "+".join(pending))
-    set_value("已处理事项数", f'=COUNTIF({rng(ix,"人工核对结果")},"<>")')
-    set_value("人工选择冲突数", f'=COUNTIF({rng(ix,"当前核对结论")},"所选对应重复使用原记录")')
-    set_value("人工结果说明", "在人工全查或人工抽样中选择结果；确认不改变原始金额和期间，否定取消对应，候选冲突不计入有效覆盖。")
+    set_value("已处理事项数", f'=COUNTIF({rng(ix,"当前核对结论")},"已记录核查结论*")')
+    set_value("人工结果说明", "在待处理事项自由记录核查结论和备注；填写仅记录核查进度，不改变程序疑点、配对、金额、期间或覆盖率。参考线索未穷尽所有可能。")
     for source, label in (("银行流水", "银行"), ("序时账", "序时账")):
         numerator = f'SUMIF({rng("核对明细","来源")},"{source}",{rng("核对明细","已对平金额")})'
         明细 = sheets["核对明细"]
@@ -773,16 +716,12 @@ def _结论汇总(簿: 簿计划, sheets: dict, headers: dict, rng):
     visible = ["使用顺序", "核对范围", "范围说明", "银行有效交易笔数", "日记账有效交易笔数",
                "实际执行重要性水平", "明显微小错报临界值", "人工全查事项数", "人工全查未核对数",
                "人工抽样事项数", "人工抽样未核对数", "待处理事项数", "已处理事项数",
-               "人工选择冲突数", "当前未对应原始记录数", "银行当前已对平金额覆盖率",
+               "当前未对应原始记录数", "银行当前已对平金额覆盖率",
                "序时账当前已对平金额覆盖率", "余额核对", "期初余额差额", "期初余额状态",
                "人工结果说明", "金额差额口径", "当前覆盖率口径", "月度说明", "专题说明"]
     visible[4:4] = ["非工作日银行收付笔数", "非工作日银行收款笔数", "非工作日银行收款金额",
                     "非工作日银行付款笔数", "非工作日银行付款金额", "银行交易日历未覆盖笔数",
                     "非工作日日历口径", "非工作日日历来源"]
-    set_value("已处理事项数",
-              f'=COUNTIF({rng(ix,"人工核对结果")},"?*")'
-              f'-COUNTIF({rng(ix,"当前核对结论")},"选择无效")'
-              f'-COUNTIF({rng(ix,"当前核对结论")},"所选对应重复使用原记录")')
     contents = []
     for r in range(2, len(df) + 2):
         cov = tp.覆盖.get((r, value_col))
@@ -810,7 +749,7 @@ def _结论汇总(簿: 簿计划, sheets: dict, headers: dict, rng):
 
 
 _复核主表 = ("核对结论", "月度核对", "核对明细", "人工全查", "人工抽样", "每日统计")
-_复核副表 = ("月度差异组成", "其他对应供选择")
+_复核副表 = ("月度差异组成", "其他对应线索")
 _重复表 = {"疑点事项", "自动归集事项", "银行侧待查", "日记账侧待查", "逐笔匹配",
            "整组勾稽", "匹配组成", "月度统计", "其他可能对应明细"}
 _技术留存 = {"运行参数", "大模型辅助明细", "解析异常明细", "运行资料与映射",
@@ -1029,11 +968,11 @@ def 应用展示层(簿: 簿计划):
     summary = 簿.取表("核对结论")
     hs = _列定位(summary)
     messages = {
-        "使用顺序": "先看非工作日银行收付示警，再看月度收支与余额、逐笔或整组。整组左侧“＋”展开原始记录。人工全查、人工抽样直接在黄色格选择结果。",
+        "使用顺序": "先看非工作日银行收付示警及月度收支余额，再查看疑点和双方原始记录；在待处理事项黄色格自由记录核查结论和备注。",
         "金额差额口径": "收入与支出分别比较。整组汇总金额写在文字格；收入、支出数值列只记录原始组成，避免重复加总。逐笔金额正数为收入、负数为支出。",
         "月度说明": "月度收支和余额在同一张表。人工确认不改变原始金额、记账月份和客观差额；年度合计只加总发生额。",
         "专题说明": "非工作日交易按银行所选日期独立示警；每日、退款重付、手续费、跨期、重复线索及输入详情保留在隐藏表中。",
-        "人工结果说明": "黄色格每项只选一次并保存。点击逐笔、整组或未对应表的核对编号，可跳到人工填写处。原始分组保留，当前结果随选择更新。",
+        "人工结果说明": "黄色格可自由记录核查结论及备注，也可留空。点击完整明细查看双方记录与原始出处；其他线索仅供参考，人工文字不改变程序疑点、对应关系、金额或覆盖率。",
     }
     for row in range(2, len(summary.表) + 2):
         label = _读值(summary, row, hs["项目"])
@@ -1248,12 +1187,12 @@ from copy import copy as _copy
 from datetime import date as _date, datetime as _dt
 from decimal import Decimal as _Decimal
 
-_紧凑阅读表 = ("核对总览", "待处理事项", "月度核对", "每日统计", "对应明细", "事项证据", "每日差异证据", "非工作日交易")
+_紧凑阅读表 = ("核对总览", "待处理事项", "月度核对", "每日统计", "对应明细", "事项证据", "每日差异证据", "非工作日交易", "其他对应线索")
 _紧凑阅读色 = "BDD7EE"
 _紧凑留痕色 = "C6E0B4"
 _紧凑人工方式 = ("人工全查", "人工抽样")
 _紧凑列宽 = {"核对编号": 7, "处理要求": 9, "对应方式": 9, "核对动作": 45,
-             "银行记录": 46, "序时账记录": 46, "人工核对结果": 19, "当前结果": 21,
+             "银行记录": 46, "序时账记录": 46, "核查结论": 28, "当前结果": 21,
              "备注": 20, "完整明细": 7, "核对依据": 26, "日期": 11, "月份": 10,
              "需查看": 49, "余额说明": 21, "项目": 27, "结果": 43, "怎么看": 64,
              "程序归纳与具体问题": 48, "结论与待答问题": 48,
@@ -1357,7 +1296,7 @@ def _写事项(簿: 簿计划):
                                -abs(float(it.get("影响金额") or 0)), int(it["核对编号"])))
     numbers = {it["事项编号"]: it["核对编号"] for it in items}
     待处理列 = ["核对编号", "处理要求", "程序归纳与具体问题", "银行记录", "序时账记录",
-                "收入差额", "支出差额", "人工核对结果", "当前结果", "备注",
+                "收入差额", "支出差额", "核查结论", "当前结果", "备注",
                 "完整明细", "事项编号"]
     对应列 = ["核对编号", "对应方式", "银行记录", "银行收入", "银行支出",
               "序时账记录", "序时账收入", "序时账支出", "收入差额", "支出差额",
@@ -1418,12 +1357,6 @@ def _写事项(簿: 簿计划):
             _写值(待处理, row, 8, _人工填写原值(original.get("人工核对结果")) or None)
             _写值(待处理, row, 10, _人工填写原值(original.get("备注")) or None)
             人工tp = 簿.取表(name)
-            old_coord = f"{_字母(hs_m['人工核对结果'])}{source_row}"
-            for v in 人工tp.验证:
-                if _含坐标(v.get("sqref", ""), old_coord):
-                    nv = dict(v)
-                    nv["sqref"] = f"H{row}"
-                    待处理.验证.append(nv)
             owner_key = f"{_字母(hs_m['填报编号'])}{source_row}"
             for label, col_l in (("人工核对结果", "H"), ("备注", "J")):
                 value = (f"IFERROR(INDEX('待处理事项'!${col_l}$2:${col_l}${end},"
@@ -1458,12 +1391,12 @@ def _写事项(簿: 簿计划):
     evidence = 簿.取表("事项证据")
     hs_e = _列定位(evidence)
     方案首行 = {}
-    for row, identity in enumerate(簿.取表('其他对应供选择').表['事项编号'], 2):
+    for row, identity in enumerate(簿.取表('其他对应线索').表['事项编号'], 2):
         方案首行.setdefault(identity, row)
     for row in range(2, len(evidence.表)+2):
         identity = _读值(evidence, row, hs_e["事项编号"])
-        if '其他方案' in hs_e and _读值(evidence, row, hs_e['其他方案']) and identity in 方案首行:
-            evidence.盖格(row, hs_e['其他方案'], 格样式(超链接=f"#'其他对应供选择'!A{方案首行[identity]}"))
+        if '其他线索' in hs_e and _读值(evidence, row, hs_e['其他线索']) and identity in 方案首行:
+            evidence.盖格(row, hs_e['其他线索'], 格样式(超链接=f"#'其他对应线索'!A{方案首行[identity]}"))
         if identity in pending_rows:
             _写值(evidence, row, hs_e["返回填写"], "返回黄色填写格")
             evidence.盖格(row, hs_e["返回填写"], 格样式(超链接=f"#'待处理事项'!H{pending_rows[identity]}"))
@@ -1589,9 +1522,8 @@ def _建总览(簿: 簿计划):
         ("账上记录数", "日记账有效交易笔数", "进入本次核对的银行存款记账笔数。"),
         ("银行金额已对平比例", "银行当前已对平金额覆盖率", "收付金额分开累计；只计入已对应且差额为零的记录。"),
         ("账上金额已对平比例", "序时账当前已对平金额覆盖率", "人工查看过但仍有差额，不算已对平。"),
-        ("还需人工核对", "待处理事项数", "待处理事项只列需要填写的项目；在黄色格选择结果。"),
-        ("已完成人工核对", "已处理事项数", "已选有效结果的事项数，有差额的仍保留差额。"),
-        ("人工选择有冲突", "人工选择冲突数", "同一原记录被重复采用时，需要重新选择。"),
+        ("尚未记录核查结论", "待处理事项数", "黄色格可自由记录结论和备注，也可留空，不要求选择配对。"),
+        ("已记录核查结论", "已处理事项数", "仅表示已经留下人工结论；不代表程序已确认配对或疑点已经消除。"),
         ("当前尚未生效对应的记录", "当前未对应原始记录数", "包括已配对待确认及单边记录，不能解释为全部没找到对应；下方单列初始真正单边。"),
         ("期初余额差额", "期初余额差额", "银行余额减账上余额；未提供可用余额时不补零。"),
         ("余额核对情况", "余额核对", "每日和月度表保留收支、余额及差额。"),
@@ -1675,13 +1607,13 @@ def _建总览(簿: 簿计划):
     paired_pending = set(ix.loc[ix["核对方式"].isin(_紧凑人工方式) & ix["匹配ID"].fillna("").ne(""), "事项编号"])
     paired_count = int(簿.取表("核对明细").表["事项编号"].isin(paired_pending).sum())
     tp.表.loc[len(tp.表)] = ["初始已配对待人工核对记录数", paired_count,
-                              "这些记录已有候选对应，待决定是否采用；与真正单边分别展示。"]
+                              "这些记录已有程序建议对应，但依据仍待核查；参考线索未穷尽所有可能，不要求人工选择。"]
     modes = ix["核对方式"].value_counts()
     for title, mode in (("全查事项数", "人工全查"), ("中风险抽中事项数", "人工抽样"), ("留存备查事项数", "留存备查"), ("程序已确认事项数", "自动确认")):
         tp.表.loc[len(tp.表)] = [title, int(modes.get(mode, 0)), "按本次标准分流；备查及程序已确认均不计入待办。"]
     tp.表.loc[len(tp.表)] = [
-        "使用方法", "先看总览和每日、月度差额，再处理黄色格。",
-        "待处理事项一项一处填写；事项证据可一次点击直达全部组成；绿色追溯表默认隐藏。"]
+        "使用方法", "先看疑点和原始记录，再自由记录核查结论及备注。",
+        "待处理事项点击完整明细可查看双方全部组成与原始出处；参考线索仅辅助查找，无需选择配对，未查明可留空。"]
 
 
 def _做变换(reading):
@@ -1835,9 +1767,11 @@ def 应用紧凑层(簿: 簿计划):
     for tp in 簿.表:
         _紧凑样式(tp, reading=tp.名称 in _紧凑阅读表)
     待处理 = 簿.取表("待处理事项")
-    for v in 待处理.验证:
-        for row in _sqref行(v.get("sqref", "")):
-            待处理.后覆盖[(row, 8)] = 格样式(填充色="FFF2CC", 填充类型="solid")
+    待处理.盖格(1, 8, 格样式(批注=("可自由输入核查结论，例如已查明原因、存在差异、资料不足；也可留空。填写不改变程序配对、金额或覆盖率。", "填写说明")))
+    待处理.盖格(1, 10, 格样式(批注=("记录核查依据、原始凭证号及需继续追查的内容；不限于程序列出的参考线索。", "填写说明")))
+    for row in range(2, len(待处理.表) + 2):
+        for col in (8, 10):
+            待处理.后覆盖[(row, col)] = 格样式(填充色="FFF2CC", 填充类型="solid")
     for name in ("待处理事项", "对应明细"):
         t = 簿.取表(name)
         hs = _列定位(t)

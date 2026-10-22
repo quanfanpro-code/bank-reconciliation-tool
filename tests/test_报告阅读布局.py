@@ -7,7 +7,7 @@ from tests._excel假面 import get_column_letter
 from tests.test_人工结果计算 import _报告
 
 
-可见表 = {'核对总览','待处理事项','月度核对','每日统计','对应明细','事项证据','每日差异证据','非工作日交易'}
+可见表 = {'核对总览','待处理事项','月度核对','每日统计','对应明细','事项证据','每日差异证据','非工作日交易','其他对应线索'}
 原始金额列 = ('银行收入','银行支出','序时账收入','序时账支出')
 
 
@@ -102,7 +102,7 @@ def test_人工组只在主行填一次且原组成展开替代金额不混加(t
         待办头=_头(待办)
         本项=[number for number,row in _行(待办) if row['事项编号']=='M1']
         assert len(本项)==1
-        assert any(待办.cell(本项[0],待办头['人工核对结果']).coordinate in validation.sqref for validation in 待办.data_validations.dataValidation)
+        assert '核查结论' in 待办头 and not 待办.data_validations.dataValidation
         original=[(number,row) for number,row in rows if row['行别'] in ('银行组成','序时账组成')]
         assert len(original)==5
         assert all(not sheet.row_dimensions[number].hidden for number,_ in original)
@@ -154,19 +154,19 @@ def test_展开组主行可直接阅读双方日期范围和业务摘要(tmp_pat
 from tests.test_人工结果计算 import excel, _打开, _选择, _表
 
 
-def test_逐笔可见结果随否定和替代反映原始双方当前去向(excel,tmp_path):
+def test_逐笔可见结果回显自由核查结论但不改变配对(excel,tmp_path):
     path=_报告(tmp_path,[100],[100,100],[((0,),(0,))],[(0,(0,),(1,))])
     with _打开(excel,path) as book:
         _选择(excel,book,'M1','否定对应')
         row=next(row for row in _表(book,'逐笔核对') if row['事项编号']=='M1')
-        assert '否定' in row['当前核对结论'] and '已确认' not in row['当前核对结论']
+        assert '已记录核查结论' in row['当前核对结论'] and '已确认' not in row['当前核对结论']
         _选择(excel,book,'M1','采用其他对应1')
         row=next(row for row in _表(book,'逐笔核对') if row['事项编号']=='M1')
-        assert '银行：' in row['当前核对结论'] and '序时账：' in row['当前核对结论']
-        assert '已确认' in row['当前核对结论'] and '未对应' in row['当前核对结论']
+        assert '已记录核查结论' in row['当前核对结论']
+        assert all(not r['当前对应'] for r in _表(book, '核对明细'))
 
 
-def test_原逐笔双方同被新组采用显示新组核对编号(excel,tmp_path,monkeypatch):
+def test_参考线索不替换原程序已确认逐笔关系(excel,tmp_path,monkeypatch):
     from data_structures import ProcessingStatus,RiskLevel
     from reporter import Reporter
     generate=Reporter.generate_report
@@ -184,7 +184,7 @@ def test_原逐笔双方同被新组采用显示新组核对编号(excel,tmp_pat
         source=next(row for row in _表(book,'逐笔核对') if row['事项编号']=='M1')
         target=next(row for row in _表(book,'复核事项索引') if row['事项编号']=='M2')
         text=source['当前核对结论']
-        assert str(target['核对编号']) in text and '对应' in text
+        assert '程序已确认对应' in text
         assert '未对应' not in text and '待人工' not in text
 
 
@@ -237,7 +237,7 @@ def test_人工表排序后Excel计算跳转目标仍指向本事项填写格(ex
             cell.Hyperlinks(1).Follow(NewWindow=False,AddHistory=False)
         assert excel.ActiveSheet.Name=='待处理事项'
         assert manual.Cells(excel.ActiveCell.Row,headers.index('事项编号')+1).Value=='M1'
-        assert excel.ActiveCell.Column==headers.index('人工核对结果')+1
+        assert excel.ActiveCell.Column==headers.index('核查结论')+1
 
 def test_空数据真实报告月度只有表头且不造零余额或年度合计(tmp_path):
     from data_structures import MatcherConfig
@@ -259,7 +259,7 @@ def test_空数据真实报告月度只有表头且不造零余额或年度合�
         assert not any('年合计' in str(cell.value or '') for row in monthly for cell in row)
 
 
-def test_原整组被新组采用后主行不误称全未对应且组成显示新编号(excel,tmp_path,monkeypatch):
+def test_人工文字不改变程序已确认整组及其组成(excel,tmp_path,monkeypatch):
     from data_structures import ProcessingStatus,RiskLevel
     from reporter import Reporter
     generate=Reporter.generate_report
@@ -277,45 +277,45 @@ def test_原整组被新组采用后主行不误称全未对应且组成显示�
         rows=[row for row in _表(book,'整组核对') if row['事项编号']=='M1']
         main=next(row for row in rows if row['行别']=='核对事项')
         assert '未对应' not in main['当前核对结论']
-        assert '替代' in main['当前核对结论'] and '展开' in main['当前核对结论']
+        assert '程序已确认对应' in main['当前核对结论']
         target=next(row for row in _表(book,'复核事项索引') if row['事项编号']=='M2')
         children=[row for row in rows if row['行别'] in ('银行组成','序时账组成')]
         assert len(children)==4
-        assert all(str(target['核对编号']) in row['当前核对结论'] for row in children)
+        assert all('程序已确认对应' in row['当前核对结论'] for row in children)
 
 
-def test_采用候选一后候选二说明行不冒用事项已确认结论(excel,tmp_path):
+def test_填写结论后参考线索不冒用事项已确认结论(excel,tmp_path):
     path=_报告(tmp_path,[100],[100,100,100],[((0,),(0,))],[(0,(0,),(1,)),(0,(0,),(2,))])
     with _打开(excel,path) as book:
         _选择(excel,book,'M1','采用其他对应1')
         rows=[row for row in _表(book,'人工全查') if row['事项编号']=='M1']
-        candidate_two=[row for row in rows if row['行别']=='其他对应2']
+        candidate_two=[row for row in rows if row['行别']=='参考线索2']
         assert candidate_two
         assert all('已确认' not in str(row['当前核对结论'] or '') for row in candidate_two)
 
 
-def test_原人工整组先否定后成员由新组采用不误称全未对应(excel,tmp_path):
+def test_两项核查文字分别回显而不改组内交易去向(excel,tmp_path):
     path=_报告(tmp_path,[100,200,300],[100,200,300],[((0,1),(0,1)),((2,),(2,))],[(1,(0,1,2),(0,1,2))])
     with _打开(excel,path) as book:
         _选择(excel,book,'M1','否定对应')
         _选择(excel,book,'M2','采用其他对应1')
         rows=[row for row in _表(book,'整组核对') if row['事项编号']=='M1']
         main=next(row for row in rows if row['行别']=='核对事项')
-        assert '否定' in main['当前核对结论'] and '展开' in main['当前核对结论']
+        assert '已记录核查结论' in main['当前核对结论']
         assert '记录恢复未对应' not in main['当前核对结论']
-        assert all('002' in row['当前核对结论'] for row in rows if row['行别']!='核对事项')
+        assert all('已记录核查结论' in row['当前核对结论'] for row in rows if row['行别']!='核对事项')
         manual=next(row for row in _表(book,'人工全查') if row['事项编号']=='M1' and row['行别']=='核对事项')
-        assert '否定' in manual['当前核对结论'] and '展开' in manual['当前核对结论']
+        assert '已记录核查结论' in manual['当前核对结论']
         assert '记录恢复未对应' not in manual['当前核对结论']
 
 
-def test_原人工逐笔先否定后成员由新组采用提示查看逐笔当前去向(excel,tmp_path):
+def test_人工逐笔与核查记录保持同一事项而不跳到候选组(excel,tmp_path):
     path=_报告(tmp_path,[100,200],[100,200],[((0,),(0,)),((1,),(1,))],[(1,(0,1),(0,1))])
     with _打开(excel,path) as book:
         _选择(excel,book,'M1','否定对应')
         _选择(excel,book,'M2','采用其他对应1')
         main=next(row for row in _表(book,'人工全查') if row['事项编号']=='M1' and row['行别']=='核对事项')
-        assert '否定' in main['当前核对结论'] and '逐笔核对' in main['当前核对结论']
+        assert '已记录核查结论' in main['当前核对结论']
         assert '记录恢复未对应' not in main['当前核对结论'] and '展开' not in main['当前核对结论']
         pair=next(row for row in _表(book,'逐笔核对') if row['事项编号']=='M1')
-        assert '002' in pair['当前核对结论'] and '已确认' in pair['当前核对结论']
+        assert '已记录核查结论' in pair['当前核对结论'] and '已确认' not in pair['当前核对结论']

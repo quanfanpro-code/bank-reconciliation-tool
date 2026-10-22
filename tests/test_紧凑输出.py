@@ -117,27 +117,27 @@ def _输入(excel, book, identity, result):
     headers = list(values[0])
     for row, values in enumerate(values[1:], 2):
         if values[headers.index('事项编号')] == identity:
-            sheet.Cells(row, headers.index('人工核对结果') + 1).Value = result
+            sheet.Cells(row, headers.index('核查结论') + 1).Value = result
             excel.CalculateFullRebuild()
             return
     raise AssertionError(identity)
 
 
-def test_Excel中新的唯一输入仍驱动原有公式(excel, tmp_path):
+def test_Excel自由结论只更新进度并保留差额(excel, tmp_path):
     path = _报告(tmp_path, [100], [90], [((0,), (0,))])
     with _打开(excel, path) as book:
         assert _表(book, '待处理事项')[0]['当前结果'] == '待核对'
-        _输入(excel, book, 'M1', '确认对应并保留差额')
+        _输入(excel, book, 'M1', '差额已查明，详见备注')
         summary = {row['项目']: row['结果'] for row in _表(book, '核对总览')}
-        assert summary['还需人工核对'] == 0
-        assert summary['已完成人工核对'] == 1
+        assert summary['尚未记录核查结论'] == 0
+        assert summary['已记录核查结论'] == 1
         assert summary['银行金额已对平比例'] == 0
         assert summary['非工作日银行收付笔数'] == 1
         assert summary['非工作日银行收款金额'] == 100
         assert _表(book, '待处理事项')[0]['收入差额'] == 10
-        assert _表(book, '待处理事项')[0]['当前结果'] == '已确认，差额保留'
-        _输入(excel, book, 'M1', '否定对应')
-        assert _表(book, '待处理事项')[0]['当前结果'] == '已取消对应'
+        assert '已记录核查结论' in _表(book, '待处理事项')[0]['当前结果']
+        _输入(excel, book, 'M1', '仍有差异，等待补资料')
+        assert '已记录核查结论' in _表(book, '待处理事项')[0]['当前结果']
         assert all(not row['当前对应'] for row in _表(book, '核对明细'))
 
 
@@ -147,7 +147,7 @@ def test_待处理表排序后仍按事项编号引用人工输入(excel, tmp_pa
         sheet = book.Worksheets('待处理事项')
         # 模拟按整行排序，公式相对位置由Excel处理；静态输入和编号随整行移动。
         headers = list(sheet.UsedRange.Value[0])
-        for label in ('事项编号', '人工核对结果'):
+        for label in ('事项编号', '核查结论'):
             column = headers.index(label) + 1
             a, b = sheet.Cells(2, column).Value, sheet.Cells(3, column).Value
             sheet.Cells(2, column).Value, sheet.Cells(3, column).Value = b, a

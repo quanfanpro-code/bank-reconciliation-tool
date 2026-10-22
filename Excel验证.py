@@ -24,19 +24,30 @@ def 检查人工填写区(路径):
             if c.get('t') == 'inlineStr':
                 return ''.join(t.text or '' for t in c.iter(ns+'t'))
             return v or ''
-        数据 = ET.fromstring(包.read(目标)).find(ns+'sheetData')
+        根 = ET.fromstring(包.read(目标))
+        数据 = 根.find(ns+'sheetData')
         if 数据 is None or not len(数据):
             return 0
         列名 = {''.join(x for x in c.get('r') if x.isalpha()): 值(c) for c in 数据[0]}
-        if '人工核对结果' not in 列名.values():
-            raise RuntimeError('填写区缺少人工核对结果列，未交付报告')
+        if not {'人工核对结果', '核查结论'} & set(列名.values()):
+            raise RuntimeError('填写区缺少核查结论列，未交付报告')
+        if '核查结论' in 列名.values():
+            from 直读XML import 字母转列
+            填写列 = {字母转列(c) for c, name in 列名.items() if name in ('核查结论', '备注')}
+            for v in 根.findall(ns+'dataValidations/'+ns+'dataValidation'):
+                for ref in v.get('sqref', '').split():
+                    两端 = ref.split(':')
+                    起 = 字母转列(''.join(x for x in 两端[0] if x.isalpha()))
+                    末 = 字母转列(''.join(x for x in 两端[-1] if x.isalpha()))
+                    if any(起 <= c <= 末 for c in 填写列):
+                        raise RuntimeError(f'填写区 {ref} 仍有下拉或输入限制，未交付报告')
         行数 = 0
         for row in list(数据)[1:]:
             行数 += 1
             for c in row:
                 字段 = 列名.get(''.join(x for x in c.get('r') if x.isalpha()))
                 文 = str(值(c)).lstrip("' \t\r\n")
-                if 字段 == '人工核对结果' and (c.find(ns+'f') is not None or 文.startswith('=')):
+                if 字段 in ('人工核对结果', '核查结论') and (c.find(ns+'f') is not None or 文.startswith('=')):
                     raise RuntimeError(f'填写区 待处理事项!{c.get("r")} 包含公式或公式文本，未交付报告')
                 if 字段 == '备注' and 文.startswith('=IF(') and 'INDEX(' in 文 and '待处理事项' in 文:
                     raise RuntimeError(f'填写区 待处理事项!{c.get("r")} 包含程序回显公式，未交付报告')

@@ -69,7 +69,7 @@ def build_display_tables(tables):
     index = tables['复核事项索引'].to_dict('records')
     originals = {row['事项编号']: row for name in ('人工全查', '人工抽样') for row in tables[name].to_dict('records') if row['行别'] == '核对事项'}
     alternatives = defaultdict(list)
-    for record in tables['其他对应供选择'].to_dict('records'):
+    for record in tables['其他对应线索'].to_dict('records'):
         alternatives[record['事项编号']].append(record)
     pair_rows, group_rows, single_rows = [], [], []
     manual_rows = {'人工全查': [], '人工抽样': []}
@@ -92,14 +92,14 @@ def build_display_tables(tables):
             manual_rows[mode].append(main)
             if grouped:
                 manual_rows[mode].extend(_组成(item, records))
-            # 一套候选只列一行摘要，完整组成集中保留在其他对应供选择。
+            # 一套候选只列一行摘要，完整组成集中保留在线索表。
             候选组 = defaultdict(list)
             for other in alternatives[item['事项编号']]:
-                候选组[other['可选结果']].append(other)
+                候选组[other['线索编号']].append(other)
             for label, group in 候选组.items():
                 行 = {'核对编号': item['核对编号'], '事项编号': item['事项编号'],
                      '行别': label.replace('采用', ''), '核对原因': group[0]['关系说明'],
-                     '原始出处': '完整组成集中见其他对应供选择；候选不是新增交易'}
+                     '原始出处': '完整组成见其他对应线索；仅供参考，不要求选择，也不是新增交易'}
                 for side, source in (('银行', '银行流水'), ('序时账', '序时账')):
                     组成 = [r for r in group if r['来源'] == source]
                     收, 支 = _收支(组成)

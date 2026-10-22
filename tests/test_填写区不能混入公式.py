@@ -30,7 +30,7 @@ def test_排版不修改调用者的业务表且重复生成仍为空白():
     for name in tables:
         pd.testing.assert_frame_equal(tables[name], before[name], obj=name)
     again = 生成簿计划(SimpleNamespace(), tables)
-    assert again.取表('待处理事项').表['人工核对结果'].isna().all()
+    assert again.取表('待处理事项').表['核查结论'].isna().all()
 
 
 @pytest.mark.parametrize('前缀', ['', "'"])
@@ -41,7 +41,7 @@ def test_旧回显公式不得迁入人工输入(前缀):
     tables['人工全查'].loc[mask, '人工核对结果'] = mirror
     tables['人工全查'].loc[mask, '备注'] = mirror.replace('$H$', '$J$')
     pending = 生成簿计划(SimpleNamespace(), tables).取表('待处理事项').表
-    assert pending['人工核对结果'].isna().all()
+    assert pending['核查结论'].isna().all()
     assert pending['备注'].isna().all()
 
 
@@ -51,7 +51,7 @@ def test_真实人工选择与备注保留():
     tables['人工全查'].loc[mask, '人工核对结果'] = '确认对应'
     tables['人工全查'].loc[mask, '备注'] = '已核对原始凭证'
     pending = 生成簿计划(SimpleNamespace(), tables).取表('待处理事项').表
-    assert pending.iloc[0]['人工核对结果'] == '确认对应'
+    assert pending.iloc[0]['核查结论'] == '确认对应'
     assert pending.iloc[0]['备注'] == '已核对原始凭证'
 
 
