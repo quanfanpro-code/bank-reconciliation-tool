@@ -15,7 +15,7 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 
 from data_structures import OverallControlResult
-from utils import clean_excel_string
+from utils import clean_excel_string, parse_date
 
 
 SUPPORTED_SUFFIXES = {".xlsx", ".xls", ".csv"}
@@ -574,21 +574,45 @@ def _error_count(
     )
 
 
-NON_TRANSACTION_KEYWORDS = (
-    "合计",
-    "累计",
-    "小计",
-    "总计",
-    "日计",
-    "月计",
-    "年计",
-    "期初",
-    "期末",
-    "承前页",
-    "过次页",
-    "统计",
-)
 NOTE_PREFIXES = ("注：", "说明：", "备注：", "单位：", "制表：")
+
+
+def is_summary_label(value: Any) -> bool:
+    """只认整格统计标签，不能用业务文字中包含关键词代替判断。"""
+    text = unicodedata.normalize("NFKC", _cell_text(value)).rstrip(":").strip()
+    return text in SUMMARY_ROW_KEYWORDS or text == "统计" or bool(
+        re.fullmatch(r"(?:(?:\d{4}年)?\d{1,2}月|\d{4}年)(?:合计|累计|小计|总计)", text)
+    )
+
+
+def summary_row_mask(
+    frame: pd.DataFrame,
+    mapping: dict[str, Any],
+    date_format: str = "auto",
+) -> pd.Series:
+    """加载清理和输入检查共用判断，空日期汇总不受统计笔数干扰。"""
+    if frame.empty:
+        return pd.Series(False, index=frame.index, dtype=bool)
+    labels = frame.apply(lambda column: column.map(is_summary_label))
+    date_column = mapping.get("date")
+    valid_date = (
+        frame[date_column].map(lambda value: parse_date(value, date_format) is not None)
+        if date_column in frame.columns
+        else pd.Series(False, index=frame.index)
+    )
+    summary_column = mapping.get("summary")
+    explicit_summary = (
+        labels[summary_column]
+        if summary_column in frame.columns
+        else pd.Series(False, index=frame.index)
+    )
+    voucher_column = mapping.get("voucher")
+    voucher_blank = (
+        frame[voucher_column].map(lambda value: not _cell_text(value))
+        if voucher_column in frame.columns
+        else pd.Series(True, index=frame.index)
+    )
+    return (labels.any(axis=1) & ~valid_date) | (explicit_summary & voucher_blank)
 
 
 def _non_transaction_mask(
@@ -602,10 +626,6 @@ def _non_transaction_mask(
         lambda row: " ".join(_cell_text(value) for value in row),
         axis=1,
     )
-    generic_summary_or_note = combined.str.contains(
-        "|".join(re.escape(word) for word in NON_TRANSACTION_KEYWORDS),
-        na=False,
-    ) | combined.str.startswith(NOTE_PREFIXES)
     column_names = {str(column).strip() for column in frame.columns}
     repeated_header = frame.apply(
         lambda row: sum(
@@ -622,16 +642,16 @@ def _non_transaction_mask(
         if date_column in frame.columns
         else pd.Series(pd.NaT, index=frame.index)
     )
-    summary_column = mapping.get("summary")
-    explicit_summary = (
-        frame[summary_column].map(_cell_text).isin(SUMMARY_ROW_KEYWORDS)
-        if summary_column in frame.columns
-        else pd.Series(False, index=frame.index)
-    )
-    summary = explicit_summary | (generic_summary_or_note & dates.isna())
+    summary = summary_row_mask(frame, mapping)
+    note = combined.str.startswith(NOTE_PREFIXES) & dates.isna()
     nonempty_counts = frame.map(lambda value: bool(_cell_text(value))).sum(axis=1)
-    title_or_note = (nonempty_counts == 1) & dates.isna()
-    return empty | summary | repeated_header | title_or_note
+    amount_content = pd.Series(False, index=frame.index)
+    for key in ("amount", "debit", "credit"):
+        column = mapping.get(key)
+        if column in frame.columns:
+            amount_content |= frame[column].map(lambda value: bool(_cell_text(value)))
+    title_or_note = (nonempty_counts == 1) & dates.isna() & ~amount_content
+    return empty | summary | note | repeated_header | title_or_note
 
 
 def _auxiliary_result(

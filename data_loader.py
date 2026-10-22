@@ -21,6 +21,8 @@ from input_precheck import (
     SUMMARY_ROW_KEYWORDS as PRECHECK_SUMMARY_ROW_KEYWORDS,
     TableStructure,
     detect_table_structure,
+    is_summary_label,
+    summary_row_mask,
 )
 from utils import (
     parse_date,
@@ -649,6 +651,27 @@ class DataLoader:
                 + 1
             )
 
+        # 汇总标签可能位于月份等其他列，须在日期补齐前统一排除并留痕。
+        summary_rows = summary_row_mask(
+            working_df[original_source_columns], mapping, date_format,
+        )
+        if summary_rows.any():
+            if self.logger:
+                self.logger(f"过滤掉 {int(summary_rows.sum())} 行明确汇总记录")
+            if self.error_collector:
+                for idx in working_df.index[summary_rows]:
+                    row_data = working_df.loc[idx]
+                    labels = [str(row_data[column]) for column in original_source_columns
+                              if is_summary_label(row_data[column])]
+                    self.error_collector.record_dropped_summary_row(
+                        row_idx=int(row_data['__file_row__']),
+                        reason="明确汇总标签：" + "；".join(labels),
+                        original_data={column: row_data[column] for column in original_source_columns
+                                       if pd.notna(row_data[column])},
+                        source_type=source_type,
+                    )
+            working_df = working_df.loc[~summary_rows].copy()
+
         # 0. 针对日记账自动执行数据清洗（跳过标题行、过滤汇总行）
         if source_type == 'journal':
             cleaner = DataCleaner(logger=self.logger)
@@ -663,43 +686,9 @@ class DataLoader:
         data['original_idx'] = data['__source_row__']
         data['original_file_row'] = data['__file_row__']
         
-        # 1.5 在ffill之前，先过滤掉明确的汇总行（本期合计、本年累计等）
         date_col = mapping.get('date')
         voucher_col = mapping.get('voucher')
         summary_col = mapping.get('summary')
-        
-        if summary_col and summary_col in data.columns:
-            # 摘要精确匹配汇总关键词
-            summary_text = data[summary_col].astype(str).str.strip()
-            is_summary_keyword = summary_text.isin(self.SUMMARY_ROW_KEYWORDS)
-            
-            # 凭证号为空（如果有的话）
-            voucher_is_empty = pd.Series([True] * len(data))
-            if voucher_col and voucher_col in data.columns:
-                voucher_is_empty = data[voucher_col].isna()
-                voucher_str = data[voucher_col].astype(str).str.strip()
-                voucher_is_empty = voucher_is_empty | (voucher_str == '') | (voucher_str.str.lower() == 'nan')
-            
-            # 明确的汇总标签即使带日期也不是交易；凭证号非空时保守保留。
-            is_summary_row = is_summary_keyword & voucher_is_empty
-            
-            if is_summary_row.any():
-                filtered_count = is_summary_row.sum()
-                if self.logger:
-                    self.logger(f"过滤掉 {filtered_count} 行汇总记录（本期合计/本年累计等）")
-                if self.error_collector:
-                    for idx in data[is_summary_row].index:
-                        row_data = data.loc[idx].to_dict()
-                        summary_text_val = str(row_data.get(summary_col, ''))
-                        self.error_collector.record_dropped_summary_row(
-                            row_idx=int(row_data.get('__file_row__', idx + 1 + int(skiprows_offset))),
-                            reason=f"摘要匹配汇总关键词: {summary_text_val}",
-                            original_data={k: v for k, v in row_data.items() if k not in {'__source_row__', 'original_idx'} and pd.notna(v)},
-                            source_type=source_type,
-                        )
-                data = data[~is_summary_row].copy()
-                data['original_idx'] = data['__source_row__']
-                data['original_file_row'] = data['__file_row__']
         
         all_parse_failures: List[Dict[str, Any]] = []
         
