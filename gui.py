@@ -21,7 +21,7 @@ import pandas as pd
 
 from data_structures import MatcherConfig
 from data_loader import DataLoader, ParseErrorCollector
-from input_precheck import InputPrecheckBlockedError, InputPrecheckReport
+from input_precheck import InputPrecheckBlockedError, InputPrecheckReport, _mapping_problems, direction_column, split_amount_role
 from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
@@ -168,18 +168,11 @@ def _auto_mapping_for_columns(
                 return label
         return None
 
-    debit = find(
-        ["借", "支出", "debit"]
-        if is_bank
-        else ["借方", "借", "debit"]
-    )
-    credit = find(
-        ["贷", "收入", "credit"]
-        if is_bank
-        else ["贷方", "贷", "credit"]
-    )
+    source = "bank" if is_bank else "journal"
+    debit = next((label for label in labels if split_amount_role(label, source) == "debit"), None)
+    credit = next((label for label in labels if split_amount_role(label, source) == "credit"), None)
     amount = find(["金额", "amount", "发生额"])
-    direction = find(["方向", "借贷标志"])
+    direction = next((label for label in labels if direction_column(label)), None)
     if debit and credit and debit != credit:
         mode = "debit_credit"
     elif amount and direction:
@@ -462,6 +455,7 @@ class ColumnMappingFrame(ctk.CTkFrame):
         for w in self.grid_frame.winfo_children():
             w.destroy()
         self.vars = {}
+        defaults = _auto_mapping_for_columns(self.columns, is_bank=self.is_bank)
 
         row_idx = 0
 
@@ -476,6 +470,12 @@ class ColumnMappingFrame(ctk.CTkFrame):
                 row=row_idx, column=1, sticky="ew", padx=(4, 0), pady=2
             )
             self.vars[key] = var
+
+            if key in {"debit", "credit", "amount", "direction"}:
+                if defaults[key] is not None:
+                    var.set(defaults[key])
+                row_idx += 1
+                return
 
             # 自动匹配列名
             normalized_cols = {str(c).strip().lower(): c for c in self.columns}
@@ -2067,7 +2067,7 @@ class ReconciliationApp(ctk.CTk):
                 is_bank=False,
             )
         saved = self.project_store.load_mapping_template(target, columns)
-        if saved and isinstance(saved.get("mapping"), dict):
+        if saved and isinstance(saved.get("mapping"), dict) and not _mapping_problems(saved["mapping"], columns, target):
             if target == "bank":
                 self.bank_mapping_state = dict(saved["mapping"])
             else:

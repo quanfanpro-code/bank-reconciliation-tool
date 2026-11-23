@@ -16,6 +16,7 @@ import bisect
 import secrets
 import time
 import unicodedata
+from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -1024,7 +1025,9 @@ class Matcher:
                  progress_callback: Optional[Callable[[float], None]] = None,
                  whitelist_rules: Optional[Dict[str, List[str]]] = None,
                  llm_assistant: Any = None,
-                 overall_control: Optional[OverallControlResult] = None):
+                 overall_control: Optional[OverallControlResult] = None,
+                 verified_balance_pairs: Optional[Dict[Tuple[int, int], str]] = None,
+                 balance_scope_verified: bool = False):
         self.bank = bank_df.copy()
         self.journal = journal_df.copy()
         self.bank['date'] = pd.to_datetime(self.bank['date'])
@@ -1063,6 +1066,10 @@ class Matcher:
         self.whitelist_rules = whitelist_rules if whitelist_rules else self.WHITELIST_RULES
         self.llm_assistant = llm_assistant
         self.overall_control = overall_control
+        self.verified_balance_pairs = verified_balance_pairs or {}
+        self.balance_scope_verified = balance_scope_verified
+        self._locked_candidates: List[MatchCandidate] = []
+        self._locked_rows: Dict[str, Set[int]] = {"bank": set(), "journal": set()}
         self.overall_scope_limited = bool(
             overall_control is not None and overall_control.scope_limited
         )
@@ -1547,6 +1554,8 @@ class Matcher:
         journal_tuple = tuple(sorted(int(index) for index in journal_idxs))
         if not bank_tuple or not journal_tuple:
             return None
+        if self._locked_rows["bank"].intersection(bank_tuple) or self._locked_rows["journal"].intersection(journal_tuple):
+            return None
         index_key = self._candidate_id(match_type, bank_tuple, journal_tuple)
         if index_key in self._candidate_index_keys:
             return None
@@ -1623,33 +1632,20 @@ class Matcher:
                 [self._business_rows["journal"][index] for index in journal_tuple],
             )
         )
-        if self.overall_scope_limited:
-            candidate.evidence["overall_scope_limited"] = True
-            candidate.evidence["overall_control_reasons"] = list(
-                self.overall_control.reasons
-            )
-        elif self.overall_control is not None and self.overall_control.affected_windows:
-            candidate_days = [
-                pd.Timestamp(self.bank.loc[index, "date"]).normalize()
-                for index in bank_tuple
-                if pd.notna(self.bank.loc[index, "date"])
-            ] + [
-                pd.Timestamp(self.journal.loc[index, "date"]).normalize()
-                for index in journal_tuple
-                if pd.notna(self.journal.loc[index, "date"])
-            ]
-            hit_windows = [
-                window
-                for window in self.overall_control.affected_windows
-                if any(window[0] <= day <= window[1] for day in candidate_days)
-            ]
-            if hit_windows:
-                candidate.evidence["overall_scope_limited"] = True
-                candidate.evidence["overall_control_reasons"] = [
-                    f"余额连续性在{window[1]:%Y-%m-%d}断档，仅断档窗口"
-                    f"（{window[0]:%Y-%m-%d}至{window[1]:%Y-%m-%d}）内关系降级"
-                    for window in hit_windows
-                ]
+        verified_balance = None
+        if len(bank_tuple) == len(journal_tuple) == 1:
+            verified_balance = self.verified_balance_pairs.get((bank_tuple[0], journal_tuple[0]))
+        if verified_balance:
+            candidate.evidence["verified_balance_match"] = verified_balance
+            candidate.evidence["business_strength"] = max(3, candidate.evidence.get("business_strength", 0))
+        if (verified_balance or match_type == "balanced_window") and candidate.evidence.get("business_conflicts") == ("批量业务与其他用途混合",):
+            bank_rows = [self._business_rows["bank"][idx] for idx in bank_tuple]
+            journal_rows = [self._business_rows["journal"][idx] for idx in journal_tuple]
+            payees = set.intersection(*(set(row["parties"].get("对方户名", ())) for row in bank_rows))
+            if (len(journal_rows) == 1 and len(payees) == 1
+                    and all(row["sign"] < 0 and row["batch_category"] in ("报销", "员工报销") for row in bank_rows)
+                    and re.search(r"费用|餐费|招待费|差旅费|交通费|住宿费|办公费", journal_rows[0]["summary"])):
+                candidate.evidence["business_conflicts"] = ()
         self._refresh_atomic_candidate_eligibility(candidate)
         self._score_existing_candidate(candidate)
         self.candidates.append(candidate)
@@ -2272,15 +2268,21 @@ class Matcher:
 
     def _commit_selected_candidates(self) -> None:
         """统一完成排序、占用、稳定编号和旧字段回填。"""
+        self.candidates = [c for c in self.candidates if (
+            not self._locked_rows["bank"].intersection(c.bank_idxs)
+            and not self._locked_rows["journal"].intersection(c.journal_idxs)
+            and (c.metrics.total_diff_li == 0 or c.evidence.get("business_strength", 0) >= 2)
+        )]
         self._add_closed_candidate_groups()
         self._refresh_candidate_ambiguity()
         self._apply_llm_assistance()
         selection_diagnostics: Dict[str, Any] = {}
-        self.selected_candidates = select_non_conflicting_candidates(
+        self.selected_candidates = self._locked_candidates + select_non_conflicting_candidates(
             self.candidates,
             diagnostics=selection_diagnostics,
             should_stop=lambda: self.stopping,
         )
+        self.candidates = self._locked_candidates + self.candidates
         self.run_parameters["selection_optimization"] = selection_diagnostics
         final_id_counts: Dict[str, int] = {}
         for candidate in self.selected_candidates:
@@ -2560,12 +2562,113 @@ class Matcher:
             [0, 1],
         )
 
+    def _lock(self, candidate: MatchCandidate) -> None:
+        self._locked_candidates.append(candidate)
+        self._locked_rows["bank"].update(candidate.bank_idxs)
+        self._locked_rows["journal"].update(candidate.journal_idxs)
+
+    def _lock_direct_matches(self) -> None:
+        eligible = [c for c in self.candidates if c.match_type == "exact_1to1"
+                    and not c.evidence.get("selection_ineligible") and not has_business_conflict(c)
+                    and (c.evidence.get("verified_balance_match") or c.evidence.get("business_strength", 0) >= 2)]
+        priorities = (
+            [c for c in eligible if c.evidence.get("verified_balance_match")],
+            [c for c in eligible if not c.evidence.get("verified_balance_match")],
+        )
+        for candidates in priorities:
+            possible = [c for c in candidates if c.bank_idxs[0] not in self._locked_rows["bank"]
+                        and c.journal_idxs[0] not in self._locked_rows["journal"]]
+            bank_counts = Counter(c.bank_idxs[0] for c in possible)
+            journal_counts = Counter(c.journal_idxs[0] for c in possible)
+            for candidate in possible:
+                if bank_counts[candidate.bank_idxs[0]] == journal_counts[candidate.journal_idxs[0]] == 1:
+                    if route_candidate(candidate, self.config)[0] == ProcessingStatus.AUTO_CONFIRMED:
+                        self._lock(candidate)
+
+    @staticmethod
+    def _daily_postings(frame):
+        """按原文件顺序复核余额链，再按原日期保留每笔交易。"""
+        if frame.empty or "balance" not in frame or frame["balance"].isna().any():
+            return None
+        rows = frame.sort_values("original_file_row", kind="stable")
+        days = pd.to_datetime(rows["date"]).dt.normalize()
+        if not days.is_monotonic_increasing:
+            return None
+        postings = {}
+        initial = PrecisionEngine.to_integer_li(rows.iloc[0]["balance"]) - int(rows.iloc[0]["amount_decimal"])
+        previous = initial
+        for index, day, amount, balance in zip(rows.index, days, rows["amount_decimal"], rows["balance"]):
+            ending = PrecisionEngine.to_integer_li(balance)
+            if previous + int(amount) != ending:
+                return None
+            postings.setdefault(day, []).append((int(index), int(amount), ending))
+            previous = ending
+        return initial, postings
+
+    def _lock_balanced_windows(self) -> None:
+        if not self.balance_scope_verified:
+            return
+        bank, journal = self._daily_postings(self.bank), self._daily_postings(self.journal)
+        if bank is None or journal is None or bank[0] != journal[0]:
+            return
+        bank_balance, journal_balance = bank[0], journal[0]
+        bank_remaining, journal_remaining = [], []
+        for day in sorted(bank[1].keys() | journal[1].keys()):
+            bank_day, journal_day = bank[1].get(day, ()), journal[1].get(day, ())
+            if bank_day:
+                bank_balance = bank_day[-1][2]
+            if journal_day:
+                journal_balance = journal_day[-1][2]
+            bank_remaining.extend((idx, amount) for idx, amount, _ in bank_day if idx not in self._locked_rows["bank"])
+            journal_remaining.extend((idx, amount) for idx, amount, _ in journal_day if idx not in self._locked_rows["journal"])
+            if bank_balance == journal_balance:
+                self._match_window_remainder(bank_remaining, journal_remaining)
+                bank_remaining.clear()
+                journal_remaining.clear()
+
+    def _match_window_remainder(self, bank, journal) -> None:
+        def by_amount(entries):
+            grouped = {}
+            for idx, amount in entries:
+                if amount:
+                    grouped.setdefault(amount, []).append(idx)
+            return grouped
+
+        b, j = by_amount(bank), by_amount(journal)
+        for amount in b.keys() & j.keys():
+            if len(b[amount]) == len(j[amount]) == 1:
+                self._lock_balance_relationship(b[amount], j[amount])
+
+        for direction in (1, -1):
+            b_rows = [(idx, value) for idx, value in bank if value * direction > 0 and idx not in self._locked_rows["bank"]]
+            j_rows = [(idx, value) for idx, value in journal if value * direction > 0 and idx not in self._locked_rows["journal"]]
+            if min(len(b_rows), len(j_rows)) != 1 or max(len(b_rows), len(j_rows)) == 1:
+                continue
+            if sum(value for _, value in b_rows) == sum(value for _, value in j_rows):
+                self._lock_balance_relationship([idx for idx, _ in b_rows], [idx for idx, _ in j_rows])
+
+    def _lock_balance_relationship(self, bank_idxs, journal_idxs) -> None:
+        candidate = self._add_candidate(bank_idxs, journal_idxs, "balanced_window", "余额核对")
+        if candidate is None:
+            return
+        if candidate.date_span_days > self.config.tolerance_days or has_business_conflict(candidate):
+            candidate.evidence["selection_ineligible"] = True
+            return
+        candidate.evidence.update(
+            verified_reconciliation="这段交易前后余额一致，其余已对上的交易扣除后，剩下这些记录的收付金额相同。",
+            business_strength=3,
+        )
+        candidate.evidence.pop("selection_ineligible", None)
+        self._lock(candidate)
+
     def run(self) -> List[Dict[str, Any]]:
         candidate_steps = [
-            ("退款冲销重付、重复与手续费净额", self.match_special_business_events),
-            ("业务完整组匹配", self.match_business_groups),
             ("白名单规则匹配", self.match_whitelist_rules),
             ("精确匹配", self.match_exact_1to1),
+            ("确认逐笔对应", self._lock_direct_matches),
+            ("核对余额一致区间内的剩余交易", self._lock_balanced_windows),
+            ("退款冲销重付、重复与手续费净额", self.match_special_business_events),
+            ("业务完整组匹配", self.match_business_groups),
             ("日期容差匹配", self.match_tolerance),
             ("批量聚合匹配", self.match_batch_aggregation),
             ("连续摘要整组匹配", self.match_continuous_summary_groups),

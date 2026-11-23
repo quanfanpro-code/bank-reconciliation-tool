@@ -137,8 +137,12 @@ def row_business(row):
         value for value in parties.get("对方户名", ()) if broad_purpose and value == "税费社保")
     tax_social = {kind for kind, pattern in (("税费", r"税|教育附加"), ("社保公积金", r"社保|公积金"))
                   if re.search(pattern, tax_social_text)}
+    if any(name.endswith("住房公积金管理中心") for name in parties.get("对方户名", ())):
+        tax_social.add("社保公积金")
     row_date = row["date"]
     batch_category = _batch_category(text)
+    if batch_category == "批量收付" and re.search(r"入息|利息|付息", text):
+        batch_category = ""
     salary = batch_category == "工资"
     periods = set()
     if batch_category:

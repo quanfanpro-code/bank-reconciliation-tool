@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import unicodedata
 import json
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
@@ -484,7 +485,24 @@ def _required_columns(mapping: dict[str, Any]) -> list[tuple[str, str]]:
     return required
 
 
-def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any]) -> list[str]:
+def direction_column(label: Any) -> bool:
+    return bool(re.search(r"方向|(?:借贷|收支|收付)(?:标[志记识]|类别|类型)|\bdirection\b", str(label), re.I))
+
+
+def split_amount_role(label: Any, source: str) -> str | None:
+    text = unicodedata.normalize("NFKC", str(label)).strip().lower()
+    if direction_column(text) or re.search(r"余额|balance|合计|累计|标志|标记|标识|笔数", text):
+        return None
+    roles = (
+        ("debit", r"借(?:方)?|支出|付款|出账|取款|debit"),
+        ("credit", r"贷(?:方)?|收入|收款|入账|存款|credit"),
+    ) if source == "bank" else (("debit", r"借(?:方)?|debit"), ("credit", r"贷(?:方)?|credit"))
+    hits = [role for role, pattern in roles if re.search(
+        rf"(?:^|[ /_\-])(?:{pattern})(?=$|[ (（/_\-]|金|发生|本位|原币|额|款)|(?:本位币|原币)(?:{pattern})", text)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any], source: str = "bank") -> list[str]:
     available = set(columns)
     selected = []
     problems = []
@@ -496,8 +514,17 @@ def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any]) -> list[s
             problems.append(f"{label}列不存在：{value}")
         elif value in selected:
             problems.append(f"{label}列与其他必填映射重复：{value}")
+        elif key in {"debit", "credit", "amount"} and direction_column(value):
+            problems.append(f"{value}是方向列，不能作为{label}金额列。")
+        elif key in {"debit", "credit"} and split_amount_role(value, source) not in {key, None}:
+            problems.append(f"{value}与{label}的金额方向相反。")
         else:
             selected.append(value)
+    if mapping.get("mode") in {"signed_amount", "single_amount_with_direction"}:
+        amount_column = mapping.get("amount")
+        role = split_amount_role(amount_column, source)
+        if role and any(split_amount_role(column, source) not in {role, None} for column in columns):
+            problems.append(f"原表收付金额分在两列。当前只读取了「{amount_column}」，请使用借贷分列。")
     for key, label in (
         ("account", "本方账号"),
         ("currency", "币种"),
@@ -1466,8 +1493,13 @@ def build_input_precheck(
     )
 
     bank_mapping_problems = _mapping_problems(bank_mapping, raw_bank.columns)
-    journal_mapping_problems = _mapping_problems(journal_mapping, raw_journal.columns)
+    journal_mapping_problems = _mapping_problems(journal_mapping, raw_journal.columns, "journal")
     mapping_blocked = bool(bank_mapping_problems or journal_mapping_problems)
+    mapping_explanation = "；".join(
+        f"{side}：{'；'.join(problems)}"
+        for side, problems in (("银行流水", bank_mapping_problems), ("日记账", journal_mapping_problems))
+        if problems
+    )
     items.append(
         PrecheckItem(
             "必填字段",
@@ -1475,7 +1507,7 @@ def build_input_precheck(
             "完整" if not journal_mapping_problems else "；".join(journal_mapping_problems),
             "双方完整" if not mapping_blocked else "存在缺失或无效映射",
             "无法计算" if mapping_blocked else "通过",
-            "请返回选择当前金额模式所需的必填列。" if mapping_blocked else "当前金额模式所需字段完整。",
+            mapping_explanation or "当前金额模式所需字段完整。",
         )
     )
 

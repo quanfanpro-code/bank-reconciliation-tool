@@ -13,7 +13,7 @@ def 检查人工填写区(路径):
     from 直读XML import _表目标, _读共享串
     ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
     with zipfile.ZipFile(路径) as 包:
-        目标 = next((部件 for 名, 部件, _ in _表目标(包) if 名 == '待处理事项'), None)
+        目标 = next((部件 for 名, 部件, _ in _表目标(包) if 名 in {'待核对', '待处理事项'}), None)
         if 目标 is None:
             return 0
         串 = _读共享串(包)

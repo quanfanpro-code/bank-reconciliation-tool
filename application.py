@@ -1,7 +1,9 @@
 """不依赖图形界面的完整核对流程编排。"""
 
+from collections import Counter
 import hashlib
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +26,102 @@ from llm_assistant import LLMConfig, LLMAssistant
 from matcher import Matcher
 from reporter import Reporter
 from 项目记录 import LocalProjectStore
+
+
+def _balance_scope_identity(bank_path, journal_path, raw_journal, control):
+    """核实同一账户的期间、收支和余额，允许仅缺少表头口径标签。"""
+    identity = Path(bank_path).stem
+    journal_identity = Path(journal_path).stem.removesuffix("-日记账")
+    parts = identity.rsplit("-", 2)
+    if identity != journal_identity or len(parts) != 3 or not re.fullmatch(r"[0-9]{10,30}", parts[-1]):
+        return None
+    company, own_bank, account = parts
+    if "辅助核算名称" not in raw_journal:
+        return None
+    journal_accounts = raw_journal["辅助核算名称"].dropna().astype(str).str.strip()
+    if journal_accounts.empty or not journal_accounts.str.extract(r"([0-9]+)$", expand=False).eq(account).all():
+        return None
+    if any(getattr(control, field) != "通过" for field in (
+        "period_status", "amount_status", "bank_balance_status", "journal_balance_status"
+    )) or control.initial_balance_diff != 0 or control.ending_balance_diff != 0:
+        return None
+    if any(not reason.startswith(("核对账户未完全验证", "核对币种未完全验证", "金额口径未完全验证")) for reason in control.reasons):
+        return None
+    return company, own_bank, account
+
+
+def _balanced_posting_days(frame):
+    """按原表顺序验证日内余额链，按有方向的金额统计逐笔组成。"""
+    days = {}
+    for day, rows in frame.groupby(pd.to_datetime(frame["date"]).dt.normalize(), sort=False):
+        if len(rows) < 2 or rows[["amount", "balance"]].isna().any().any():
+            continue
+        rows = rows.sort_values("original_file_row", kind="stable")
+        before = rows["balance"] - rows["amount"]
+        if before.iloc[1:].tolist() != rows["balance"].iloc[:-1].tolist():
+            continue
+        amounts = Counter(rows["amount"])
+        unique = {amount: index for index, amount in rows["amount"].items() if amounts[amount] == 1 and amount}
+        days[day] = ((before.iloc[0], rows["balance"].iloc[-1], amounts), unique)
+    return days
+
+
+def _verified_balance_pairs(bank_path, journal_path, raw_bank, raw_journal, bank, journal, control, *, bank_first_row=2):
+    identity = _balance_scope_identity(bank_path, journal_path, raw_journal, control)
+    if identity is None:
+        return {}
+    company, own_bank, account = identity
+
+    def fingerprints(frame):
+        rows = frame.dropna(subset=["date", "amount", "balance"])
+        return rows.assign(day=pd.to_datetime(rows["date"]).dt.normalize()).groupby(["day", "amount", "balance"], sort=False).groups
+
+    journal_keys = fingerprints(journal)
+    pairs = {}
+    for key, bank_indexes in fingerprints(bank).items():
+        journal_indexes = journal_keys.get(key, ())
+        if len(bank_indexes) != 1 or len(journal_indexes) != 1 or not key[1]:
+            continue
+        b, j = bank_indexes[0], journal_indexes[0]
+        pairs[b, j] = (key[0], key[1], False)
+
+    journal_days = _balanced_posting_days(journal)
+    for day, (bank_controls, bank_unique) in _balanced_posting_days(bank).items():
+        if day not in journal_days or bank_controls != journal_days[day][0]:
+            continue
+        for amount, b in bank_unique.items():
+            j = journal_days[day][1][amount]
+            pairs.setdefault((b, j), (day, amount, True))
+
+    row_numbers = raw_bank.get("__file_row__", raw_bank.index + bank_first_row)
+    bank_rows = raw_bank.set_axis(row_numbers)
+    verified = {}
+    for (b, j), (day, amount, different_order) in pairs.items():
+        bank_original = bank_rows.loc[int(bank.at[b, "original_file_row"])]
+        other_account = str(bank_original.get("对方账号", "")).strip()
+        voucher_value = journal.at[j, "voucher_no"]
+        voucher = str(voucher_value).strip() if pd.notna(voucher_value) else ""
+        summary = str(journal.at[j, "summary"]).strip()
+        bank_party = str(bank_original.get("对方户名", "")).strip()
+        if (bank_party == company and re.fullmatch(r"[0-9]{10,30}", other_account)
+            and other_account != account and voucher and summary in {"转账", "内部转账", "同名账户划款"}):
+            other_bank = bank_original.get("对方开户行")
+            other_label = f"{other_bank if pd.notna(other_bank) else '对方账户'}尾号{other_account[-4:]}"
+            own_label = f"{own_bank}尾号{account[-4:]}"
+            start, end = (other_label, own_label) if amount > 0 else (own_label, other_label)
+            detail = f"{day:%Y-%m-%d}，{company}从{start}转入{end} {abs(amount):,.2f} 元。"
+        else:
+            action = "收款" if amount > 0 else "付款"
+            detail = f"{day:%Y-%m-%d}，{own_bank}尾号{account[-4:]}{action} {abs(amount):,.2f} 元。"
+        ledger = f"第{voucher}号凭证" if voucher else "账上记录"
+        if different_order:
+            verified[int(b), int(j)] = (
+                detail + f"{ledger}有唯一同日同额记录。双方当天流水顺序不同，"
+                "逐笔收付金额组成一致，日初、日末余额也一致。"
+            )
+        else:
+            verified[int(b), int(j)] = detail + f"{ledger}的日期、金额和交易后余额与银行一致。"
+    return verified
 
 
 def _map_matcher_progress(value: float) -> float:
@@ -377,6 +475,13 @@ def run_reconciliation(
         progress_callback=report_matcher_progress,
         llm_assistant=assistant,
         overall_control=precheck_report.overall_control,
+        balance_scope_verified=_balance_scope_identity(
+            bank_path, journal_path, raw_journal, precheck_report.overall_control,
+        ) is not None,
+        verified_balance_pairs=_verified_balance_pairs(
+            bank_path, journal_path, raw_bank, raw_journal, bank, journal, precheck_report.overall_control,
+            bank_first_row=bank_structure.skiprows + bank_structure.header_rows + 1,
+        ),
     )
     if matcher_ready:
         matcher_ready(matcher)

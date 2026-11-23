@@ -2168,30 +2168,8 @@ class Reporter:
         date_format: str = "auto",
     ) -> None:
         """生成组级清晰、可复核且防公式注入的 Excel 报告。"""
-        del bank_path, journal_path
         report_started = time.perf_counter()
-        effective_config = config or self.matcher.config
-        table_started = time.perf_counter()
-        self._log("开始构造报告表格")
-        tables = self.build_report_tables(
-            effective_config,
-            date_format=date_format,
-        )
-        from 报告偏好 import apply_column_preferences
-        apply_column_preferences(tables)
-        total_rows = sum(len(table) for table in tables.values())
-        self._log(
-            f"报告表格构造完成：{len(tables):,} 个工作表，"
-            f"共 {total_rows:,} 行，耗时 {time.perf_counter() - table_started:.1f} 秒"
-        )
-        presentation_started = time.perf_counter()
-        self._log("开始应用审计报告排版和复核标记")
-        from 排版计划 import 生成簿计划
-        from 报告写入 import 渲染簿计划
-        渲染簿计划(生成簿计划(self, tables, effective_config), output_path)
-        self._log(
-            f"报告排版保存完成：排版耗时 "
-            f"{time.perf_counter() - presentation_started:.1f} 秒，"
-            f"报告总耗时 {time.perf_counter() - report_started:.1f} 秒"
-        )
+        from 核对报告 import write_reconciliation_report
+        write_reconciliation_report(self, output_path, config or self.matcher.config, bank_path, journal_path)
+        self._log(f"五张核对工作表已写入，耗时 {time.perf_counter() - report_started:.1f} 秒")
 

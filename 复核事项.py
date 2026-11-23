@@ -101,25 +101,15 @@ def build_review_items(matcher) -> list[dict]:
         closed = correction or bank_reversal
         if closed:
             impact = 0
-        control = getattr(matcher, "overall_control", None)
-        days = [pd.Timestamp(value).normalize() for value in rows["date"]]
-        hit_windows = [window for window in getattr(control, "affected_windows", ())
-                       if any(window[0] <= day <= window[1] for day in days)]
-        limited = bool(getattr(matcher, "overall_scope_limited", False)
-                       or getattr(control, "scope_limited", False) or hit_windows)
-        risk = risk_level_for(impact, matcher.config, unquantifiable=limited)
+        risk = risk_level_for(impact, matcher.config)
         original_rows = sorted(int(frame.loc[index].get("original_file_row", frame.loc[index].get("original_idx", index))) for index in indexes)
         side_name = "银行侧" if side == "bank" else "序时账侧"
         identity = f"{side_name}-原行" + "-".join(str(value) for value in original_rows)
-        reason = "程序未找到足以建立跨双方对应关系的候选"
+        reason = "本次匹配未建立对应关系"
         if event:
             reason = f"{event.event_type}：{event.relationship_formula}；{event.evidence_basis}"
             if not closed:
                 reason += "；尚未与另一侧建立对应"
-        if limited:
-            reasons = list(getattr(control, "reasons", ()))
-            reasons.extend(f"余额断档窗口{start:%Y-%m-%d}至{end:%Y-%m-%d}" for start, end in hit_windows)
-            reason += "；核对范围受限" + ("：" + "；".join(reasons) if reasons else "")
         item = make_item(
             identity, indexes if side == "bank" else (), indexes if side == "journal" else (),
             "账内更正已闭合" if correction else "银行冲正已闭合" if bank_reversal else "同侧业务链" if event else f"{side_name}未对应", risk, impact, impact, reason,

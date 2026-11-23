@@ -350,6 +350,8 @@ def route_candidate(
     config: MatcherConfig,
 ) -> tuple[ProcessingStatus, RiskLevel, str]:
     """自动确定关系状态和风险等级，业务疑点不阻断处理。"""
+    if candidate.evidence.get("verified_reconciliation"):
+        return ProcessingStatus.AUTO_CONFIRMED, RiskLevel.NORMAL, candidate.evidence["verified_reconciliation"]
     reasons: list[str] = []
     hard_conflict = False
     if candidate.text_evidence and candidate.text_evidence.conflicting_fields:
@@ -388,7 +390,7 @@ def route_candidate(
         and int(candidate.evidence.get("business_strength", 0)) < 2
         and not candidate.evidence.get("shared_transaction_id")
     ):
-        reasons.append("金额和日期相同但业务依据不足，只有相同摘要不能证明交易对应")
+        reasons.append("金额一致，业务依据不足。缺少可核实的对方信息、业务编号或流水号")
     overall_scope_limited = bool(candidate.evidence.get("overall_scope_limited"))
     if overall_scope_limited:
         control_reasons = "、".join(
@@ -415,7 +417,9 @@ def route_candidate(
     elif has_relationship_risk:
         status = ProcessingStatus.FLAGGED
     else:
-        return ProcessingStatus.AUTO_CONFIRMED, RiskLevel.NORMAL, "金额完全一致且关系明确"
+        return ProcessingStatus.AUTO_CONFIRMED, RiskLevel.NORMAL, candidate.evidence.get(
+            "verified_balance_match", "金额完全一致且关系明确",
+        )
 
     impact_li = (
         candidate.metrics.group_amount_li
