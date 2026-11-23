@@ -21,7 +21,10 @@ import pandas as pd
 
 from data_structures import MatcherConfig
 from data_loader import DataLoader, ParseErrorCollector
-from input_precheck import InputPrecheckBlockedError, InputPrecheckReport, _mapping_problems, direction_column, split_amount_role
+from input_precheck import (
+    InputPrecheckBlockedError, InputPrecheckReport, _mapping_problems,
+    direction_column, non_own_account_column, split_amount_role,
+)
 from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
@@ -152,7 +155,7 @@ def _auto_mapping_for_columns(
         )
         for name in contained_names:
             for label, compact in normalized.items():
-                if name in compact and not any(word in compact for word in excluded):
+                if name in compact and not non_own_account_column(compact) and not any(word in compact for word in excluded):
                     return label
         return None
 

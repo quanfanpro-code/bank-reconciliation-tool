@@ -502,6 +502,10 @@ def split_amount_role(label: Any, source: str) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def non_own_account_column(label: Any) -> bool:
+    return bool(re.search(r"对方|付款人|收款人|汇款人|counterparty|payer|payee|beneficiary|recipient|remitter", str(label), re.I))
+
+
 def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any], source: str = "bank") -> list[str]:
     available = set(columns)
     selected = []
@@ -535,6 +539,8 @@ def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any], source: s
         value = mapping.get(key)
         if value not in (None, "", "(无)") and value not in available:
             problems.append(f"{label}列不存在：{value}")
+        elif key == "account" and non_own_account_column(value):
+            problems.append(f"{value}是交易一方的账号列，不能当成本户账号。")
     return problems
 
 

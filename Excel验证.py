@@ -1,11 +1,43 @@
 # -*- coding: utf-8 -*-
-"""报告交付前由独立的 Microsoft Excel 打开、重算并保存；失败即拒绝交付。"""
+"""交付前验证 Excel 报告。Windows 拒绝启动 Excel 时，检查新版五表文件结构。"""
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import psutil
 import xml.etree.ElementTree as ET
 import zipfile
+
+
+class _Excel启动被拒绝(RuntimeError):
+    pass
+
+
+def _验证五表结构(路径):
+    from 直读XML import 读簿
+
+    with zipfile.ZipFile(路径) as 包:
+        if 包.testzip() is not None:
+            raise RuntimeError('报告文件损坏，未交付报告')
+    簿 = 读簿(路径, 读样式=False)
+    if 簿.表名列表 != ['核对总览', '月度核对', '日度核对', '待核对', '交易明细']:
+        raise RuntimeError('无法验证报告的五张工作表，未交付报告')
+    if any(表.状态 != 'visible' or not 表.值(1, 1) for 表 in 簿):
+        raise RuntimeError('报告缺少可见工作表或表头，未交付报告')
+    待核对, 交易明细 = 簿['待核对'], 簿['交易明细']
+    编号 = {行[0] for 行 in 交易明细.行值(2)}
+    预期公式 = {}
+    for 行 in range(2, 待核对.最大行 + 1):
+        当前编号 = 待核对.值(行, 1)
+        if not 当前编号:
+            continue
+        if 当前编号 not in 编号:
+            raise RuntimeError(f'待核对第 {行} 行找不到交易明细，未交付报告')
+        预期公式[行, 10] = (
+            f'HYPERLINK("#\'交易明细\'!A"&(MATCH(A{行},\'交易明细\'!$A$2:$A${交易明细.最大行},0)+1),"查看明细")'
+        )
+    if 待核对.公式 != 预期公式 or any(表.公式 for 表 in 簿 if 表 is not 待核对):
+        raise RuntimeError('报告含有异常公式或明细跳转，未交付报告')
+    return {'工作表数': 5, '公式数': len(预期公式), '验证方式': '工作簿结构检查', '人工填写行数': len(预期公式)}
 
 
 def 检查人工填写区(路径):
@@ -75,7 +107,12 @@ def 验证Excel报告(路径, *, logger=None, cancel_check=None):
         自有进程 = None
         try:
             原有进程 = {p.pid for p in psutil.process_iter(['name']) if (p.info['name'] or '').lower() == 'excel.exe'}
-            app = win32com.client.DispatchEx('Excel.Application')
+            try:
+                app = win32com.client.DispatchEx('Excel.Application')
+            except Exception as exc:
+                if getattr(exc, 'hresult', None) == -2147024891:  # E_ACCESSDENIED
+                    raise _Excel启动被拒绝() from exc
+                raise
             pid = win32process.GetWindowThreadProcessId(app.Hwnd)[1]
             if pid in 原有进程:
                 app = None
@@ -97,7 +134,7 @@ def 验证Excel报告(路径, *, logger=None, cancel_check=None):
                 cancel_check()
             book.Save()
             return {'Excel版本': str(app.Version), '工作表数': int(book.Worksheets.Count)}
-        except InterruptedError:
+        except (InterruptedError, _Excel启动被拒绝):
             raise
         except Exception as exc:
             raise RuntimeError(f'本机 Excel 打开或重算验证失败，未交付报告：{exc}') from exc
@@ -120,8 +157,16 @@ def 验证Excel报告(路径, *, logger=None, cancel_check=None):
                             # Excel 已关簿并 Quit；只回收本次新建、仍被 COM 引用留住的进程。
                             自有进程.terminate()
                             自有进程.wait(timeout=5)
-    with ThreadPoolExecutor(max_workers=1) as 线程:
-        结果 = 线程.submit(打开并重算).result()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as 线程:
+            结果 = 线程.submit(打开并重算).result()
+    except _Excel启动被拒绝:
+        if cancel_check:
+            cancel_check()
+        结果 = _验证五表结构(路径)
+        if logger:
+            logger('Windows 拒绝启动 Excel，五张工作表、填写区和明细跳转已通过文件检查')
+        return 结果
 
     ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
     relns = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'

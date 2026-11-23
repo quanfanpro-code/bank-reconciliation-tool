@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -67,3 +68,20 @@ def test_实际差额用自定阈值并能定位交易(tmp_path):
     book = 读簿(output)
     assert book['待核对'].值(2, 7) == 600
     assert 'MATCH(A2' in book['待核对'].值(2, 10)
+    from Excel验证 import _验证五表结构
+    assert _验证五表结构(output)['人工填写行数'] == 1
+
+
+def test_启动Excel被拒绝时仍可验证五表报告(tmp_path):
+    from Excel验证 import 验证Excel报告
+    import pywintypes
+
+    source = _rows([("2026-02-01", "-10", "990", "收付款", {})])
+    matcher = Matcher(source, source, MatcherConfig())
+    matcher.run()
+    output = tmp_path / '报告.xlsx'
+    Reporter(matcher)._generate_report(str(output))
+    with patch('win32com.client.DispatchEx', side_effect=pywintypes.com_error(-2147024891, '拒绝访问', None, None)):
+        result = 验证Excel报告(output)
+    assert result['工作表数'] == 5
+    assert result['验证方式'] == '工作簿结构检查'

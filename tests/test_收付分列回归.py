@@ -26,6 +26,14 @@ def test_单金额加借贷标记仍使用方向列():
     assert (mapping['mode'], mapping['amount'], mapping['direction']) == ('single_amount_with_direction','交易金额','借贷标记')
 
 
+def test_付款人或收款人账号不是本户账号():
+    headers = ['交易日期', '收入金额', '支出金额', '付款人账号', '收款人账号', '对方账号']
+    mapping = _auto_mapping_for_columns(headers, is_bank=True)
+    assert _mapping_problems({**mapping, 'account': '付款人账号'}, headers, 'bank')
+    assert mapping['account'] is None
+    assert _auto_mapping_for_columns(headers + ['本方账号'], is_bank=True)['account'] == '本方账号'
+
+
 @pytest.mark.parametrize('debit,credit',[('借贷标记','收入金额'),('收入金额','支出金额')])
 def test_预检查拦截方向文本或收付映反(debit,credit):
     mapping = {'mode':'debit_credit','date':'交易日期','debit':debit,'credit':credit}
