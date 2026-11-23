@@ -15,6 +15,8 @@ from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
+from 列识别 import amount_basis_label, field_problem, identity_columns, split_amount_role
+
 from data_structures import OverallControlResult
 from utils import clean_excel_string, parse_date
 
@@ -485,27 +487,6 @@ def _required_columns(mapping: dict[str, Any]) -> list[tuple[str, str]]:
     return required
 
 
-def direction_column(label: Any) -> bool:
-    return bool(re.search(r"方向|(?:借贷|收支|收付)(?:标[志记识]|类别|类型)|\bdirection\b", str(label), re.I))
-
-
-def split_amount_role(label: Any, source: str) -> str | None:
-    text = unicodedata.normalize("NFKC", str(label)).strip().lower()
-    if direction_column(text) or re.search(r"余额|balance|合计|累计|标志|标记|标识|笔数", text):
-        return None
-    roles = (
-        ("debit", r"借(?:方)?|支出|付款|出账|取款|debit"),
-        ("credit", r"贷(?:方)?|收入|收款|入账|存款|credit"),
-    ) if source == "bank" else (("debit", r"借(?:方)?|debit"), ("credit", r"贷(?:方)?|credit"))
-    hits = [role for role, pattern in roles if re.search(
-        rf"(?:^|[ /_\-])(?:{pattern})(?=$|[ (（/_\-]|金|发生|本位|原币|额|款)|(?:本位币|原币)(?:{pattern})", text)]
-    return hits[0] if len(hits) == 1 else None
-
-
-def non_own_account_column(label: Any) -> bool:
-    return bool(re.search(r"对方|付款人|收款人|汇款人|counterparty|payer|payee|beneficiary|recipient|remitter", str(label), re.I))
-
-
 def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any], source: str = "bank") -> list[str]:
     available = set(columns)
     selected = []
@@ -518,10 +499,8 @@ def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any], source: s
             problems.append(f"{label}列不存在：{value}")
         elif value in selected:
             problems.append(f"{label}列与其他必填映射重复：{value}")
-        elif key in {"debit", "credit", "amount"} and direction_column(value):
-            problems.append(f"{value}是方向列，不能作为{label}金额列。")
-        elif key in {"debit", "credit"} and split_amount_role(value, source) not in {key, None}:
-            problems.append(f"{value}与{label}的金额方向相反。")
+        elif reason := field_problem(key, value, source):
+            problems.append(f"「{value}」{reason}，应选择{label}列。")
         else:
             selected.append(value)
     if mapping.get("mode") in {"signed_amount", "single_amount_with_direction"}:
@@ -539,8 +518,13 @@ def _mapping_problems(mapping: dict[str, Any], columns: Sequence[Any], source: s
         value = mapping.get(key)
         if value not in (None, "", "(无)") and value not in available:
             problems.append(f"{label}列不存在：{value}")
-        elif key == "account" and non_own_account_column(value):
-            problems.append(f"{value}是交易一方的账号列，不能当成本户账号。")
+        elif value and (reason := field_problem(key, value, source)):
+            problems.append(f"「{value}」{reason}，应选择{label}列。")
+        elif value and key in {"currency", "balance"}:
+            _, basis, _ = _amount_basis(mapping)
+            tag = amount_basis_label(value)
+            if basis and tag and tag != basis:
+                problems.append(f"「{value}」的币种口径和金额列不一致。")
     return problems
 
 
@@ -722,34 +706,7 @@ def _scope_values(
     identity: str,
 ) -> tuple[str, set[str], int, int]:
     """提取核对账户或币种，同时统计有效交易中的空白身份行。"""
-    columns = []
-    explicit_column = mapping.get(identity)
-    if explicit_column and explicit_column in frame.columns:
-        columns = [explicit_column]
-    else:
-        for candidate in frame.columns:
-            name = _cell_text(candidate)
-            lowered = name.lower()
-            if identity == "account":
-                matched = (
-                    "对方" not in name
-                    and (
-                        "本方账号" in name
-                        or name in {"账号", "银行账号", "账户账号", "卡号"}
-                        or lowered in {"account", "account number", "account_number"}
-                    )
-                )
-            else:
-                matched = (
-                    "对方" not in name
-                    and (
-                        "币种" in name
-                        or "币别" in name
-                        or lowered in {"currency", "currency code", "currency_code"}
-                    )
-                )
-            if matched:
-                columns.append(candidate)
+    columns = identity_columns(frame, mapping, identity)
     transaction_rows = frame.loc[~_non_transaction_mask(frame, mapping)]
     total_rows = len(transaction_rows)
     if not columns:
@@ -1098,32 +1055,8 @@ def _population_detail_rows(
                 continue
             standardized_amounts[row_number] = std_row.get("amount")
 
-    def matching_columns(identity: str) -> list[Any]:
-        explicit = mapping.get(identity)
-        if explicit:
-            return [explicit] if explicit in raw.columns else []
-        result = []
-        for column in raw.columns:
-            name = _cell_text(column)
-            lowered = name.lower()
-            if identity == "account":
-                matched = "对方" not in name and (
-                    "本方账号" in name
-                    or name in {"账号", "银行账号", "账户账号", "卡号"}
-                    or lowered in {"account", "account number", "account_number"}
-                )
-            else:
-                matched = "对方" not in name and (
-                    "币种" in name
-                    or "币别" in name
-                    or lowered in {"currency", "currency code", "currency_code"}
-                )
-            if matched:
-                result.append(column)
-        return result
-
-    account_columns = matching_columns("account")
-    currency_columns = matching_columns("currency")
+    account_columns = identity_columns(raw, mapping, "account")
+    currency_columns = identity_columns(raw, mapping, "currency")
     rows = []
     for position, (index, raw_row) in enumerate(raw.iterrows()):
         if "__file_row__" in raw.columns and pd.notna(raw_row.get("__file_row__")):

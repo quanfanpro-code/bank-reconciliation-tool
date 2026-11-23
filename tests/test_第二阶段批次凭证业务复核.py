@@ -152,7 +152,7 @@ def test_实际界面自动映射能区分本方账号余额凭证字和凭证�
 
     assert 结果["account"] == "本方账号"
     assert 结果["balance"] == "账户余额"
-    assert 结果["currency"] == "原币币种"
+    assert 结果["currency"] is None  # 本位币金额无需读取原币币种
     assert 结果["voucher_word"] == "凭证字"
     assert 结果["voucher"] == "凭证号"
     assert 结果["amount_basis"] == "本位币"

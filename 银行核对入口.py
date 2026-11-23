@@ -12,6 +12,7 @@ import time
 from uuid import uuid4
 
 from data_structures import MatcherConfig
+from 列识别 import ColumnRecognitionError, FIELD_LABELS
 
 
 def _identity(path):
@@ -121,23 +122,21 @@ class AgentReview:
         return verdict
 
 
-def run_accounts(bank, journal, output, config, session, *, log=print):
+def run_accounts(bank, journal, output, config, session, *, log=print,
+                 bank_columns=None, journal_columns=None):
     from application import run_reconciliation
-    from data_loader import DataLoader
-    from gui import _auto_mapping_for_columns
     from llm_assistant import LLMConfig
     from 项目记录 import LocalProjectStore
 
     pairs, problems = pair_inputs(bank, journal)
-    loader = DataLoader()
+    if (bank_columns or journal_columns) and not (bank.is_file() and journal.is_file()):
+        raise ValueError("指定字段时请提供需要补跑的两份文件")
     output.mkdir(parents=True, exist_ok=True)
     suffix = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
     store = LocalProjectStore(session / "项目记录")
     results = []
     for bank_file, journal_file in pairs:
         try:
-            bank_columns = loader.detect_table_structure(str(bank_file)).columns
-            journal_columns = loader.detect_table_structure(str(journal_file)).columns
             target = output / f"{bank_file.stem}_核对报告_{suffix}.xlsx"
 
             def set_reviewer(matcher):
@@ -145,15 +144,30 @@ def run_accounts(bank, journal, output, config, session, *, log=print):
 
             report = run_reconciliation(
                 str(bank_file), str(journal_file),
-                _auto_mapping_for_columns(bank_columns, is_bank=True),
-                _auto_mapping_for_columns(journal_columns, is_bank=False),
+                {"_column_auto": True, "_column_overrides": bank_columns},
+                {"_column_auto": True, "_column_overrides": journal_columns},
                 config, llm_config=LLMConfig(enabled=False), logger=log,
                 output_path=target, project_store=store, matcher_ready=set_reviewer,
             )
             results.append({"银行流水": str(bank_file), "日记账": str(journal_file), "报告": str(report)})
+        except ColumnRecognitionError as exc:
+            problems.append({
+                "银行流水": str(bank_file), "日记账": str(journal_file),
+                "原因": str(exc), "字段问题": exc.issues,
+            })
         except Exception as exc:
             problems.append({"银行流水": str(bank_file), "日记账": str(journal_file), "原因": str(exc)})
     return {"完成": results, "待处理": problems}
+
+
+def _column_overrides(parser, entries):
+    result = {}
+    for entry in entries:
+        role, separator, column = entry.partition("=")
+        if not separator or role not in FIELD_LABELS or not column or role in result:
+            parser.error(f"无效或重复的字段设置：{entry}")
+        result[role] = column
+    return result
 
 
 def main():
@@ -164,7 +178,11 @@ def main():
     parser.add_argument("--session", required=True, type=Path)
     parser.add_argument("--trivial", type=Decimal)
     parser.add_argument("--materiality", type=Decimal)
+    parser.add_argument("--bank-column", action="append", default=[], metavar="字段=原列名")
+    parser.add_argument("--journal-column", action="append", default=[], metavar="字段=原列名")
     args = parser.parse_args()
+    bank_columns = _column_overrides(parser, args.bank_column)
+    journal_columns = _column_overrides(parser, args.journal_column)
     config = replace(MatcherConfig(), **{
         key: value for key, value in {"clearly_trivial_threshold": args.trivial, "performance_materiality": args.materiality}.items()
         if value is not None
@@ -172,7 +190,8 @@ def main():
     session = args.session.resolve()
     session.mkdir(parents=True, exist_ok=False)
     result = run_accounts(args.bank.resolve(), args.journal.resolve(), args.output.resolve(), config, session,
-                          log=lambda message: print(message, flush=True))
+                          log=lambda message: print(message, flush=True),
+                          bank_columns=bank_columns, journal_columns=journal_columns)
     print("核对结果 " + json.dumps(result, ensure_ascii=False), flush=True)
     return 1 if result["待处理"] else 0
 

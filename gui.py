@@ -23,12 +23,11 @@ from data_structures import MatcherConfig
 from data_loader import DataLoader, ParseErrorCollector
 from input_precheck import (
     InputPrecheckBlockedError, InputPrecheckReport, _mapping_problems,
-    direction_column, non_own_account_column, split_amount_role,
 )
 from validate import validate_config_params
 from llm_assistant import LLMConfig, LLMAssistant
 from application import run_reconciliation
-from matching_policy import COUNTERPARTY_FIELD_KEYWORDS
+from 列识别 import ColumnRecognitionError, FIELD_LABELS, auto_select_auxiliary_columns, recognize_columns
 from 输入模板 import generate_input_templates
 from 项目记录 import LocalProjectStore
 
@@ -53,33 +52,6 @@ SECONDARY_BUTTON = {"width": 112, "height": 34}
 CARD_RADIUS = 10
 CONTENT_GAP = 12
 
-AUXILIARY_COLUMN_KEYWORDS = (
-    "摘要",
-    "业务说明",
-    "交易用途",
-    *COUNTERPARTY_FIELD_KEYWORDS,
-    "附言",
-    "备注",
-    "业务号",
-    "业务编号",
-    "批次号",
-    "批次编号",
-    "银企批量号",
-    "银企批次号",
-    "订单号",
-    "合同号",
-    "结算号",
-    "交易流水号",
-    "回单号",
-)
-EXCLUDED_DEFAULT_AUXILIARY_KEYWORDS = (
-    "账号",
-    "帐号",
-    "卡号",
-    "凭证",
-)
-
-
 def default_gui_values() -> dict[str, str]:
     """返回界面初始值，正式业务名称不得缩写。"""
     return {
@@ -99,119 +71,14 @@ def default_gui_values() -> dict[str, str]:
     }
 
 
-def auto_select_auxiliary_columns(
-    columns: Sequence[object],
-) -> list[str]:
-    """自动勾选业务文字列，账号、卡号和凭证号默认排除。"""
-    selected = []
-    for column in columns:
-        label = str(column)
-        if not any(keyword in label for keyword in AUXILIARY_COLUMN_KEYWORDS):
-            continue
-        if any(
-            keyword in label
-            for keyword in EXCLUDED_DEFAULT_AUXILIARY_KEYWORDS
-        ):
-            continue
-        selected.append(label)
-    return selected
-
-
 def _auto_mapping_for_columns(
     columns: Sequence[object],
     *,
     is_bank: bool,
 ) -> dict[str, object]:
-    """为新载入的文件生成可编辑的初始列映射。"""
-    labels = [str(column) for column in columns]
-
-    def find(keywords):
-        for keyword in keywords:
-            for label in labels:
-                if keyword.lower() in label.strip().lower():
-                    return label
-        return None
-
-    def find_account():
-        normalized = {
-            label: label.strip().lower().replace("_", " ")
-            for label in labels
-        }
-        exact_names = (
-            "本方账号", "银行账号", "账号", "帐号", "卡号",
-            "account number", "account no", "account",
-        )
-        for name in exact_names:
-            for label, compact in normalized.items():
-                if compact == name:
-                    return label
-        excluded = (
-            "余额", "对方", "户名", "名称", "账户名",
-            "counterparty", "account name", "balance",
-        )
-        contained_names = (
-            "本方账号", "银行账号", "账号", "帐号", "卡号",
-            "account number", "account no",
-        )
-        for name in contained_names:
-            for label, compact in normalized.items():
-                if name in compact and not non_own_account_column(compact) and not any(word in compact for word in excluded):
-                    return label
-        return None
-
-    def find_voucher_number():
-        value = find(["完整凭证号", "凭证号码", "凭证号", "voucher number", "voucher_no"])
-        if value:
-            return value
-        for label in labels:
-            compact = label.strip().lower()
-            if "凭证" in compact and not any(
-                keyword in compact for keyword in ("凭证字", "凭证类型", "凭证类别")
-            ):
-                return label
-        return None
-
+    """兼容只提供表头的调用。实际载入时依据原表数据识别。"""
     source = "bank" if is_bank else "journal"
-    debit = next((label for label in labels if split_amount_role(label, source) == "debit"), None)
-    credit = next((label for label in labels if split_amount_role(label, source) == "credit"), None)
-    amount = find(["金额", "amount", "发生额"])
-    direction = next((label for label in labels if direction_column(label)), None)
-    if debit and credit and debit != credit:
-        mode = "debit_credit"
-    elif amount and direction:
-        mode = "single_amount_with_direction"
-    elif amount:
-        mode = "signed_amount"
-    else:
-        mode = "debit_credit"
-
-    amount_basis = ""
-    amount_labels = " ".join(
-        str(value) for value in (debit, credit, amount) if value
-    )
-    if "本位" in amount_labels:
-        amount_basis = "本位币"
-    elif "原币" in amount_labels:
-        amount_basis = "原币"
-
-    return {
-        "mode": mode,
-        "date": find(["日期", "date", "交易时间", "time"]),
-        "summary": find(
-            ["摘要", "summary", "业务说明", "交易用途", "备注"]
-        ),
-        "account": find_account(),
-        "currency": find(["原币币种", "币种", "currency", "币别"]),
-        "voucher_word": find(["凭证字", "凭证类型", "凭证类别"]),
-        "voucher": find_voucher_number(),
-        "balance": find(["余额", "balance"]),
-        "debit": debit,
-        "credit": credit,
-        "amount": amount,
-        "direction": direction,
-        "amount_basis": amount_basis,
-        "auxiliary_text_columns": auto_select_auxiliary_columns(labels),
-    }
+    return recognize_columns(pd.DataFrame(columns=columns), source).mapping
 
 
 def _as_bool(value: object, default: bool = False) -> bool:
@@ -458,7 +325,6 @@ class ColumnMappingFrame(ctk.CTkFrame):
         for w in self.grid_frame.winfo_children():
             w.destroy()
         self.vars = {}
-        defaults = _auto_mapping_for_columns(self.columns, is_bank=self.is_bank)
 
         row_idx = 0
 
@@ -467,44 +333,12 @@ class ColumnMappingFrame(ctk.CTkFrame):
             ctk.CTkLabel(self.grid_frame, text=label, width=80, anchor="w").grid(
                 row=row_idx, column=0, sticky="w", pady=2
             )
-            vals = ["(无)"] + self.columns if allow_none else self.columns
-            var = ctk.StringVar(value=vals[0] if vals else "")
+            vals = ["(无)" if allow_none else ""] + self.columns
+            var = ctk.StringVar(value=vals[0])
             ctk.CTkComboBox(self.grid_frame, variable=var, values=vals, state="readonly").grid(
                 row=row_idx, column=1, sticky="ew", padx=(4, 0), pady=2
             )
             self.vars[key] = var
-
-            if key in {"debit", "credit", "amount", "direction"}:
-                if defaults[key] is not None:
-                    var.set(defaults[key])
-                row_idx += 1
-                return
-
-            # 自动匹配列名
-            normalized_cols = {str(c).strip().lower(): c for c in self.columns}
-            keywords = {
-                "date": ["日期", "date", "交易时间", "time"],
-                "summary": ["摘要", "summary", "备注", "对方户名", "用途", "业务说明"],
-                "voucher": ["凭证", "voucher"],
-                "balance": ["余额", "balance"],
-                "debit": ["借", "debit", "支"],
-                "credit": ["贷", "credit", "收"],
-                "amount": ["金额", "amount", "发生额"],
-                "direction": ["方向", "借贷标志"],
-            }
-            candidates = keywords.get(key, [])
-            if "借" in label:
-                candidates = keywords["debit"]
-            if "贷" in label:
-                candidates = keywords["credit"]
-
-            for kw in candidates:
-                for col_norm, col_orig in normalized_cols.items():
-                    if kw in col_norm:
-                        var.set(col_orig)
-                        row_idx += 1
-                        return
-
             row_idx += 1
 
         add("日期", "date")
@@ -1594,10 +1428,21 @@ class ReconciliationApp(ctk.CTk):
         self.wait_window(dialog)
         if dialog.result is None:
             return
-        (
-            self.bank_mapping_state,
-            self.journal_mapping_state,
-        ) = dialog.result
+        for source, label, previous, proposed, columns in (
+            ("bank", "银行流水", self.bank_mapping_state, dialog.result[0], self.bank_columns),
+            ("journal", "日记账", self.journal_mapping_state, dialog.result[1], self.journal_columns),
+        ):
+            problems = _mapping_problems(proposed, columns, source)
+            open_fields = previous.get("_column_choices", {})
+            problems.extend(
+                f"请选择{FIELD_LABELS[field]}列（{'、'.join(candidates)}）"
+                for field, candidates in open_fields.items()
+                if field in proposed and not proposed.get(field)
+            )
+            if problems:
+                messagebox.showerror(f"{label}列映射", "\n".join(problems), parent=self)
+                return
+        self.bank_mapping_state, self.journal_mapping_state = dialog.result
         bank_aux = len(
             self.bank_mapping_state.get("auxiliary_text_columns", [])
         )
@@ -2047,37 +1892,43 @@ class ReconciliationApp(ctk.CTk):
                 header_rows=int(header_rows),
                 derived_columns=derived_columns,
             )
-            cols = df.columns.tolist()
-            self.log(f"已加载列信息: {cols}")
-            self.after(
-                0,
-                lambda: self._store_loaded_columns(target, cols),
-            )
+            columns = df.columns.tolist()
+            recognition = recognize_columns(df, target)
+            self.after(0, lambda: self._store_loaded_columns(
+                target, columns, recognition, path, skiprows, header_rows,
+            ))
         except Exception as e:
             self.log(f"加载列失败: {e}")
 
-    def _store_loaded_columns(self, target, columns):
+    def _store_loaded_columns(self, target, columns, recognition, path, skiprows, header_rows):
+        current = self.bank_path if target == "bank" else self.journal_path
+        current_skip = self.bank_skip if target == "bank" else self.journal_skip
+        current_headers = self.bank_header_rows if target == "bank" else self.journal_header_rows
+        if (path, int(skiprows), int(header_rows)) != (
+            current.get(), self._safe_int(current_skip.get()), self._safe_int(current_headers.get(), 1),
+        ):
+            return
+        mapping = {
+            **recognition.mapping, "_column_auto": True,
+            "_column_choices": recognition.choices, "_column_problems": recognition.problems,
+        }
+        saved = self.project_store.load_mapping_template(target, columns)
+        if saved and isinstance(saved.get("mapping"), dict):
+            saved_aux = saved["mapping"].get("auxiliary_text_columns")
+            if isinstance(saved_aux, list):
+                mapping["auxiliary_text_columns"] = [column for column in saved_aux if column in columns]
         if target == "bank":
             self.bank_columns = list(columns)
-            self.bank_mapping_state = _auto_mapping_for_columns(
-                columns,
-                is_bank=True,
-            )
+            self.bank_mapping_state = mapping
         else:
             self.journal_columns = list(columns)
-            self.journal_mapping_state = _auto_mapping_for_columns(
-                columns,
-                is_bank=False,
-            )
-        saved = self.project_store.load_mapping_template(target, columns)
-        if saved and isinstance(saved.get("mapping"), dict) and not _mapping_problems(saved["mapping"], columns, target):
-            if target == "bank":
-                self.bank_mapping_state = dict(saved["mapping"])
-            else:
-                self.journal_mapping_state = dict(saved["mapping"])
-            self.log(f"已自动套用列映射模板：{saved.get('name', '')}")
+            self.journal_mapping_state = mapping
         if self.bank_columns and self.journal_columns:
-            self.mapping_status_var.set("已自动识别，可打开检查")
+            needs_selection = any(
+                state.get("_column_choices") or state.get("_column_problems")
+                for state in (self.bank_mapping_state, self.journal_mapping_state)
+            )
+            self.mapping_status_var.set("有字段需要确认" if needs_selection else "已识别文件字段")
         else:
             self.mapping_status_var.set("已读取一侧文件列")
 
@@ -2170,6 +2021,15 @@ class ReconciliationApp(ctk.CTk):
             ("银行流水", run_state["bank_mapping"], self.bank_columns),
             ("日记账", run_state["journal_mapping"], self.journal_columns),
         ):
+            if mapping.get("_column_auto"):
+                issues = mapping.get("_column_problems", []) + [
+                    f"{FIELD_LABELS[field]}有多个候选（{'、'.join(columns)}）"
+                    for field, columns in mapping.get("_column_choices", {}).items()
+                ]
+                if issues:
+                    messagebox.showinfo(label + "需要确认字段", "\n".join(issues), parent=self)
+                    self.open_column_mapping_dialog()
+                    return
             mapping_ok, mapping_error = self._validate_mapping(mapping, label, available_columns)
             if not mapping_ok:
                 messagebox.showerror("参数错误", mapping_error)
@@ -2245,6 +2105,11 @@ class ReconciliationApp(ctk.CTk):
             self.log(f"\n{'=' * 50}")
             self.log(f"✅ 核对完成！报告已保存至: {output_path}")
             self.log(f"{'=' * 50}")
+        except ColumnRecognitionError as exc:
+            message = str(exc)
+            self.log(message)
+            self.after(0, lambda: messagebox.showerror("请确认交易字段", message, parent=self))
+            self._set_progress(0)
         except InputPrecheckBlockedError as exc:
             message = str(exc)
             if exc.report_path:

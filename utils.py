@@ -75,7 +75,8 @@ def parse_date(date_val: Any, date_format: str = "auto") -> Optional[pd.Timestam
         pass
 
     str_val = str(date_val).strip()
-    if not str_val:
+    # 单独的时分秒不包含交易日期。pandas 会给它补上系统日期。
+    if not str_val or re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\s*[AP]M)?", str_val, re.I):
         return None
     # Excel 数值列遇到空格后可能以浮点形式读出八位日期。
     if re.fullmatch(r'\d{8}\.0+', str_val):

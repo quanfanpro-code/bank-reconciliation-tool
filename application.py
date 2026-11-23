@@ -21,11 +21,13 @@ from input_precheck import (
     build_input_precheck,
     derive_header_columns,
     write_input_problem_report,
+    _mapping_problems,
 )
 from llm_assistant import LLMConfig, LLMAssistant
 from matcher import Matcher
 from reporter import Reporter
 from 项目记录 import LocalProjectStore
+from 列识别 import ColumnRecognitionError, recognize_columns
 
 
 def _balance_scope_identity(bank_path, journal_path, raw_journal, control):
@@ -249,8 +251,8 @@ def _adopt_structure(
 def run_reconciliation(
     bank_path: str,
     journal_path: str,
-    bank_mapping: dict[str, object],
-    journal_mapping: dict[str, object],
+    bank_mapping: Optional[dict[str, object]],
+    journal_mapping: Optional[dict[str, object]],
     matcher_config: MatcherConfig,
     llm_config: Optional[LLMConfig] = None,
     logger: Optional[Callable[[str], None]] = None,
@@ -349,6 +351,36 @@ def run_reconciliation(
             ),
         )
         raise _blocked_error_with_report(report, destination) from exc
+
+    column_issues = []
+    mappings = []
+    for source, path, raw, supplied in (
+        ("bank", bank_path, raw_bank, bank_mapping),
+        ("journal", journal_path, raw_journal, journal_mapping),
+    ):
+        choices = {}
+        if not supplied or supplied.get("_column_auto"):
+            result = recognize_columns(
+                raw, source, overrides=(supplied or {}).get("_column_overrides"), date_format=date_format,
+            )
+            mapping, choices, problems = result.mapping, result.choices, result.problems
+            if not choices and not problems:
+                problems = _mapping_problems(mapping, raw.columns, source)
+            auxiliary = (supplied or {}).get("auxiliary_text_columns")
+            if auxiliary is not None:
+                mapping["auxiliary_text_columns"] = [column for column in auxiliary if column in raw.columns]
+        else:
+            mapping = supplied
+            problems = _mapping_problems(mapping, raw.columns, source)
+        if problems or choices:
+            column_issues.append({
+                "侧": source, "来源": "银行流水" if source == "bank" else "日记账",
+                "文件": Path(path).name, "候选列": choices, "问题": problems,
+            })
+        mappings.append(mapping)
+    bank_mapping, journal_mapping = mappings
+    if column_issues:
+        raise ColumnRecognitionError(column_issues)
 
     check_cancelled()
     if progress_callback:
