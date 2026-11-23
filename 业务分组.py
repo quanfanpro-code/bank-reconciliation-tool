@@ -1,4 +1,4 @@
-﻿"""从已有文字提取业务范围；完整组直接求和，不枚举工资子集。"""
+"""从已有文字提取业务范围；完整组直接求和，不枚举工资子集。"""
 import re
 import unicodedata
 from collections import defaultdict
@@ -143,6 +143,10 @@ def row_business(row):
     batch_category = _batch_category(text)
     if batch_category == "批量收付" and re.search(r"入息|利息|付息", text):
         batch_category = ""
+    if batch_category == "社保公积金" and re.search(r"证书|密钥", text):
+        # 证书更新费用是报销用途，不是社保或公积金缴款。
+        batch_category = ""
+        tax_social.discard("社保公积金")
     salary = batch_category == "工资"
     periods = set()
     if batch_category:
