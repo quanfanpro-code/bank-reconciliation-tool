@@ -21,35 +21,44 @@ from input_precheck import (
     build_input_precheck,
     derive_header_columns,
     write_input_problem_report,
+    statement_filename_identity,
     _mapping_problems,
 )
 from llm_assistant import LLMConfig, LLMAssistant
 from matcher import Matcher
 from reporter import Reporter
 from 项目记录 import LocalProjectStore
-from 列识别 import ColumnRecognitionError, recognize_columns
+from 列识别 import ColumnRecognitionError, normalized_identity, recognize_columns
 
 
-def _balance_scope_identity(bank_path, journal_path, raw_journal, control):
-    """核实同一账户的期间、收支和余额，允许仅缺少表头口径标签。"""
-    identity = Path(bank_path).stem
-    journal_identity = Path(journal_path).stem.removesuffix("-日记账")
-    parts = identity.rsplit("-", 2)
-    if identity != journal_identity or len(parts) != 3 or not re.fullmatch(r"[0-9]{10,30}", parts[-1]):
-        return None
-    company, own_bank, account = parts
-    if "辅助核算名称" not in raw_journal:
-        return None
-    journal_accounts = raw_journal["辅助核算名称"].dropna().astype(str).str.strip()
-    if journal_accounts.empty or not journal_accounts.str.extract(r"([0-9]+)$", expand=False).eq(account).all():
-        return None
+def _balance_scope_identity(bank_path, journal_path, raw_journal, control, *,
+                            verified_account="", stated_accounts=()):
+    """先核实账户，再核实双方收支、期初期末和余额连续性。"""
     if any(getattr(control, field) != "通过" for field in (
-        "period_status", "amount_status", "bank_balance_status", "journal_balance_status"
+        "amount_status", "bank_balance_status", "journal_balance_status",
     )) or control.initial_balance_diff != 0 or control.ending_balance_diff != 0:
         return None
-    if any(not reason.startswith(("核对账户未完全验证", "核对币种未完全验证", "金额口径未完全验证")) for reason in control.reasons):
+    allowed_reasons = ("核对账户未完全验证", "核对币种未完全验证", "金额口径未完全验证")
+    if verified_account:
+        allowed_reasons += ("双方起止日期不一致",)
+    if any(not reason.startswith(allowed_reasons) for reason in control.reasons) or control.continuity_anomalies:
         return None
-    return company, own_bank, account
+
+    file_identity = statement_filename_identity(Path(bank_path))
+    journal_identity = statement_filename_identity(Path(journal_path))
+    if verified_account and control.period_status in {"通过", "疑点"}:
+        if file_identity and file_identity == journal_identity and file_identity[-1] == verified_account:
+            return file_identity
+        return "", "本账户", verified_account
+    if (control.period_status != "通过" or not file_identity or file_identity != journal_identity
+            or not re.fullmatch(r"[0-9]{10,30}", file_identity[-1])
+            or any(account != file_identity[-1] for account in stated_accounts)
+            or "辅助核算名称" not in raw_journal):
+        return None
+    names = raw_journal["辅助核算名称"].fillna("").astype(str).str.strip()
+    if names.empty or not names.str.extract(r"([0-9]+)$", expand=False).eq(file_identity[-1]).all():
+        return None
+    return file_identity
 
 
 def _balanced_posting_days(frame):
@@ -68,8 +77,12 @@ def _balanced_posting_days(frame):
     return days
 
 
-def _verified_balance_pairs(bank_path, journal_path, raw_bank, raw_journal, bank, journal, control, *, bank_first_row=2):
-    identity = _balance_scope_identity(bank_path, journal_path, raw_journal, control)
+def _verified_balance_pairs(bank_path, journal_path, raw_bank, raw_journal, bank, journal, control, *,
+                            bank_first_row=2, verified_account="", stated_accounts=()):
+    identity = _balance_scope_identity(
+        bank_path, journal_path, raw_journal, control,
+        verified_account=verified_account, stated_accounts=stated_accounts,
+    )
     if identity is None:
         return {}
     company, own_bank, account = identity
@@ -105,7 +118,7 @@ def _verified_balance_pairs(bank_path, journal_path, raw_bank, raw_journal, bank
         voucher = str(voucher_value).strip() if pd.notna(voucher_value) else ""
         summary = str(journal.at[j, "summary"]).strip()
         bank_party = str(bank_original.get("对方户名", "")).strip()
-        if (bank_party == company and re.fullmatch(r"[0-9]{10,30}", other_account)
+        if (company and bank_party == company and re.fullmatch(r"[0-9]{10,30}", other_account)
             and other_account != account and voucher and summary in {"转账", "内部转账", "同名账户划款"}):
             other_bank = bank_original.get("对方开户行")
             other_label = f"{other_bank if pd.notna(other_bank) else '对方账户'}尾号{other_account[-4:]}"
@@ -499,6 +512,17 @@ def run_reconciliation(
             return
         progress_callback(_map_matcher_progress(value))
 
+    account_passed = any(item.name == "核对账户" and item.status == "通过" for item in precheck_report.items)
+    stated_accounts = {
+        normalized_identity(value, "account")
+        for frame in (bank, journal) for value in frame["account"].dropna().unique()
+    } - {""}
+    verified_account = ""
+    if account_passed and len(stated_accounts) == 1:
+        account = next(iter(stated_accounts))
+        if re.fullmatch(r"[0-9A-Z]+", account):
+            verified_account = account
+
     matcher = Matcher(
         bank,
         journal,
@@ -509,10 +533,12 @@ def run_reconciliation(
         overall_control=precheck_report.overall_control,
         balance_scope_verified=_balance_scope_identity(
             bank_path, journal_path, raw_journal, precheck_report.overall_control,
+            verified_account=verified_account, stated_accounts=stated_accounts,
         ) is not None,
         verified_balance_pairs=_verified_balance_pairs(
             bank_path, journal_path, raw_bank, raw_journal, bank, journal, precheck_report.overall_control,
             bank_first_row=bank_structure.skiprows + bank_structure.header_rows + 1,
+            verified_account=verified_account, stated_accounts=stated_accounts,
         ),
     )
     if matcher_ready:

@@ -1523,9 +1523,11 @@ class Matcher:
             self.config,
             bank_fields,
             journal_fields,
+            llm_semantic_score=candidate.llm_decision.semantic_score if candidate.llm_decision else None,
         )
         if (
-            candidate.metrics.total_diff_li == 0
+            candidate.llm_decision is None
+            and candidate.metrics.total_diff_li == 0
             and not candidate.evidence.get("resolves_full_group")
             and int(candidate.evidence.get("business_strength", 0)) < 2
         ):
@@ -2119,8 +2121,41 @@ class Matcher:
             ),
         )
 
+    def _agent_verified_candidate(self, selected, competitors, request):
+        """语义意见只能解决同一原始记录的竞争，其他确认条件沿用分流规则。"""
+        decision = selected.llm_decision
+        if (
+            decision.provider != "当前 Agent"
+            or decision.semantic_score < self.config.auto_confirm_score
+            or not decision.reason.strip()
+            or selected.metrics.total_diff_li
+            or selected.date_span_days > self.config.tolerance_days
+            or has_business_conflict(selected)
+        ):
+            return None
+        bank_rows, ledger_rows = set(selected.bank_idxs), set(selected.journal_idxs)
+        alternatives = [candidate for candidate in competitors
+                        if (candidate.bank_idxs, candidate.journal_idxs) != (selected.bank_idxs, selected.journal_idxs)
+                        and (bank_rows.intersection(candidate.bank_idxs) or ledger_rows.intersection(candidate.journal_idxs))
+                        and not has_business_conflict(candidate)]
+        submitted = {candidate.candidate_id: candidate for candidate in request.candidates}
+        if not alternatives or any(
+            candidate.candidate_id not in submitted or relationship_priority(candidate) > relationship_priority(selected)
+            for candidate in alternatives
+        ):
+            return None
+        chosen_fields = replace(submitted[selected.candidate_id], candidate_id="")
+        if any(replace(submitted[candidate.candidate_id], candidate_id="") == chosen_fields for candidate in alternatives):
+            return None
+        verified = replace(selected, is_ambiguous=False, evidence={**selected.evidence, "agent_confirmed": True})
+        self._score_existing_candidate(verified)
+        status, _, _ = route_candidate(verified, self.config)
+        if status in {ProcessingStatus.AUTO_CONFIRMED, ProcessingStatus.GROUP_RECONCILED}:
+            return verified
+        return None
+
     def _apply_llm_assistance(self) -> None:
-        """只增强含糊候选的文字分，硬性金额和状态规则保持不变。"""
+        """复核竞争候选，满足程序核验条件的 Agent 意见可确认对应。"""
         if self.llm_assistant is None:
             return
         assistant_config = getattr(self.llm_assistant, "config", None)
@@ -2133,7 +2168,12 @@ class Matcher:
 
         request_sequence = len(self.llm_records)
         for group in self._group_ambiguous_candidates():
-            eligible = list(group)
+            if self.stopping:
+                break
+            distinct = {}
+            for candidate in sorted(group, key=self._candidate_sort_key):
+                distinct.setdefault((candidate.bank_idxs, candidate.journal_idxs), candidate)
+            eligible = list(distinct.values())
             if not eligible:
                 continue
             if (
@@ -2161,10 +2201,7 @@ class Matcher:
             if not needs_llm:
                 continue
 
-            limited = sorted(
-                eligible,
-                key=self._candidate_sort_key,
-            )[: self._llm_candidate_limit()]
+            limited = eligible[:self._llm_candidate_limit()]
             request_sequence += 1
             semantic_request = CandidateSemanticRequest(
                 request_id=f"LLM{request_sequence:06d}",
@@ -2244,19 +2281,10 @@ class Matcher:
                 == decision.selected_candidate_id
             )
             selected.llm_decision = decision
-            score_candidate(
-                selected,
-                self.config,
-                self._merged_text_fields(
-                    self.bank,
-                    selected.bank_idxs,
-                ),
-                self._merged_text_fields(
-                    self.journal,
-                    selected.journal_idxs,
-                ),
-                llm_semantic_score=decision.semantic_score,
-            )
+            self._score_existing_candidate(selected)
+            verified = self._agent_verified_candidate(selected, eligible, semantic_request)
+            if verified is not None:
+                self._lock(verified)
 
     @staticmethod
     def _legacy_confidence(score: int) -> str:
@@ -2275,7 +2303,13 @@ class Matcher:
         )]
         self._add_closed_candidate_groups()
         self._refresh_candidate_ambiguity()
+        locked_before_review = len(self._locked_candidates)
         self._apply_llm_assistance()
+        if len(self._locked_candidates) > locked_before_review:
+            self.candidates = [candidate for candidate in self.candidates
+                               if not self._locked_rows["bank"].intersection(candidate.bank_idxs)
+                               and not self._locked_rows["journal"].intersection(candidate.journal_idxs)]
+            self._refresh_candidate_ambiguity()
         selection_diagnostics: Dict[str, Any] = {}
         self.selected_candidates = self._locked_candidates + select_non_conflicting_candidates(
             self.candidates,

@@ -700,6 +700,14 @@ def _auxiliary_result(
     return "；".join(parts), low
 
 
+def statement_filename_identity(path: Path) -> tuple[str, str, str] | None:
+    stem = re.sub(r"[-_](?:银行存款日记账|银行日记账|银行存款序时账|日记账|序时账)$", "", path.stem)
+    parts = tuple(part.strip() for part in stem.rsplit("-", 2))
+    if len(parts) == 3 and all(parts) and re.fullmatch(r"[0-9]+", parts[-1]):
+        return parts
+    return None
+
+
 def _scope_values(
     frame: pd.DataFrame,
     mapping: dict[str, Any],

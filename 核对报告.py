@@ -101,6 +101,15 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
             explanation = "双方记录之间仍有收付金额差额"
         else:
             explanation = "双方金额相同，交易对应尚未确定"
+        if action:
+            reasons = [
+                reason for reason in item["判断依据"].split("；")
+                if reason and not reason.startswith("综合可信度") and reason != "本次匹配未建立对应关系"
+            ]
+            if reasons:
+                explanation += "。具体问题：" + "；".join(reasons)
+            if item["入选原因"]:
+                explanation += "。入选原因：" + item["入选原因"]
         if item["事项编号"] in agent_notes:
             explanation += "。Agent 判断依据：" + agent_notes[item["事项编号"]]
         if action:
@@ -130,6 +139,16 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         ("月度核对结果", message), ("需要人工核对", len(pending)),
         ("明显微小错报临界值", config.clearly_trivial_threshold), ("实际执行重要性水平", config.performance_materiality),
     ]
+    if reporter.precheck_report:
+        overview.append((
+            "余额配对",
+            "已核实本户及双方收支、期初期末余额，可用余额补充核对证据"
+            if reporter.matcher.balance_scope_verified
+            else "未启用余额配对。本次未同时核实账户、双方收支及连续余额",
+        ))
+    review_counts = getattr(reporter.matcher.llm_assistant, "review_counts", None)
+    if review_counts is not None:
+        overview.append(("Agent复核", "，".join(f"{key} {count} 项" for key, count in review_counts.items())))
     if reporter.error_collector and reporter.error_collector.has_errors():
         for error in reporter.error_collector.get_all_errors():
             overview.append(("未读入的记录", f"{error.get('source_type', '')} 第{error.get('row', '')}行：{error.get('reason', '')}"))

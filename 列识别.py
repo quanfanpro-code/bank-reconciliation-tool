@@ -67,9 +67,10 @@ def split_amount_role(label, source):
         return None
     debit = r"借方|借|debit"
     credit = r"贷方|贷|credit"
-    if source == "bank":
-        debit += r"|支出|付款|付方|出账|取款|withdrawal"
-        credit += r"|收入|收款|收方|入账|存款|deposit"
+    outgoing = r"|支出|付款|付方|出账|取款|withdrawal"
+    incoming = r"|收入|收款|收方|入账|存款|deposit"
+    debit += outgoing if source == "bank" else incoming
+    credit += incoming if source == "bank" else outgoing
     roles = [role for role, aliases in (("debit", debit), ("credit", credit))
              if any(re.fullmatch(rf"(?:{aliases})\s*(?:金额|发生额|发生金额|额|amount)?", name)
                     for name in _money_names(parts))]

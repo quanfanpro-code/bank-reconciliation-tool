@@ -1,33 +1,25 @@
 """为 Agent 提供单户及目录核对入口。用户设置由 Agent 在问答中收集。"""
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, replace
 from datetime import datetime
 from decimal import Decimal
 import json
 from pathlib import Path
-import re
 import time
 from uuid import uuid4
 
 from data_structures import MatcherConfig
+from input_precheck import statement_filename_identity
 from 列识别 import ColumnRecognitionError, FIELD_LABELS
-
-
-def _identity(path):
-    stem = re.sub(r"[-_](?:银行存款日记账|银行日记账|银行存款序时账|日记账|序时账)$", "", path.stem)
-    parts = stem.rsplit("-", 2)
-    if len(parts) == 3 and all(part.strip() for part in parts) and parts[-1].isascii() and parts[-1].isdigit():
-        return tuple(part.strip() for part in parts)
-    return None
 
 
 def pair_inputs(bank, journal):
     if bank.is_file() and journal.is_file():
         if bank.resolve() == journal.resolve():
             raise ValueError("银行流水和日记账不能使用同一个文件")
-        left, right = _identity(bank), _identity(journal)
+        left, right = statement_filename_identity(bank), statement_filename_identity(journal)
         if left and right and left != right:
             raise ValueError("两个文件名标明的公司、银行或账号不一致")
         return [(bank, journal)], []
@@ -44,7 +36,7 @@ def pair_inputs(bank, journal):
                 continue
             if path.name.startswith(("~$", ".")) or any(word in path.stem for word in ("核对报告", "导入模板", "输入问题")):
                 continue
-            identity = _identity(path)
+            identity = statement_filename_identity(path)
             if identity is None:
                 problems.append({"原因": f"{label}文件名未标明公司、银行和账号", "文件": str(path)})
             else:
@@ -63,6 +55,10 @@ def pair_inputs(bank, journal):
     return pairs, problems
 
 
+def _review_counts():
+    return Counter({"已完成": 0, "超时": 0, "未复核": 0})
+
+
 class AgentReview:
     """在本次任务目录交接候选和 Agent 答复。"""
 
@@ -70,7 +66,7 @@ class AgentReview:
         self.directory = directory
         self.timeout = timeout
         self.sources = sources
-        self.timed_out = False
+        self.review_counts = _review_counts()
         directory.mkdir(parents=True, exist_ok=True)
 
     def evaluate_candidates(self, request):
@@ -80,9 +76,7 @@ class AgentReview:
         ids = tuple(candidate.candidate_id for candidate in request.candidates)
         verdict = LLMDecisionRecord(request.request_id, ids, provider="当前 Agent", fallback_used=True)
         if len(ids) < 2:
-            return verdict
-        if self.timed_out:
-            verdict.error = "当前 Agent 未在等待时间内返回答复"
+            self.review_counts["未复核"] += 1
             return verdict
 
         token = uuid4().hex
@@ -94,14 +88,17 @@ class AgentReview:
             candidates.append(summary)
         request_path = self.directory / f"request-{token}.json"
         staged = request_path.with_suffix(".new")
-        staged.write_text(json.dumps({"id": token, "sources": self.sources, "candidates": candidates}, ensure_ascii=False), encoding="utf-8")
+        deadline = time.monotonic() + self.timeout
+        expires_at = time.time() + self.timeout
+        staged.write_text(json.dumps({
+            "id": token, "sources": self.sources, "expires_at": expires_at, "candidates": candidates,
+        }, ensure_ascii=False), encoding="utf-8")
         staged.replace(request_path)
         response_path = self.directory / f"answer-{token}.json"
-        deadline = time.monotonic() + self.timeout
-        while not response_path.is_file() and time.monotonic() < deadline:
-            time.sleep(.1)
-        if not response_path.is_file():
-            self.timed_out = True
+        while not response_path.is_file() and (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(.1, remaining))
+        if not response_path.is_file() or response_path.stat().st_mtime > expires_at:
+            self.review_counts["超时"] += 1
             verdict.error = "当前 Agent 未在等待时间内返回答复"
             return verdict
 
@@ -110,15 +107,22 @@ class AgentReview:
         except (OSError, UnicodeError, ValueError):
             answer = None
         if not isinstance(answer, dict) or answer.get("id") != token:
+            self.review_counts["未复核"] += 1
             verdict.error = "Agent 答复无法关联到本次候选"
             return verdict
         selected = answer.get("selected_candidate_id")
         score = answer.get("semantic_score")
         reason = answer.get("reason")
         if selected in ids and type(score) is int and 0 <= score <= 100 and isinstance(reason, str) and reason.strip():
+            self.review_counts["已完成"] += 1
             return replace(verdict, selected_candidate_id=selected, semantic_score=score,
                            reason=reason.strip(), fallback_used=False)
-        verdict.error = "当前 Agent 保留疑点" if not selected else "Agent 返回了无效的候选或依据"
+        if selected == "":
+            self.review_counts["已完成"] += 1
+            verdict.error = "当前 Agent 保留疑点"
+        else:
+            self.review_counts["未复核"] += 1
+            verdict.error = "Agent 返回了无效的候选或依据"
         return verdict
 
 
@@ -135,12 +139,15 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
     suffix = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
     store = LocalProjectStore(session / "项目记录")
     results = []
+    totals = _review_counts()
     for bank_file, journal_file in pairs:
+        reviewer = None
         try:
             target = output / f"{bank_file.stem}_核对报告_{suffix}.xlsx"
+            reviewer = AgentReview(session / "复核", sources=(str(bank_file), str(journal_file)))
 
             def set_reviewer(matcher):
-                matcher.llm_assistant = AgentReview(session / "复核", sources=(str(bank_file), str(journal_file)))
+                matcher.llm_assistant = reviewer
 
             report = run_reconciliation(
                 str(bank_file), str(journal_file),
@@ -149,7 +156,8 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
                 config, llm_config=LLMConfig(enabled=False), logger=log,
                 output_path=target, project_store=store, matcher_ready=set_reviewer,
             )
-            results.append({"银行流水": str(bank_file), "日记账": str(journal_file), "报告": str(report)})
+            results.append({"银行流水": str(bank_file), "日记账": str(journal_file), "报告": str(report),
+                            "Agent复核": dict(reviewer.review_counts)})
         except ColumnRecognitionError as exc:
             problems.append({
                 "银行流水": str(bank_file), "日记账": str(journal_file),
@@ -157,7 +165,10 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
             })
         except Exception as exc:
             problems.append({"银行流水": str(bank_file), "日记账": str(journal_file), "原因": str(exc)})
-    return {"完成": results, "待处理": problems}
+        finally:
+            if reviewer is not None:
+                totals.update(reviewer.review_counts)
+    return {"完成": results, "待处理": problems, "Agent复核": dict(totals)}
 
 
 def _column_overrides(parser, entries):

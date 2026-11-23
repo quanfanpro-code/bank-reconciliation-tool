@@ -389,6 +389,7 @@ def route_candidate(
         and not is_complete_group
         and int(candidate.evidence.get("business_strength", 0)) < 2
         and not candidate.evidence.get("shared_transaction_id")
+        and not candidate.evidence.get("agent_confirmed")
     ):
         reasons.append("金额一致，业务依据不足。缺少可核实的对方信息、业务编号或流水号")
     overall_scope_limited = bool(candidate.evidence.get("overall_scope_limited"))
@@ -418,7 +419,9 @@ def route_candidate(
         status = ProcessingStatus.FLAGGED
     else:
         return ProcessingStatus.AUTO_CONFIRMED, RiskLevel.NORMAL, candidate.evidence.get(
-            "verified_balance_match", "金额完全一致且关系明确",
+            "verified_balance_match",
+            "Agent 核实原表业务依据，双方收支金额一致" if candidate.evidence.get("agent_confirmed")
+            else "金额完全一致且关系明确",
         )
 
     impact_li = (
