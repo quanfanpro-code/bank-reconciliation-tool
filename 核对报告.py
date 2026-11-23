@@ -58,6 +58,12 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
     reporter._prepare_initial_balance()
     daily, monthly = reporter._build_daily_and_monthly_tables()
     items = sorted(build_review_items(reporter.matcher), key=lambda item: (item["首次日期"], item["事项编号"]))
+    agent_notes = {
+        candidate.final_match_id: candidate.llm_decision.reason
+        for candidate in reporter.matcher.selected_candidates
+        if candidate.llm_decision and candidate.llm_decision.provider == "当前 Agent"
+        and not candidate.llm_decision.fallback_used and candidate.llm_decision.reason
+    }
     paths = {"银行": bank_path, "账上": journal_path}
     origins = {}
     for source in getattr(reporter.precheck_report, "source_info", ()):
@@ -95,6 +101,8 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
             explanation = "双方记录之间仍有收付金额差额"
         else:
             explanation = "双方金额相同，交易对应尚未确定"
+        if item["事项编号"] in agent_notes:
+            explanation += "。Agent 判断依据：" + agent_notes[item["事项编号"]]
         if action:
             pending.append((label, action, explanation, _brief(bank), _brief(journal), income, expense, "", "", "查看明细"))
         for side, entries in (("银行", bank), ("账上", journal)):
