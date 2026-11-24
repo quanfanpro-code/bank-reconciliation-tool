@@ -32,7 +32,7 @@ def _records(frame, indices):
         yield row, party, note
 
 
-def _brief(rows, first_row, label):
+def _brief(rows, first_row, label, detail_tab):
     values = []
     for row, party, note in rows[:3]:
         voucher = _text(row.get("voucher_no"))
@@ -40,8 +40,15 @@ def _brief(rows, first_row, label):
         action = "收款" if row["amount"] >= 0 else "付款"
         values.append(f"{row['date']:%m-%d} {action}{abs(row['amount']):,.2f}元 {context}".strip())
     if len(rows) > 3:
-        values.append(f"另{len(rows) - 3}笔见待核对明细第{first_row + 3}–{first_row + len(rows) - 1}行（编号{label}）")
+        values.append(f"另{len(rows) - 3}笔见{detail_tab}第{first_row + 3}–{first_row + len(rows) - 1}行（编号{label}）")
     return "\n".join(values)
+
+
+def _difference_text(income, expense):
+    return "，".join(
+        f"{'银行' if value > 0 else '账上'}{direction}多 {abs(value):,.2f} 元"
+        for direction, value in (("收入", income), ("支出", expense)) if value
+    )
 
 
 def _periods(frame, key, ending, notes):
@@ -62,6 +69,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
     daily, monthly = reporter._build_daily_and_monthly_tables()
     items = sorted(build_review_items(reporter.matcher), key=lambda item: (item["首次日期"], item["事项编号"]))
     automatic = getattr(reporter.matcher, "skill_automatic", False)
+    report_tab, detail_tab = ("差异说明", "差异明细") if automatic else ("待核对", "待核对明细")
     chosen = {candidate.final_match_id for candidate in reporter.matcher.selected_candidates
               if candidate.metrics.total_diff_li == 0 and not candidate.evidence.get("selection_ineligible")}
     duplicates = defaultdict(list)
@@ -171,7 +179,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
             ]
             if reasons:
                 explanation += "。具体问题：" + "；".join(reasons)
-            if item["入选原因"]:
+            if item["入选原因"] and not automatic:
                 explanation += "。入选原因：" + item["入选原因"]
         if item["事项编号"] in agent_notes:
             explanation += "。Agent 判断依据：" + agent_notes[item["事项编号"]]
@@ -190,10 +198,17 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         if action:
             first_review_row = len(review_details) + 2
             count = len(bank) + len(journal)
-            pending.append((label, action, explanation, _brief(bank, first_review_row, label),
-                            _brief(journal, first_review_row + len(bank), label), income, expense, "", "", ""))
+            pending.append((label, action, explanation, _brief(bank, first_review_row, label, detail_tab),
+                            _brief(journal, first_review_row + len(bank), label, detail_tab), income, expense, "", "", ""))
             review_groups.append((action, first_detail_row, first_review_row, count))
             review_details.extend(details[first_detail_row - 2:])
+            if automatic and (difference := _difference_text(income, expense)):
+                sources = "、".join(row[-1] for row in details[first_detail_row - 2:])
+                text = f"{difference}。原行 {sources}"
+                if len(dates) == 1:
+                    daily_notes[dates[0]].append(text)
+                if len(months) == 1:
+                    monthly_notes[months[0]].append(f"{dates[0]:%m月%d日} {text}")
 
     months_with_difference = sum(
         any(pd.notna(value) and value != 0 for value in values)
@@ -237,7 +252,8 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         ("读入笔数", f"银行 {len(reporter.matcher.bank)} 笔，账上 {len(reporter.matcher.journal)} 笔"),
         ("月度核对结果", message), ("差异及范围说明" if automatic else "需要人工核对",
                                   len(pending) if automatic else sum(row[1] != "范围说明" for row in pending)),
-        ("如何查看明细", "在待核对点「查看全部…笔」。待核对明细按编号分组，浅蓝为范围说明，浅黄为核对事项。"),
+        ("如何查看明细", "在差异说明点「查看全部…笔」。差异明细按编号列出原始记录。" if automatic
+         else "在待核对点「查看全部…笔」。待核对明细按编号分组，浅蓝为范围说明，浅黄为核对事项。"),
         ("明显微小错报临界值", config.clearly_trivial_threshold), ("实际执行重要性水平", config.performance_materiality),
     ]
     if reporter.precheck_report:
@@ -259,14 +275,17 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         overview.append(("原表读取说明", f"{source} 第{error.get('row', '')}行。{reason}"))
     pending_frame = pd.DataFrame(pending or [("", "", "本次无差异事项" if automatic else "本次无需人工核对", "", "", None, None, "", "", "")], columns=[
         "编号", "处理方式", "要查什么", "银行记录", "账上记录", "收入差额", "支出差额", "核查结论", "备注", "交易明细"])
+    if automatic:
+        pending_frame = pending_frame.drop(columns=["核查结论", "备注"]).rename(
+            columns={"处理方式": "结果类型", "要查什么": "核对结果"})
     detail_columns = ["编号", "来源", "日期", "收入金额", "支出金额", "余额", "对方", "摘要",
                       "银行备注", "凭证号", "核对结果", "原表位置"]
     tables = {
         "核对总览": pd.DataFrame(overview, columns=["项目", "结果"]),
         "月度核对": _periods(monthly, "月份", "月末余额", monthly_notes),
         "日度核对": _periods(daily, "日期", "日末余额", daily_notes),
-        "待核对": pending_frame,
-        "待核对明细": pd.DataFrame(review_details, columns=detail_columns),
+        report_tab: pending_frame,
+        detail_tab: pd.DataFrame(review_details, columns=detail_columns),
         "交易明细": pd.DataFrame(details, columns=detail_columns),
     }
     plan = 新建簿计划({name: reporter._safe_table(table) for name, table in tables.items()})
@@ -275,13 +294,13 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         sheet.冻结 = "A2"
         if sheet.名称 != "核对总览" and len(sheet.表):
             sheet.筛选 = f"A1:{字母(len(sheet.表.columns))}{len(sheet.表) + 1}"
-    todo = plan.取表("待核对")
+    todo = plan.取表(report_tab)
     if pending:
         todo.表["交易明细"] = [
-            "=" + 明细跳转公式(row, "待核对明细", len(review_details) + 1, f"查看全部{count}笔")
+            "=" + 明细跳转公式(row, detail_tab, len(review_details) + 1, f"查看全部{count}笔")
             for row, (_, _, _, count) in enumerate(review_groups, 2)
         ]
-    targeted = plan.取表("待核对明细")
+    targeted = plan.取表(detail_tab)
     full = plan.取表("交易明细")
     for action, first_detail_row, first_review_row, count in review_groups:
         color = "DFEDFC" if action == "范围说明" else "FFEDBC"
@@ -293,7 +312,8 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
                         上框=("medium", "7891AD") if index == 0 else None,
                     ))
     for row in range(2, len(pending) + 2):
-        for column in (8, 9):
-            todo.盖格(row, column, 格样式(填充色="FFF2CC", 填充类型="solid"))
+        if not automatic:
+            for column in (8, 9):
+                todo.盖格(row, column, 格样式(填充色="FFF2CC", 填充类型="solid"))
         todo.行计划取(row).高 = 68
     渲染簿计划(plan, output_path)

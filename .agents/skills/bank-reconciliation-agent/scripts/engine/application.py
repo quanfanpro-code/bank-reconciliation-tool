@@ -333,7 +333,7 @@ def run_reconciliation(
     facts = dict(coverage_evidence or {})
     try:
         if input_review is not None:
-            from 原表读取 import read_source, 原表
+            from 原表读取 import read_source, verify_journal_summary, 原表
             from 核对期间 import add_balance_point
             prepared = [
                 read_source(path, side, loader, overrides=(mapping or {}).get("_column_overrides"), review=input_review)
@@ -491,6 +491,8 @@ def run_reconciliation(
         raise _blocked_error_with_report(report, destination) from exc
 
     check_cancelled()
+    if prepared is not None:
+        verify_journal_summary(facts["journal"], journal)
     error_summary = collector.get_summary()
     if error_summary["总计"] > 0:
         log(

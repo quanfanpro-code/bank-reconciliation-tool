@@ -149,11 +149,11 @@ def test_范围说明的全部明细按编号着色并可直接跳转(tmp_path):
     Reporter(matcher)._generate_report(str(target))
     assert _验证五表结构(target)["工作表数"] == 6
     book = load_workbook(target)
-    review, subset, full = (book[name] for name in ("待核对", "待核对明细", "交易明细"))
+    review, subset, full = (book[name] for name in ("差异说明", "差异明细", "交易明细"))
     number = review["A2"].value
     assert review["C2"].value == "2025年6月银行缺这些日期的流水，账上有5笔。收付差额无法计算。"
     assert f"第5–6行（编号{number}）" in review["E2"].value
-    assert "待核对明细" in review["J2"].value and "查看全部5笔" in review["J2"].value
+    assert "差异明细" in review["H2"].value and "查看全部5笔" in review["H2"].value
     assert subset.max_row == 6
     assert {subset.cell(row, 1).value for row in range(2, 7)} == {number}
     assert {cell.fill.fgColor.rgb[-6:] for row in subset.iter_rows(min_row=2, max_row=6) for cell in row} == {"DFEDFC"}

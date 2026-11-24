@@ -45,7 +45,40 @@ def _facts(prefix, origin):
                 amount = clean_amount(point[2])
                 if day is not None and amount is not None:
                     add_balance_point(facts, day.normalize(), (amount, origin))
+    month_range = r"(\d{4})\s*年\s*(\d{1,2})\s*月?\s*[-–—－~～至到]\s*(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月"
+    fields = (r"期初.*余额", r"借方(?:发生额|金额|累计额)", r"贷方(?:发生额|金额|累计额)", r"期末.*余额")
+    for row_number, (header, values) in enumerate(zip(prefix, prefix[1:]), 1):
+        month_span = re.search(month_range, lines[row_number - 1])
+        positions = [next((col for col, label in enumerate(header)
+                           if re.fullmatch(field, str(label).strip())), None) for field in fields]
+        if not month_span or any(col is None or col >= len(values) or pd.isna(values[col]) for col in positions):
+            continue
+        amounts = [clean_amount(values[col]) for col in positions]
+        if any(value is None for value in amounts):
+            continue
+        year, month, end_year, end_month = month_span.groups()
+        try:
+            start = pd.Timestamp(year=int(year), month=int(month), day=1)
+            end = pd.Timestamp(year=int(end_year or year), month=int(end_month), day=1) + pd.offsets.MonthEnd(0)
+        except ValueError:
+            continue
+        if start <= end:
+            facts.setdefault("journal_summaries", []).append(
+                (start, end, *amounts, f"{origin} 第{row_number}–{row_number + 1}行"))
     return facts
+
+
+def verify_journal_summary(facts, journal):
+    """原件明示的账期由期初、收付和期末与明细核实后采用。"""
+    for start, end, opening, income, expense, closing, origin in facts.get("journal_summaries", ()):
+        rows = journal.loc[journal["date"].between(start, end)]
+        if opening + income - expense != closing:
+            continue
+        if rows["income"].sum() != income or rows["expense"].sum() != expense:
+            continue
+        facts["periods"].append((start, end, "完整", origin))
+        facts.setdefault("opening", {}).setdefault(start, opening)
+        add_balance_point(facts, end, (closing, origin))
 
 
 def _pages(path, loader):
@@ -143,6 +176,8 @@ def read_source(path, side, loader, *, overrides=None, review=None):
             if kind == "无交易" and not raw[mapping["date"]].dropna().empty:
                 continue
             combined_facts["periods"].append((start, end, kind, source))
+        if side == "journal" and facts.get("journal_summaries"):
+            combined_facts.setdefault("journal_summaries", []).extend(facts["journal_summaries"])
         for day, value in facts["balances"].items():
             add_balance_point(combined_facts, day, value)
         for day, points in facts.get("balance_conflicts", {}).items():

@@ -122,11 +122,14 @@ def apply_coverage(daily, monthly, matcher, daily_notes, monthly_notes):
             daily[balance_column] = None
         if month_column not in monthly:
             monthly[month_column] = None
+        daily[balance_column] = daily[balance_column].astype(object)
         # 明细缺口切断余额结转，从下一条有日期的原始余额重新起算。
         previous = None
         frame = matcher.bank if side == "bank" else matcher.journal
         original_days = set(frame["date"].dt.normalize())
         for index, day in days.items():
+            if day in facts.get("opening", {}):
+                previous = round_decimal(facts["opening"][day])
             point = facts.get("balances", {}).get(day)
             conflicts = facts.get("balance_conflicts", {}).get(day)
             if conflicts:
@@ -154,7 +157,11 @@ def apply_coverage(daily, monthly, matcher, daily_notes, monthly_notes):
                 previous = daily.at[index, balance_column]
             daily.at[index, balance_column] = previous
         for month, mask in days_by_month.items():
-            last = daily.loc[mask].iloc[-1]
+            available = daily.loc[mask & daily[balance_column].notna()]
+            if available.empty:
+                monthly.loc[month_keys.eq(str(month)), month_column] = None
+                continue
+            last = available.iloc[-1]
             value = last[balance_column] if last["日期"].day == month.days_in_month else None
             monthly.loc[month_keys.eq(str(month)), month_column] = value
             if last["日期"].day != month.days_in_month and pd.notna(last[balance_column]):

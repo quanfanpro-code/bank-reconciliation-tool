@@ -15,7 +15,7 @@ from balance import _closed_day_balances
 from data_structures import BusinessEvent
 from 核对期间 import coverage_dates, uncovered_dates
 from llm_assistant import ONLINE_ALLOWED_FIELDS
-from matcher import Matcher, select_non_conflicting_candidates
+from matcher import Matcher, _solve_combination, select_non_conflicting_candidates
 from 业务分组 import candidate_sort_key, has_business_conflict
 
 
@@ -154,13 +154,20 @@ class SkillMatcher(Matcher):
             if not has_business_conflict(candidate):
                 self._lock(candidate)
 
+        self._lock_repeated_balances(gaps)
+        frames = self._frames()
         amounts = {}
-        for side, frame in (("bank", self.bank), ("journal", self.journal)):
+        daily = {}
+        for side, frame in frames.items():
             groups = defaultdict(list)
+            day_rows = defaultdict(list)
             for row in frame[["date", "amount_decimal"]].itertuples():
                 if row.amount_decimal and row.Index not in self._locked_rows[side]:
-                    groups[row.amount_decimal].append((pd.Timestamp(row.date).normalize(), int(row.Index)))
+                    day, index = pd.Timestamp(row.date).normalize(), int(row.Index)
+                    groups[row.amount_decimal].append((day, index))
+                    day_rows[day].append((index, int(row.amount_decimal)))
             amounts[side] = {amount: sorted(rows) for amount, rows in groups.items()}
+            daily[side] = day_rows
 
         exact = {(c.bank_idxs[0], c.journal_idxs[0]): c for c in self.candidates if c.match_type == "exact_1to1"}
         window = pd.Timedelta(days=self.config.tolerance_days)
@@ -170,7 +177,46 @@ class SkillMatcher(Matcher):
             end = bisect_right(days, day + window)
             return rows[start] if end - start == 1 else None
 
-        pending = []
+        def same_day_rows(day):
+            if day not in same_day_cache:
+                eligible = {"bank": defaultdict(list), "journal": defaultdict(list)}
+                for left, right in (("bank", "journal"), ("journal", "bank")):
+                    for index, target in daily[left][day]:
+                        options = [(i, value) for i, value in daily[right][day]
+                                   if value * target > 0 and abs(value) < abs(target)]
+                        if len(options) < 2 or abs(sum(value for _, value in options)) < abs(target):
+                            continue
+                        if len(options) > 18:
+                            # 大组继续用已有预算控制的组合搜索。
+                            eligible[left].setdefault(index, [])
+                            continue
+                        indices, values = zip(*options)
+                        found = _solve_combination(list(values), [day] * len(values), list(indices), target, date_window=0)
+                        if found:
+                            rows, _ = found
+                            b, j = ([index], rows) if left == "bank" else (rows, [index])
+                            combo = self._add_candidate(b, j, "same_day_combination", "同日合计")
+                            if combo is not None and self._can_cover(combo):
+                                unique = True
+                                for omitted in rows:
+                                    alternative = [(i, value) for i, value in options if i != omitted]
+                                    ai, av = zip(*alternative)
+                                    if _solve_combination(list(av), [day] * len(av), list(ai), target, date_window=0):
+                                        unique = False
+                                        break
+                                eligible[left].setdefault(index, [])
+                                for member in rows:
+                                    eligible[right].setdefault(member, [])
+                                if unique:
+                                    eligible[left][index].append(combo)
+                                    for member in rows:
+                                        eligible[right][member].append(combo)
+                same_day_cache[day] = eligible
+            return same_day_cache[day]
+
+        same_day_cache = {}
+        pending = {}
+        preferred = {}
         for amount, bank in amounts["bank"].items():
             journal = amounts["journal"].get(amount, [])
             bank_days = [day for day, _ in bank]
@@ -186,11 +232,76 @@ class SkillMatcher(Matcher):
                     [b], [j], "exact_1to1" if bank_day == journal_day else "tolerance_date", "逐笔核对",
                 )
                 if candidate is not None and self._can_cover(candidate):
-                    pending.append(candidate)
-        self._review_purposes(pending)
-        for candidate in pending:
-            if not has_business_conflict(candidate):
-                candidate.evidence["verified_reconciliation"] = "容差内双方同方向同金额各有一笔"
+                    strong = any(candidate.evidence.get(key) for key in
+                                 ("shared_transaction_id", "shared_business_id", "verified_balance_match"))
+                    has_same_day = False
+                    if bank_day != journal_day and not strong:
+                        bank_options = same_day_rows(bank_day)["bank"]
+                        journal_options = same_day_rows(journal_day)["journal"]
+                        has_same_day = b in bank_options or j in journal_options
+                        for options in (bank_options.get(b, []), journal_options.get(j, [])):
+                            if len(options) == 1:
+                                preferred[options[0].candidate_id] = options[0]
+                        if has_same_day:
+                            # 同日能单独核清的别组不应被余额大组并在一起。
+                            for day in (bank_day, journal_day):
+                                for scoped in same_day_rows(day).values():
+                                    for options in scoped.values():
+                                        if len(options) == 1:
+                                            preferred[options[0].candidate_id] = options[0]
+                    # 同日合计存在时，留给后续完整候选比较，避免锁死相邻的记录。
+                    if not has_same_day:
+                        pending[candidate.candidate_id] = candidate
+        self._review_purposes([*pending.values(), *preferred.values()])
+        for candidates, reason in (
+            ([c for c in pending.values() if c.date_span_days == 0], "同日双方同方向同金额各有一笔"),
+            (preferred.values(), "与跨日同额比较后，同日收支有唯一的合计对应"),
+            ([c for c in pending.values() if c.date_span_days != 0], "容差内双方同方向同金额各有一笔"),
+        ):
+            available = [c for c in candidates if self._can_cover(c)
+                         and not self._locked_rows["bank"].intersection(c.bank_idxs)
+                         and not self._locked_rows["journal"].intersection(c.journal_idxs)]
+            for candidate in select_non_conflicting_candidates(available):
+                candidate.evidence["verified_reconciliation"] = reason
+                self._lock(candidate)
+
+    def _lock_repeated_balances(self, gaps):
+        """同额多笔用各自交易后余额分开。整张凭证的记录均有对应时才拆开显示。"""
+        sides = {}
+        for side, frame in self._frames().items():
+            if "balance" not in frame:
+                return
+            source = frame.loc[~frame.index.isin(self._locked_rows[side]), ["date", "amount_decimal", "balance"]].dropna()
+            duplicate = source.duplicated(["date", "amount_decimal"], keep=False)
+            by_key = defaultdict(list)
+            for index, row in source.iterrows():
+                day = pd.Timestamp(row["date"]).normalize()
+                if row["amount_decimal"] and not any(start <= day <= end for start, end in gaps):
+                    by_key[row["amount_decimal"], row["balance"]].append((int(index), day, duplicate.at[index]))
+            sides[side] = by_key
+        proposed = []
+        for key in sides["bank"].keys() & sides["journal"].keys():
+            left, right = sides["bank"][key], sides["journal"][key]
+            if len(left) != 1 or len(right) != 1:
+                continue
+            (b, bank_day, bank_repeat), (j, journal_day, journal_repeat) = left[0], right[0]
+            if not (bank_repeat and journal_repeat) or abs((bank_day - journal_day).days) > self.config.tolerance_days:
+                continue
+            candidate = self._add_candidate([b], [j], "equal_posting_balance", "逐笔余额")
+            if candidate is not None and candidate.metrics.total_diff_li == 0 and not has_business_conflict(candidate):
+                proposed.append(candidate)
+        self._review_purposes(proposed)
+        proposed = [c for c in proposed if not has_business_conflict(c)]
+        covered = {"bank": {c.bank_idxs[0] for c in proposed}, "journal": {c.journal_idxs[0] for c in proposed}}
+        for candidate in proposed:
+            if candidate.evidence.get("ineligible_reason") == "候选只包含完整凭证的一部分，禁止拆分凭证凑数":
+                indices = {"bank": candidate.bank_idxs[0], "journal": candidate.journal_idxs[0]}
+                if all(group <= covered[side] for side, groups in self._atomic_groups.items()
+                       for group in groups if indices[side] in group):
+                    candidate.evidence.pop("selection_ineligible", None)
+                    candidate.evidence.pop("ineligible_reason", None)
+            if self._can_cover(candidate):
+                candidate.evidence["verified_reconciliation"] = "同额交易分别按不同的交易后余额对应"
                 self._lock(candidate)
 
     def _frames(self):
@@ -324,6 +435,18 @@ class SkillMatcher(Matcher):
             if not self._total_structure_matches(self.bank.loc[bank, "amount_decimal"].tolist(),
                                                  self.journal.loc[journal, "amount_decimal"].tolist()):
                 continue
+            same_day = select_non_conflicting_candidates([c for c in group if c.date_span_days == 0])
+            covered = sum(len(c.bank_idxs) + len(c.journal_idxs) for c in same_day)
+            cross_day = [c for c in group if c.date_span_days > 0]
+            if (cross_day and len(same_day) > 1 and covered == len(bank) + len(journal)
+                    and not any(c.evidence.get("shared_transaction_id") or c.evidence.get("shared_business_id")
+                                for c in cross_day)):
+                self._review_purposes(same_day)
+                if all(self._can_cover(c) for c in same_day):
+                    for c in same_day:
+                        c.evidence["verified_reconciliation"] = "同日收支相符，各原行已完整覆盖"
+                        self._lock(c)
+                    continue
             completion = select_non_conflicting_candidates(group, should_stop=lambda: self.stopping)
             if sum(len(c.bank_idxs) + len(c.journal_idxs) for c in completion) != len(bank) + len(journal):
                 continue
