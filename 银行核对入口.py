@@ -114,9 +114,16 @@ class AgentReview:
         score = answer.get("semantic_score")
         reason = answer.get("reason")
         if selected in ids and type(score) is int and 0 <= score <= 100 and isinstance(reason, str) and reason.strip():
+            evidence = answer.get("source_evidence")
+            fields = ("bank_field", "journal_field", "quote")
+            source_evidence = None
+            if isinstance(evidence, dict) and all(
+                isinstance(evidence.get(field), str) and evidence[field].strip() for field in fields
+            ):
+                source_evidence = tuple(evidence[field].strip() for field in fields)
             self.review_counts["已完成"] += 1
             return replace(verdict, selected_candidate_id=selected, semantic_score=score,
-                           reason=reason.strip(), fallback_used=False)
+                           reason=reason.strip(), source_evidence=source_evidence, fallback_used=False)
         if selected == "":
             self.review_counts["已完成"] += 1
             verdict.error = "当前 Agent 保留疑点"

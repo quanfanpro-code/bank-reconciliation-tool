@@ -61,8 +61,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
     agent_notes = {
         candidate.final_match_id: candidate.llm_decision.reason
         for candidate in reporter.matcher.selected_candidates
-        if candidate.llm_decision and candidate.llm_decision.provider == "当前 Agent"
-        and not candidate.llm_decision.fallback_used and candidate.llm_decision.reason
+        if candidate.evidence.get("agent_confirmed") and candidate.llm_decision
     }
     paths = {"银行": bank_path, "账上": journal_path}
     origins = {}
@@ -140,12 +139,13 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         ("明显微小错报临界值", config.clearly_trivial_threshold), ("实际执行重要性水平", config.performance_materiality),
     ]
     if reporter.precheck_report:
-        overview.append((
-            "余额配对",
-            "已核实本户及双方收支、期初期末余额，可用余额补充核对证据"
-            if reporter.matcher.balance_scope_verified
-            else "未启用余额配对。本次未同时核实账户、双方收支及连续余额",
-        ))
+        if reporter.matcher.balance_windows_checked:
+            balance_result = "已核实本户及双方收支、期初期末余额，并逐日核对余额链"
+        elif reporter.matcher.balance_scope_verified:
+            balance_result = "已核实账户及总体余额。逐日余额链未能核实，未用于跨日或合笔确认"
+        else:
+            balance_result = "本次未同时核实账户、双方收支及连续余额，未启用余额配对"
+        overview.append(("余额配对", balance_result))
     review_counts = getattr(reporter.matcher.llm_assistant, "review_counts", None)
     if review_counts is not None:
         overview.append(("Agent复核", "，".join(f"{key} {count} 项" for key, count in review_counts.items())))

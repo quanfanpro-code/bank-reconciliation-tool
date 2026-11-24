@@ -38,6 +38,7 @@ except ImportError:
 
 # 本地模块导入
 from precision_engine import PrecisionEngine
+from balance import _closed_day_balances
 from data_structures import (
     BusinessClue, BusinessEvent, DifferencePoolResult, LLMDecisionRecord, MatcherConfig,
     MatchCandidate, OverallControlResult,
@@ -54,6 +55,7 @@ from llm_assistant import (
 )
 from matching_policy import (
     _critical_field_category,
+    _normalize_text,
     apply_medium_risk_sampling,
     apply_monthly_difference_pools,
     build_sensitive_field_signals,
@@ -67,7 +69,7 @@ from matching_policy import (
 from utils import normalize_summary
 from 业务分组 import (
     row_business, business_evidence, complete_groups, has_business_conflict,
-    relationship_priority, candidate_sort_key,
+    relationship_priority, candidate_sort_key, _is_generic_summary,
 )
 from 业务事件 import business_identity, detect_same_side_events, has_fee_evidence, rows_share_business
 
@@ -1068,6 +1070,7 @@ class Matcher:
         self.overall_control = overall_control
         self.verified_balance_pairs = verified_balance_pairs or {}
         self.balance_scope_verified = balance_scope_verified
+        self.balance_windows_checked = False
         self._locked_candidates: List[MatchCandidate] = []
         self._locked_rows: Dict[str, Set[int]] = {"bank": set(), "journal": set()}
         self.overall_scope_limited = bool(
@@ -2121,6 +2124,48 @@ class Matcher:
             ),
         )
 
+    def _agent_evidence_basis(self, selected, alternatives):
+        """从已选原行复核双方同文及明示期间，再生成报告依据。"""
+        evidence = selected.llm_decision.source_evidence
+        if evidence is None:
+            return ""
+        bank_field, journal_field, quote = evidence
+        if (bank_field not in ONLINE_ALLOWED_FIELDS or journal_field not in ONLINE_ALLOWED_FIELDS
+                or len(_normalize_text(quote)) < 4 or _is_generic_summary(quote)):
+            return ""
+
+        def normalize(text):
+            return " ".join(unicodedata.normalize("NFKC", str(text)).casefold().split())
+
+        def original_fields(candidate, bank):
+            frame, indexes = (self.bank, candidate.bank_idxs) if bank else (self.journal, candidate.journal_idxs)
+            return [self._row_text_fields(frame, index) for index in indexes]
+
+        bank_rows, journal_rows = original_fields(selected, True), original_fields(selected, False)
+        value = normalize(quote)
+        if (not all(normalize(row.get(bank_field, "")) == value for row in bank_rows)
+                or not all(normalize(row.get(journal_field, "")) == value for row in journal_rows)):
+            return ""
+
+        def texts(rows):
+            return [normalize(text) for row in rows for label, text in row.items() if label in ONLINE_ALLOWED_FIELDS]
+
+        def periods(rows):
+            return {(int(year) if year else None, int(month))
+                    for text in texts(rows)
+                    for year, month in re.findall(r"(?<!\d)(?:(\d{4})\s*年\s*)?(0?[1-9]|1[0-2])\s*月", text)}
+
+        left, right = periods(bank_rows), periods(journal_rows)
+        if left and right and not any(
+            lmonth == rmonth and (lyear == ryear or None in (lyear, ryear))
+            for lyear, lmonth in left for ryear, rmonth in right
+        ):
+            return ""
+        if any(value in texts(original_fields(other, True)) and value in texts(original_fields(other, False))
+               for other in alternatives):
+            return ""
+        return f"银行「{bank_field}」与账上「{journal_field}」原文相符：{bank_rows[0][bank_field]}"
+
     def _agent_verified_candidate(self, selected, competitors, request):
         """语义意见只能解决同一原始记录的竞争，其他确认条件沿用分流规则。"""
         decision = selected.llm_decision
@@ -2144,10 +2189,13 @@ class Matcher:
             for candidate in alternatives
         ):
             return None
-        chosen_fields = replace(submitted[selected.candidate_id], candidate_id="")
-        if any(replace(submitted[candidate.candidate_id], candidate_id="") == chosen_fields for candidate in alternatives):
+        basis = self._agent_evidence_basis(selected, alternatives)
+        if not basis:
             return None
-        verified = replace(selected, is_ambiguous=False, evidence={**selected.evidence, "agent_confirmed": True})
+        verified = replace(
+            selected, is_ambiguous=False, llm_decision=replace(decision, reason=basis),
+            evidence={**selected.evidence, "agent_confirmed": True},
+        )
         self._score_existing_candidate(verified)
         status, _, _ = route_candidate(verified, self.config)
         if status in {ProcessingStatus.AUTO_CONFIRMED, ProcessingStatus.GROUP_RECONCILED}:
@@ -2620,41 +2668,45 @@ class Matcher:
                         self._lock(candidate)
 
     @staticmethod
-    def _daily_postings(frame):
-        """按原文件顺序复核余额链，再按原日期保留每笔交易。"""
+    def _daily_postings(frame, opening_hint=None):
+        """按日核实原行组成的余额链，保持原行索引和金额。"""
         if frame.empty or "balance" not in frame or frame["balance"].isna().any():
             return None
-        rows = frame.sort_values("original_file_row", kind="stable")
-        days = pd.to_datetime(rows["date"]).dt.normalize()
-        if not days.is_monotonic_increasing:
+        days = pd.to_datetime(frame["date"]).dt.normalize()
+        if days.isna().any():
             return None
         postings = {}
-        initial = PrecisionEngine.to_integer_li(rows.iloc[0]["balance"]) - int(rows.iloc[0]["amount_decimal"])
-        previous = initial
-        for index, day, amount, balance in zip(rows.index, days, rows["amount_decimal"], rows["balance"]):
-            ending = PrecisionEngine.to_integer_li(balance)
-            if previous + int(amount) != ending:
+        initial, previous = None, opening_hint
+        for day, rows in frame.groupby(days, sort=True):
+            closed = _closed_day_balances(zip(rows["amount"], rows["balance"]), previous)
+            if closed is None or (previous is not None and closed[0] != previous):
                 return None
-            postings.setdefault(day, []).append((int(index), int(amount), ending))
-            previous = ending
+            if initial is None:
+                initial = PrecisionEngine.to_integer_li(closed[0])
+            previous = closed[1]
+            postings[day] = (
+                PrecisionEngine.to_integer_li(previous),
+                [(int(index), int(amount)) for index, amount in rows["amount_decimal"].items()],
+            )
         return initial, postings
 
     def _lock_balanced_windows(self) -> None:
         if not self.balance_scope_verified:
             return
-        bank, journal = self._daily_postings(self.bank), self._daily_postings(self.journal)
+        bank = self._daily_postings(self.bank, getattr(self.overall_control, "bank_initial_balance", None))
+        journal = self._daily_postings(self.journal, getattr(self.overall_control, "journal_initial_balance", None))
         if bank is None or journal is None or bank[0] != journal[0]:
             return
+        self.balance_windows_checked = True
         bank_balance, journal_balance = bank[0], journal[0]
         bank_remaining, journal_remaining = [], []
         for day in sorted(bank[1].keys() | journal[1].keys()):
-            bank_day, journal_day = bank[1].get(day, ()), journal[1].get(day, ())
-            if bank_day:
-                bank_balance = bank_day[-1][2]
-            if journal_day:
-                journal_balance = journal_day[-1][2]
-            bank_remaining.extend((idx, amount) for idx, amount, _ in bank_day if idx not in self._locked_rows["bank"])
-            journal_remaining.extend((idx, amount) for idx, amount, _ in journal_day if idx not in self._locked_rows["journal"])
+            if day in bank[1]:
+                bank_balance, entries = bank[1][day]
+                bank_remaining.extend((index, amount) for index, amount in entries if index not in self._locked_rows["bank"])
+            if day in journal[1]:
+                journal_balance, entries = journal[1][day]
+                journal_remaining.extend((index, amount) for index, amount in entries if index not in self._locked_rows["journal"])
             if bank_balance == journal_balance:
                 self._match_window_remainder(bank_remaining, journal_remaining)
                 bank_remaining.clear()

@@ -32,14 +32,18 @@ def _table(path, sheet):
         book.close()
 
 
-@pytest.mark.parametrize("score,confirmed", [(100, True), (20, False)])
-def test_Agent原表依据改变最终结果并写入报告(tmp_path, score, confirmed):
+@pytest.mark.parametrize("review,score,confirmed", [
+    ("正确", 100, True), ("低分", 20, False), ("缺证据", 100, False),
+    ("虚构编号", 100, False), ("共同但空泛的字样", 100, False), ("两侧明确期间冲突", 100, False),
+])
+def test_Agent原表依据改变最终结果并写入报告(tmp_path, review, score, confirmed):
     bank, journal = _sources(tmp_path, {
         "交易日期": ["2026-02-05"], "交易金额": [-1000], "摘要": ["转账"],
-        "附言": ["2026年1月天然气款"],
+        "附言": ["2026年1月天然气款"], "备注": ["南站检修服务" if review == "两侧明确期间冲突" else None],
     }, {
         "凭证日期": ["2026-02-05"] * 2, "发生额": [-1000, -1000],
         "摘要": ["2026年1月天然气款", "2025年12月天然气款"],
+        "备注": [None, "南站检修服务" if review == "两侧明确期间冲突" else None],
     })
     session = tmp_path / "任务"
     with ThreadPoolExecutor() as pool:
@@ -51,13 +55,24 @@ def test_Agent原表依据改变最终结果并写入报告(tmp_path, score, con
                 if request in answered:
                     continue
                 packet = json.loads(request.read_text(encoding="utf-8"))
+                chose_correct = review in {"正确", "低分"}
+                note = "2026年1月天然气款" if chose_correct else "2025年12月天然气款"
                 selected = next(item for item in packet["candidates"]
-                                if item["journal_fields"].get("摘要") == "2026年1月天然气款")
+                                if item["journal_fields"].get("摘要") == note)
+                evidence = {
+                    "bank_field": "附言", "journal_field": "摘要",
+                    "quote": {"虚构编号": "不存在的流水号205", "共同但空泛的字样": "天然气款"}.get(review, note),
+                }
+                if review == "两侧明确期间冲突":
+                    evidence = {"bank_field": "备注", "journal_field": "备注", "quote": "南站检修服务"}
+                answer = {
+                    "id": packet["id"], "selected_candidate_id": selected["candidate_id"],
+                    "semantic_score": score, "reason": "Agent 自填的未验证说明",
+                }
+                if review != "缺证据":
+                    answer["source_evidence"] = evidence
                 staged = request.with_suffix(".new")
-                staged.write_text(json.dumps({"id": packet["id"], "selected_candidate_id": selected["candidate_id"],
-                                              "semantic_score": score,
-                                              "reason": "银行附言与账上摘要同为2026年1月天然气款"},
-                                             ensure_ascii=False), encoding="utf-8")
+                staged.write_text(json.dumps(answer, ensure_ascii=False), encoding="utf-8")
                 staged.replace(request.with_name(f"answer-{packet['id']}.json"))
                 answered.add(request)
             assert time.monotonic() < deadline
@@ -68,9 +83,12 @@ def test_Agent原表依据改变最终结果并写入报告(tmp_path, score, con
     records = _table(workbook, "交易明细")[1:]
     debit = next(row for row in records if row[1] == "银行")
     chosen = next(row for row in records if row[0] == debit[0] and row[1] == "账上")
-    if confirmed:
+    if review in {"正确", "低分"}:
         assert chosen[7] == "2026年1月天然气款"
+    assert "Agent 自填的未验证说明" not in debit[10]
+    if confirmed:
         assert "Agent 判断依据" in debit[10]
+        assert "2026年1月天然气款" in debit[10]
     pending = _table(workbook, "待核对")[1:]
     assert all(row[0] != debit[0] for row in pending) is confirmed
     assert result["Agent复核"] == {"已完成": 1, "超时": 0, "未复核": 0}
@@ -98,7 +116,8 @@ def test_Agent评分门槛不改变原候选(score, status, risk):
         def evaluate_candidates(self, request):
             target = next(c for c in request.candidates if c.journal_fields.get("摘要") == "2026年1月天然气款")
             return LLMDecisionRecord(request.request_id, selected_candidate_id=target.candidate_id,
-                                     semantic_score=score, reason="同期间同用途", provider="当前 Agent")
+                                     semantic_score=score, reason="同期间同用途", provider="当前 Agent",
+                                     source_evidence=("附言", "摘要", "2026年1月天然气款"))
 
     matcher = Matcher(bank, journal, CONFIG, llm_assistant=Reviewer())
     matcher.run()
@@ -125,8 +144,11 @@ def test_待核对显示字段冲突和月度入选原因(tmp_path):
     assert all("综合可信度" not in message for message in actions)
 
 
-@pytest.mark.parametrize("use_filename", [False, True])
-def test_余额配对按表内账号或受支持的账单后缀(tmp_path, use_filename):
+@pytest.mark.parametrize("use_filename,bank_reverse,journal_reverse", [
+    (True, False, False), (False, False, False), (False, True, False),
+    (False, False, True), (False, True, True),
+])
+def test_余额配对按表内账号或受支持的账单后缀(tmp_path, use_filename, bank_reverse, journal_reverse):
     account = "001234567890"
     bank_data = {"交易日期": ["2026-02-03", "2026-02-05", "2026-02-05"], "交易金额": [70, -120, -180],
                  "交易后余额": [1000, 880, 700], "摘要": ["同笔收款", "转账", "转账"]}
@@ -140,13 +162,26 @@ def test_余额配对按表内账号或受支持的账单后缀(tmp_path, use_fi
     else:
         bank_data["账户"] = [account] * 3
         journal_data["账户"] = [account] * 2
+    if bank_reverse:
+        bank_data = {key: values[::-1] for key, values in bank_data.items()}
+    if journal_reverse:
+        journal_data = {key: values[::-1] for key, values in journal_data.items()}
     bank, journal = _sources(tmp_path, bank_data, journal_data, names)
     matchers = []
-    run_reconciliation(str(bank), str(journal), None, None, CONFIG,
-                       output_path=tmp_path / "核对.xlsx", matcher_ready=matchers.append)
+    workbook = run_reconciliation(str(bank), str(journal), None, None, CONFIG,
+                                  output_path=tmp_path / "核对.xlsx", matcher_ready=matchers.append)
     assert matchers[0].balance_scope_verified
-    assert [(item["bank_idxs"], item["journal_idxs"], item["processing_status"])
-            for item in matchers[0].matches] == [([0], [0], "自动确认"), ([1, 2], [1], "自动确认")]
+    details = _table(workbook, "交易明细")[1:]
+    payments = [row for row in details if row[4]]
+    assert sorted(row[4] for row in payments) == [120, 180, 300]
+    assert len({row[0] for row in payments}) == 1
+    assert any(item["type"] == "balanced_window" and item["processing_status"] == "自动确认"
+               for item in matchers[0].matches)
+    assert not any(row[0] for row in _table(workbook, "待核对")[1:])
+    assert all(row[11].endswith(f"第{n}行") for row, n in zip(
+        sorted((row for row in payments if row[1] == "银行"), key=lambda row: row[4]),
+        (3, 2) if bank_reverse else (3, 4),
+    ))
 
 
 def test_日记账收入支出分列保留实际方向(tmp_path):
@@ -195,19 +230,19 @@ def test_Agent满分不能确认未排除的其他可能(skipped_reason):
         frame = pd.DataFrame(rows)
         return DataLoader().standardize_data(frame, {
             "mode": "signed_amount", "date": "日期", "amount": "金额",
-            "summary": "摘要", "auxiliary_text_columns": ["摘要", "对方户名"],
+            "summary": "摘要", "auxiliary_text_columns": ["摘要", "备注", "对方户名"],
         }, source)
 
     day = "2026-02-05"
-    bank = read([{"日期": day, "金额": 1000, "摘要": "转账", "对方户名": "甲公司"}], "bank")
-    journals = [{"日期": day, "金额": 1000, "摘要": "一月设备款", "对方户名": ""}]
-    journals.append({**journals[0], "摘要": "二月设备款"})
+    bank = read([{"日期": day, "金额": 1000, "摘要": "转账", "对方户名": "甲公司", "备注": "北仓工程款"}], "bank")
+    journals = [{"日期": day, "金额": 1000, "摘要": "一月设备款", "对方户名": "", "备注": "北仓工程款"}]
+    journals.append({**journals[0], "摘要": "二月设备款", "备注": "南仓工程款"})
     if skipped_reason == "明确冲突":
         journals[0]["对方户名"] = "乙公司"
     elif skipped_reason == "候选无法区分":
-        journals[1]["摘要"] = journals[0]["摘要"]
+        journals[1]["备注"] = journals[0]["备注"]
     else:
-        journals.append({**journals[0], "摘要": "三月设备款"})
+        journals.append({**journals[0], "摘要": "三月设备款", "备注": "西仓工程款"})
     journal = read(journals, "journal")
 
     class Reviewer:
@@ -217,7 +252,8 @@ def test_Agent满分不能确认未排除的其他可能(skipped_reason):
             target = next((candidate for candidate in request.candidates
                            if candidate.journal_fields.get("摘要") == "一月设备款"), request.candidates[0])
             return LLMDecisionRecord(request.request_id, selected_candidate_id=target.candidate_id,
-                                     semantic_score=100, reason="Agent 给出判断", provider="当前 Agent")
+                                     semantic_score=100, reason="Agent 给出判断", provider="当前 Agent",
+                                     source_evidence=("备注", "备注", "北仓工程款"))
 
     matcher = Matcher(bank, journal, CONFIG, llm_assistant=Reviewer())
     matcher.run()

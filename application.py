@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from data_loader import DataLoader, ParseErrorCollector
+from balance import _closed_day_balances
 from data_structures import MatcherConfig
 from input_precheck import (
     InputPrecheckBlockedError,
@@ -61,19 +62,18 @@ def _balance_scope_identity(bank_path, journal_path, raw_journal, control, *,
     return file_identity
 
 
-def _balanced_posting_days(frame):
-    """按原表顺序验证日内余额链，按有方向的金额统计逐笔组成。"""
+def _balanced_posting_days(frame, opening_hint=None):
+    """按原表金额和余额验证日内链，按交易方向统计逐笔组成。"""
     days = {}
-    for day, rows in frame.groupby(pd.to_datetime(frame["date"]).dt.normalize(), sort=False):
-        if len(rows) < 2 or rows[["amount", "balance"]].isna().any().any():
-            continue
-        rows = rows.sort_values("original_file_row", kind="stable")
-        before = rows["balance"] - rows["amount"]
-        if before.iloc[1:].tolist() != rows["balance"].iloc[:-1].tolist():
+    previous = opening_hint
+    for day, rows in frame.groupby(pd.to_datetime(frame["date"]).dt.normalize(), sort=True):
+        closed = _closed_day_balances(zip(rows["amount"], rows["balance"]), previous)
+        previous = closed[1] if closed is not None else None
+        if closed is None or len(rows) < 2:
             continue
         amounts = Counter(rows["amount"])
         unique = {amount: index for index, amount in rows["amount"].items() if amounts[amount] == 1 and amount}
-        days[day] = ((before.iloc[0], rows["balance"].iloc[-1], amounts), unique)
+        days[day] = ((*closed, amounts), unique)
     return days
 
 
@@ -100,8 +100,9 @@ def _verified_balance_pairs(bank_path, journal_path, raw_bank, raw_journal, bank
         b, j = bank_indexes[0], journal_indexes[0]
         pairs[b, j] = (key[0], key[1], False)
 
-    journal_days = _balanced_posting_days(journal)
-    for day, (bank_controls, bank_unique) in _balanced_posting_days(bank).items():
+    journal_days = _balanced_posting_days(journal, control.journal_initial_balance)
+    bank_days = _balanced_posting_days(bank, control.bank_initial_balance)
+    for day, (bank_controls, bank_unique) in bank_days.items():
         if day not in journal_days or bank_controls != journal_days[day][0]:
             continue
         for amount, b in bank_unique.items():

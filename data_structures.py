@@ -127,6 +127,7 @@ class LLMDecisionRecord:
     fallback_used: bool = False
     error: str = ""
     raw_response: str = ""
+    source_evidence: Optional[tuple[str, str, str]] = None
 
 
 @dataclass
