@@ -110,10 +110,14 @@ def _verified_balance_pairs(bank_path, journal_path, raw_bank, raw_journal, bank
             pairs.setdefault((b, j), (day, amount, True))
 
     row_numbers = raw_bank.get("__file_row__", raw_bank.index + bank_first_row)
-    bank_rows = raw_bank.set_axis(row_numbers)
+    labels = zip(raw_bank["__sheet__"], row_numbers) if "__sheet__" in raw_bank else row_numbers
+    bank_rows = {key: row for key, (_, row) in zip(labels, raw_bank.iterrows())}
     verified = {}
     for (b, j), (day, amount, different_order) in pairs.items():
-        bank_original = bank_rows.loc[int(bank.at[b, "original_file_row"])]
+        key = int(bank.at[b, "original_file_row"])
+        if "__sheet__" in raw_bank:
+            key = (bank.at[b, "original_sheet"], key)
+        bank_original = bank_rows[key]
         other_account = str(bank_original.get("对方账号", "")).strip()
         voucher_value = journal.at[j, "voucher_no"]
         voucher = str(voucher_value).strip() if pd.notna(voucher_value) else ""
@@ -285,6 +289,8 @@ def run_reconciliation(
     ] = None,
     project_store: Optional[LocalProjectStore] = None,
     cancel_requested: Optional[Callable[[], bool]] = None,
+    input_review: Optional[Callable] = None,
+    coverage_evidence: Optional[dict] = None,
 ) -> Path:
     """读取、标准化、匹配并生成 Excel 报告。
 
@@ -300,7 +306,7 @@ def run_reconciliation(
         if output_path is not None
         else _default_output_path(bank_path, journal_path)
     )
-    for source_path in (Path(bank_path), Path(journal_path)):
+    for source_path in map(Path, filter(None, (bank_path, journal_path))):
         if destination.resolve() == source_path.resolve() or (
             destination.exists() and source_path.exists()
             and destination.samefile(source_path)
@@ -323,36 +329,56 @@ def run_reconciliation(
     load_started = time.perf_counter()
     log("开始读取银行流水和银行存款序时账")
     check_cancelled()
+    prepared = None
+    facts = dict(coverage_evidence or {})
     try:
-        bank_structure = _adopt_structure(
-            bank_path,
-            loader.detect_table_structure(bank_path),
-            bank_skiprows,
-            bank_header_rows,
-        )
-        journal_structure = _adopt_structure(
-            journal_path,
-            loader.detect_table_structure(journal_path),
-            journal_skiprows,
-            journal_header_rows,
-        )
-        raw_bank = loader.load_file(
-            bank_path,
-            skiprows=bank_structure.skiprows,
-            header_rows=bank_structure.header_rows,
-            derived_columns=bank_structure.columns,
-        )
-        raw_journal = loader.load_file(
-            journal_path,
-            skiprows=journal_structure.skiprows,
-            header_rows=journal_structure.header_rows,
-            derived_columns=journal_structure.columns,
-        )
+        if input_review is not None:
+            from 原表读取 import read_source, 原表
+            from 核对期间 import add_balance_point
+            prepared = [
+                read_source(path, side, loader, overrides=(mapping or {}).get("_column_overrides"), review=input_review)
+                if path else None
+                for path, side, mapping in ((bank_path, "bank", bank_mapping), (journal_path, "journal", journal_mapping))
+            ]
+            if bool(bank_path) != bool(journal_path):
+                index = 0 if bank_path else 1
+                known = prepared[index]
+                prepared[1 - index] = 原表(known.raw.iloc[:0].copy(), known.structure, known.mapping.copy(),
+                                         {"periods": [], "balances": {}})
+            left, right = prepared
+            raw_bank, bank_structure = left.raw, left.structure
+            raw_journal, journal_structure = right.raw, right.structure
+            for side, source in zip(("bank", "journal"), prepared):
+                current = facts.get(side, {})
+                source.facts["periods"].extend(current.get("periods", ()))
+                for day, value in current.get("balances", {}).items():
+                    add_balance_point(source.facts, day, value)
+                for day, points in current.get("balance_conflicts", {}).items():
+                    for value in points:
+                        add_balance_point(source.facts, day, value)
+                facts[side] = source.facts
+        else:
+            bank_structure = _adopt_structure(
+                bank_path, loader.detect_table_structure(bank_path), bank_skiprows, bank_header_rows,
+            )
+            journal_structure = _adopt_structure(
+                journal_path, loader.detect_table_structure(journal_path), journal_skiprows, journal_header_rows,
+            )
+            raw_bank = loader.load_file(
+                bank_path, skiprows=bank_structure.skiprows, header_rows=bank_structure.header_rows,
+                derived_columns=bank_structure.columns,
+            )
+            raw_journal = loader.load_file(
+                journal_path, skiprows=journal_structure.skiprows, header_rows=journal_structure.header_rows,
+                derived_columns=journal_structure.columns,
+            )
         log(
             f"文件读取完成：银行流水 {len(raw_bank):,} 行，"
             f"银行存款序时账 {len(raw_journal):,} 行，"
             f"耗时 {time.perf_counter() - load_started:.1f} 秒"
         )
+    except ColumnRecognitionError:
+        raise
     except Exception as exc:
         report = _blocked_report(
                 "文件读取",
@@ -369,12 +395,15 @@ def run_reconciliation(
 
     column_issues = []
     mappings = []
-    for source, path, raw, supplied in (
+    for index, (source, path, raw, supplied) in enumerate((
         ("bank", bank_path, raw_bank, bank_mapping),
         ("journal", journal_path, raw_journal, journal_mapping),
-    ):
+    )):
         choices = {}
-        if not supplied or supplied.get("_column_auto"):
+        if prepared is not None:
+            mapping = prepared[index].mapping
+            problems = _mapping_problems(mapping, raw.columns, source)
+        elif not supplied or supplied.get("_column_auto"):
             result = recognize_columns(
                 raw, source, overrides=(supplied or {}).get("_column_overrides"), date_format=date_format,
             )
@@ -412,6 +441,7 @@ def run_reconciliation(
             date_format,
             skiprows_offset=bank_structure.skiprows,
             header_rows=bank_structure.header_rows,
+            recover_amounts=prepared is not None,
         )
         journal = loader.standardize_data(
             raw_journal.copy(),
@@ -420,6 +450,7 @@ def run_reconciliation(
             date_format,
             skiprows_offset=journal_structure.skiprows,
             header_rows=journal_structure.header_rows,
+            recover_amounts=prepared is not None,
         )
         log(
             f"数据解析完成：银行流水有效交易 {len(bank):,} 行，"
@@ -483,12 +514,23 @@ def run_reconciliation(
         bank_structure=bank_structure,
         journal_structure=journal_structure,
         parse_errors=collector.get_all_errors(),
-        source_info=(
-            _source_info(bank_path, "银行流水", bank_mapping, bank_structure),
-            _source_info(journal_path, "银行日记账", journal_mapping, journal_structure),
-        ),
+        source_info=tuple(_source_info(path, label, mapping, structure) for path, label, mapping, structure in (
+            (bank_path, "银行流水", bank_mapping, bank_structure),
+            (journal_path, "银行日记账", journal_mapping, journal_structure),
+        ) if path),
+        verified_periods=facts,
     )
-    if precheck_report.has_blockers:
+    blockers = [item for item in precheck_report.items if item.status == "无法计算"]
+    scope_conflicts = [item for item in blockers if item.name in {"核对账户", "核对币种", "金额口径"}]
+    if prepared is not None and (not bank_path or not journal_path):
+        missing = "日记账" if not journal_path else "银行流水"
+        scope_conflicts = [PrecheckItem("输入范围", "", "", f"缺少{missing}", "无法计算", "仅列示已读到的一侧")]
+        blockers = scope_conflicts
+    elif prepared is not None and any(frame.empty for frame in (bank, journal)) and blockers:
+        if all(item.name in {"日期范围", "金额合计", "文件读取"} for item in blockers):
+            scope_conflicts = blockers
+    separate_sources = bool(prepared is not None and scope_conflicts and len(scope_conflicts) == len(blockers))
+    if precheck_report.has_blockers and not separate_sources:
         raise _blocked_error_with_report(precheck_report, destination)
     if precheck_report.has_warnings:
         log(
@@ -545,6 +587,14 @@ def run_reconciliation(
     )
     if matcher_ready:
         matcher_ready(matcher)
+    if facts:
+        matcher.coverage_evidence = facts
+    if separate_sources:
+        matcher.scope_conflicts = scope_conflicts
+        matcher.empty_unverified_sides = {
+            side for side, frame in (("银行", bank), ("账上", journal)) if frame.empty
+            and not any(kind == "无交易" for _, _, kind, _ in facts.get("bank" if side == "银行" else "journal", {}).get("periods", ()))
+        }
     match_started = time.perf_counter()
     log(
         f"开始形成核对候选：银行流水 {len(bank):,} 行，"
@@ -587,18 +637,12 @@ def run_reconciliation(
     log("开始保存列映射模板和核对项目历史")
     try:
         store = project_store or LocalProjectStore()
-        store.save_mapping_template(
-            "bank",
-            raw_bank.columns,
-            bank_mapping,
-            f"银行流水-{Path(bank_path).stem}",
-        )
-        store.save_mapping_template(
-            "journal",
-            raw_journal.columns,
-            journal_mapping,
-            f"银行存款序时账-{Path(journal_path).stem}",
-        )
+        for side, side_path, raw, mapping, name in (
+            ("bank", bank_path, raw_bank, bank_mapping, "银行流水"),
+            ("journal", journal_path, raw_journal, journal_mapping, "银行存款序时账"),
+        ):
+            if side_path:
+                store.save_mapping_template(side, raw.columns, mapping, f"{name}-{Path(side_path).stem}")
         store.save_project(
             bank_path=bank_path,
             journal_path=journal_path,

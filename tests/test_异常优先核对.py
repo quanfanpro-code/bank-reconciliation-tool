@@ -77,7 +77,7 @@ def test_同额冲突和差额未被掩盖():
     ledger = frame(("2026-01-01", 40000, "收款", {"对方户名": "乙有限公司"}),
                    ("2026-01-01", -50000, "转账", {}))
     items = build_review_items(run(bank, ledger))
-    assert any(item["核对方式"] == "人工全查" and "对方户名" in item["判断依据"] for item in items)
+    assert any(item["核对方式"] == "差异说明" and "对方户名" in item["判断依据"] for item in items)
     assert sum(item["银行支出"] - item["日记账支出"] for item in items) == Decimal("30000")
 
 
@@ -110,7 +110,7 @@ def test_语义冲突由Agent读原文决定():
     ledger = frame(("2026-01-20", -50000, "购设备款", {}))
     responder = Review("conflict", "发放工资")
     result = build_review_items(run(bank, ledger, llm_assistant=responder))
-    assert result[0]["核对方式"] == "人工全查"
+    assert result[0]["核对方式"] == "差异说明"
     assert "发放工资" in result[0]["判断依据"] and "购设备款" in result[0]["判断依据"]
     invalid = Review("conflict", "银行原表没有这句话")
     result = build_review_items(run(bank, ledger, llm_assistant=invalid))
@@ -124,7 +124,7 @@ def test_银行同日等额收付仍保留两个方向的实际差额():
                  ("2026-01-21", 1000, "收款", {"余额": Decimal("2000")}))
     ledger = frame(("2026-01-21", 1000, "收款", {"余额": Decimal("2000")}))
     items = build_review_items(run(bank, ledger))
-    actions = [i for i in items if i["核对方式"] == "人工全查"]
+    actions = [i for i in items if i["核对方式"] == "差异说明"]
     assert len(actions) == 1
     assert actions[0]["银行索引"] == (0, 1)
     assert actions[0]["银行收入"] == actions[0]["银行支出"] == Decimal("50000")

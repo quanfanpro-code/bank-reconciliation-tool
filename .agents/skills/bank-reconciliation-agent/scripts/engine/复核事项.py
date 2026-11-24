@@ -7,7 +7,7 @@ import pandas as pd
 from data_structures import ProcessingStatus, RiskLevel
 from matching_policy import build_difference_components, build_group_metrics, risk_level_for
 from precision_engine import PrecisionEngine
-from 业务事件 import business_identity
+from 业务事件 import _refund_business, business_identity
 
 
 def build_review_items(matcher) -> list[dict]:
@@ -16,6 +16,7 @@ def build_review_items(matcher) -> list[dict]:
     occupied = {"bank": set(), "journal": set()}
     frames = {"bank": matcher.bank, "journal": matcher.journal}
     candidates = list(getattr(matcher, "selected_candidates", []))
+    automatic = getattr(matcher, "skill_automatic", False)
     by_candidate = {}
     pool_parts = defaultdict(list)
     risk_order = {risk.value: order for order, risk in enumerate(RiskLevel)}
@@ -23,7 +24,16 @@ def build_review_items(matcher) -> list[dict]:
 
     def make_item(identity, bank_idxs, journal_idxs, conclusion, risk, impact, difference, reason, **extra):
         indexes = {"bank": tuple(bank_idxs), "journal": tuple(journal_idxs)}
-        amounts = {side: [int(frames[side].loc[index, "amount_decimal"]) for index in indexes[side]] for side in frames}
+        amounts = {}
+        for side, frame in frames.items():
+            if {"income", "expense"} <= set(frame.columns):
+                amounts[side] = [
+                    PrecisionEngine.to_integer_li(value) * sign
+                    for incoming, outgoing in frame.loc[list(indexes[side]), ["income", "expense"]].itertuples(index=False, name=None)
+                    for value, sign in ((incoming, 1), (outgoing, -1)) if value
+                ]
+            else:
+                amounts[side] = [int(frame.at[index, "amount_decimal"]) for index in indexes[side]]
         days = [pd.Timestamp(frames[side].loc[index, "date"]) for side in frames for index in indexes[side]]
         metrics = build_group_metrics(amounts["bank"], amounts["journal"])
         item = {
@@ -93,7 +103,7 @@ def build_review_items(matcher) -> list[dict]:
             explicit = any(any(word in str(row.get("summary", "")) + str(row.get("aux_text_fields", {}))
                                for word in ("冲正", "拒绝入账")) for row in pair)
             same_day = pd.Timestamp(pair[0]["date"]).normalize() == pd.Timestamp(pair[1]["date"]).normalize()
-            bank_reversal = bool(explicit and same_day and party and business_identity(pair[1])[1] == party
+            bank_reversal = bool(explicit and same_day and party and _refund_business(*pair)[0]
                                  and all(sum(pd.Timestamp(row["date"]).normalize() == pd.Timestamp(p["date"]).normalize()
                                              and int(row["amount_decimal"]) == int(p["amount_decimal"])
                                              and business_identity(row)[1] == party
@@ -111,6 +121,10 @@ def build_review_items(matcher) -> list[dict]:
             reason = f"{event.event_type}：{event.relationship_formula}；{event.evidence_basis}"
             if not closed:
                 reason += "；尚未与另一侧建立对应"
+        if automatic:
+            conflicts = set().union(*(getattr(matcher, "row_conflicts", {}).get((side, index), set()) for index in indexes))
+            if conflicts:
+                reason += "；" + "；".join(sorted(conflicts))
         item = make_item(
             identity, indexes if side == "bank" else (), indexes if side == "journal" else (),
             "账内更正已闭合" if correction else "银行冲正已闭合" if bank_reversal else "同侧业务链" if event else f"{side_name}未对应", risk, impact, impact, reason,
@@ -159,6 +173,9 @@ def build_review_items(matcher) -> list[dict]:
         elif item["程序结论"] in {ProcessingStatus.AUTO_CONFIRMED.value, ProcessingStatus.GROUP_RECONCILED.value} and risk == RiskLevel.NORMAL.value:
             item["核对方式"] = "自动确认"
             item["入选原因"] = "程序已确认对应关系"
+        elif automatic:
+            item["核对方式"] = "差异说明"
+            item["入选原因"] = item["入选原因"].rstrip("；")
         elif risk in {RiskLevel.HIGH.value, RiskLevel.UNKNOWN.value}:
             item["核对方式"] = "人工全查"
             item["入选原因"] = item["入选原因"].rstrip("；") or (
@@ -167,6 +184,8 @@ def build_review_items(matcher) -> list[dict]:
             item["核对方式"] = "留存备查"
             item["入选原因"] = "影响不超过明显微小错报临界值，留存备查"
 
+    if automatic:
+        return items
     mediums = sorted([item for item in items if item["风险等级"] == RiskLevel.MEDIUM.value],
                      key=lambda item: (item["首次日期"], item["事项编号"]))
     high_count = sum(item["风险等级"] == RiskLevel.HIGH.value for item in items)

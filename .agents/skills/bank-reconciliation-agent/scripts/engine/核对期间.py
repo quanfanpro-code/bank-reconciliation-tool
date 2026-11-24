@@ -7,21 +7,30 @@ import pandas as pd
 from utils import round_decimal
 
 
-def parse_coverage_evidence(data):
+def parse_coverage_evidence(data, *, retain_conflicting=False):
     """按银行或账上来源及完整文件名绑定凭据。"""
     if not isinstance(data, dict) or data.keys() - {"bank", "journal"}:
         raise ValueError("覆盖凭据须按 bank 和 journal 区分来源")
-    return {side: _parse_files(files) for side, files in data.items()}
+    return {side: _parse_files(files, retain_conflicting) for side, files in data.items()}
 
 
-def _parse_files(data):
+def add_balance_point(facts, day, value):
+    balances = facts["balances"]
+    first = balances.setdefault(day, value)
+    if first[0] != value[0]:
+        points = facts.setdefault("balance_conflicts", {}).setdefault(day, [first])
+        if value not in points:
+            points.append(value)
+
+
+def _parse_files(data, retain_conflicting):
     if not isinstance(data, dict):
         raise ValueError("覆盖凭据必须按输入文件名提供")
     result = {}
     for filename, raw in data.items():
         if not filename or "/" in filename or chr(92) in filename or not isinstance(raw, dict):
             raise ValueError("覆盖凭据必须使用输入文件的完整文件名")
-        balances, periods = {}, []
+        facts = {"balances": {}, "periods": []}
         for point in raw.get("balances", []):
             day = _day(point["date"])
             source = _source(point["source"])
@@ -31,16 +40,17 @@ def _parse_files(data):
                 raise ValueError("余额凭据的金额无效") from exc
             if not amount.is_finite():
                 raise ValueError("余额凭据的金额无效")
-            if day in balances and balances[day][0] != amount:
+            balances = facts["balances"]
+            if not retain_conflicting and day in balances and balances[day][0] != amount:
                 raise ValueError(f"{filename}在{day:%Y-%m-%d}有两条不同的银行余额凭据")
-            balances[day] = (amount, source)
+            add_balance_point(facts, day, (amount, source))
         for period in raw.get("coverage", []):
             start, end = _day(period["start"]), _day(period["end"])
             kind, source = period["kind"], _source(period["source"])
             if start > end or kind not in {"完整", "无交易", "不完整"}:
                 raise ValueError("覆盖范围或类别有误")
-            periods.append((start, end, kind, source))
-        result[filename] = {"balances": balances, "periods": periods}
+            facts["periods"].append((start, end, kind, source))
+        result[filename] = facts
     return result
 
 
@@ -89,12 +99,22 @@ def apply_coverage(daily, monthly, matcher, daily_notes, monthly_notes):
     for side, prefix, label in (("bank", "银行", "银行"), ("journal", "日记账", "账上")):
         facts = evidence.get(side, {})
         missing = uncovered_dates(days, matcher.uncovered_months.get(side, ()), facts)
+        verified = [(start, end) for start, end, kind, _ in facts.get("periods", ())
+                    if kind in {"完整", "无交易"}]
+        if verified:
+            within = pd.Series(False, index=days.index)
+            for start, end in verified:
+                within |= days.between(start, end)
+            missing |= ~within
         amount_columns = [f"{prefix}-{key}" for key in ("收入金额", "支出金额", "收入笔数", "支出笔数")]
-        daily.loc[missing, amount_columns] = None
+        for column in amount_columns:
+            daily[column] = daily[column].mask(missing)
         for day in days[missing]:
             daily_notes[day].append(f"{label}逐笔明细未覆盖")
         for month in periods[missing].unique():
-            monthly.loc[month_keys.eq(str(month)), amount_columns] = None
+            affected = month_keys.eq(str(month))
+            for column in amount_columns:
+                monthly[column] = monthly[column].mask(affected)
             monthly_notes[str(month)].append(f"{label}逐笔明细未覆盖，整月发生额无法核对")
         balance_column = f"{prefix}-期末余额"
         month_column = f"{prefix}-月末余额"
@@ -108,14 +128,25 @@ def apply_coverage(daily, monthly, matcher, daily_notes, monthly_notes):
         original_days = set(frame["date"].dt.normalize())
         for index, day in days.items():
             point = facts.get("balances", {}).get(day)
-            if point:
+            conflicts = facts.get("balance_conflicts", {}).get(day)
+            if conflicts:
+                values = "、".join(f"{source}列 {amount:,.2f} 元" for amount, source in conflicts)
+                amounts = [amount for amount, _ in conflicts]
+                daily_notes[day].append(f"{label}同一日有不同余额，{values}，最大相差 {max(amounts) - min(amounts):,.2f} 元")
+                if day in original_days and pd.notna(daily.at[index, balance_column]):
+                    daily_notes[day].append(f"{label}逐笔表当天日末余额 {daily.at[index, balance_column]:,.2f} 元")
+                monthly_notes[str(day.to_period("M"))].append(f"{label}{day:%m月%d日}有不同的原表余额，见日度核对")
+                previous = None
+            elif point:
                 amount, source = point
                 original = daily.at[index, balance_column]
                 if day in original_days and pd.notna(original) and Decimal(str(original)) != amount:
                     daily_notes[day].append(
-                        f"{label}余额凭据与交易记录日末余额相差{abs(amount - Decimal(str(original))):,.2f}元"
+                        f"{label}原件余额 {amount:,.2f} 元，交易记录日末余额 {original:,.2f} 元，相差 {abs(amount - Decimal(str(original))):,.2f} 元"
                     )
-                previous = round_decimal(amount)
+                    previous = None
+                else:
+                    previous = round_decimal(amount)
                 daily_notes[day].append(f"{label}余额来源 {source}")
             elif missing.at[index]:
                 previous = None
@@ -124,11 +155,10 @@ def apply_coverage(daily, monthly, matcher, daily_notes, monthly_notes):
             daily.at[index, balance_column] = previous
         for month, mask in days_by_month.items():
             last = daily.loc[mask].iloc[-1]
-            if missing[mask].any() and last["日期"].day != month.days_in_month:
-                value = None
-            else:
-                value = last[balance_column]
+            value = last[balance_column] if last["日期"].day == month.days_in_month else None
             monthly.loc[month_keys.eq(str(month)), month_column] = value
+            if last["日期"].day != month.days_in_month and pd.notna(last[balance_column]):
+                monthly_notes[str(month)].append(f"{label}最近余额为 {last[balance_column]:,.2f} 元，截至 {last['日期']:%m月%d日}")
         for start, end, kind, source in facts.get("periods", []):
             if kind == "无交易":
                 for day in days[days.between(start, end)]:

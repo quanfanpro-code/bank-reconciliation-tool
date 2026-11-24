@@ -20,14 +20,28 @@ from 业务分组 import candidate_sort_key, has_business_conflict
 
 
 class SkillMatcher(Matcher):
+    skill_automatic = True
     DIRECT_CONFLICTS = frozenset({"业务编号或批次不同", "交易流水号不同", "账号", "卡号", "对方户名"})
 
     def _combination_has_conflict(self, evidence):
         return not self.DIRECT_CONFLICTS.isdisjoint(evidence["business_conflicts"])
 
     def _add_candidate(self, *args, **kwargs):
+        if getattr(self, "scope_conflicts", ()):
+            return None
         candidate = super()._add_candidate(*args, **kwargs)
-        if candidate is None or candidate.metrics.total_diff_li:
+        if candidate is None:
+            return candidate
+        if candidate.date_span_days > self.config.tolerance_days:
+            candidate.evidence["selection_ineligible"] = True
+            return candidate
+        cache = getattr(self, "_purpose_results", {})
+        existing = cache.get((candidate.bank_idxs, candidate.journal_idxs))
+        if existing:
+            candidate.evidence["business_conflicts"] = (existing,)
+            self._score_existing_candidate(candidate)
+            return candidate
+        if candidate.metrics.total_diff_li:
             return candidate
         conflicts = candidate.evidence.get("business_conflicts", ())
         inferred = tuple(choice for choice in conflicts if choice not in self.DIRECT_CONFLICTS)
@@ -54,9 +68,20 @@ class SkillMatcher(Matcher):
         exchange = getattr(self.llm_assistant, "exchange", None)
         if exchange is None:
             return
+        cache = getattr(self, "_purpose_results", None)
+        if cache is None:
+            self._purpose_results = cache = {}
+        def reject(candidate, reason):
+            candidate.evidence.pop("verified_reconciliation", None)
+            candidate.evidence["business_conflicts"] = (reason,)
+            self._score_existing_candidate(candidate)
+
         requested = {}
         for candidate in sorted(choices, key=candidate_sort_key):
             key = candidate.bank_idxs, candidate.journal_idxs
+            if key in cache:
+                reject(candidate, cache[key])
+                continue
             if candidate.evidence.get("purpose_alerts") and not has_business_conflict(candidate):
                 requested.setdefault(key, []).append(candidate)
         distinct = list(requested.values())
@@ -65,10 +90,13 @@ class SkillMatcher(Matcher):
             for copies in distinct[start:start + 20]:
                 candidate = copies[0]
                 batch[candidate.candidate_id] = (copies, self._purpose_rows(candidate))
-            answer, _ = exchange({
+            payload = {
                 "kind": "purpose",
                 "candidates": [{"candidate_id": identity, **rows} for identity, (_, rows) in batch.items()],
-            })
+            }
+            answer, _ = exchange(payload)
+            if answer is None:
+                answer, _ = exchange(payload)
             if answer is None:
                 continue
             verdicts = answer.get("verdicts")
@@ -100,16 +128,24 @@ class SkillMatcher(Matcher):
                 if verdict["status"] == "compatible":
                     continue
                 conflict = "银行" + basis[0] + "与账上" + basis[1] + "用途冲突"
+                cache[(copies[0].bank_idxs, copies[0].journal_idxs)] = conflict
                 for candidate in copies:
-                    candidate.evidence.pop("verified_reconciliation", None)
-                    candidate.evidence["business_conflicts"] = (conflict,)
-                    self._score_existing_candidate(candidate)
+                    reject(candidate, conflict)
             self.llm_assistant.review_counts["已完成" if valid == len(batch) else "未复核"] += 1
 
     def _lock_direct_matches(self):
         # 原表交易后余额可区分同额重复项。其余按整个日期容差窗口判断唯一性。
+        gaps = self._balance_gaps()
         pairs = [c for c in self.candidates if c.match_type == "exact_1to1"
-                 and c.evidence.get("verified_balance_match") and not has_business_conflict(c)]
+                 and c.evidence.get("verified_balance_match") and self._can_cover(c)
+                 and not any(start <= self.bank.at[c.bank_idxs[0], "date"] <= end for start, end in gaps)]
+        for candidate in self.candidates:
+            if not candidate.evidence.get("verified_balance_match"):
+                continue
+            if any(start <= self.bank.at[candidate.bank_idxs[0], "date"] <= end for start, end in gaps):
+                candidate.evidence.pop("verified_balance_match", None)
+                candidate.evidence.pop("verified_reconciliation", None)
+                self._score_existing_candidate(candidate)
         bank_count = Counter(c.bank_idxs for c in pairs)
         journal_count = Counter(c.journal_idxs for c in pairs)
         verified = [c for c in pairs if bank_count[c.bank_idxs] == journal_count[c.journal_idxs] == 1]
@@ -149,7 +185,7 @@ class SkillMatcher(Matcher):
                 candidate = exact.get((b, j)) or self._add_candidate(
                     [b], [j], "exact_1to1" if bank_day == journal_day else "tolerance_date", "逐笔核对",
                 )
-                if candidate is not None and not has_business_conflict(candidate):
+                if candidate is not None and self._can_cover(candidate):
                     pending.append(candidate)
         self._review_purposes(pending)
         for candidate in pending:
@@ -162,6 +198,13 @@ class SkillMatcher(Matcher):
 
     def _months(self):
         return {side: set(frame["date"].dt.to_period("M")) for side, frame in self._frames().items()}
+
+    def _balance_gaps(self):
+        evidence = getattr(self, "coverage_evidence", {})
+        gaps = [(start, end) for facts in evidence.values() for start, end, kind, _ in facts.get("periods", ())
+                if kind == "不完整"]
+        gaps.extend((day, day) for facts in evidence.values() for day in facts.get("balance_conflicts", {}))
+        return gaps
 
     def _lock_balanced_windows(self):
         # 按日验证原始余额链。断点之前和之后分别计算。
@@ -184,7 +227,17 @@ class SkillMatcher(Matcher):
         anchored = False
         already_locked = {side: set(values) for side, values in self._locked_rows.items()}
         before = len(self._locked_candidates)
+        gaps = self._balance_gaps()
+        last_day = None
         for day in sorted(postings["bank"].keys() | postings["journal"].keys()):
+            previous_day, last_day = last_day, day
+            if any(start <= day and (previous_day is None or previous_day <= end) for start, end in gaps):
+                balances = dict.fromkeys(postings)
+                anchored = False
+                for entries in pending.values():
+                    entries.clear()
+                if any(start <= day <= end for start, end in gaps):
+                    continue
             if day.to_period("M") not in shared_months:
                 balances = dict.fromkeys(postings)
                 anchored = False
@@ -278,8 +331,10 @@ class SkillMatcher(Matcher):
                 continue
             candidate = self._add_candidate(bank, journal, "skill_closed_cover", "整组勾稽", resolves_full_group=True)
             if candidate is not None and not candidate.evidence.get("selection_ineligible"):
-                candidate.evidence["verified_reconciliation"] = "同一批原始记录可完整覆盖，收入和支出分别对上"
-                self._lock(candidate)
+                self._review_purposes([candidate])
+                if not has_business_conflict(candidate):
+                    candidate.evidence["verified_reconciliation"] = "同一批原始记录可完整覆盖，收入和支出分别对上"
+                    self._lock(candidate)
         self._prune_locked_candidates()
 
     def _refresh_candidate_ambiguity(self):
@@ -293,7 +348,7 @@ class SkillMatcher(Matcher):
             c.evidence["alternative_candidate_ids"] = alternatives
             c.is_ambiguous = bool(alternatives)
             if not c.is_ambiguous:
-                c.evidence["verified_reconciliation"] = "当前原记录的收支金额分别一致，无其他合理对应"
+                c.evidence["verified_reconciliation"] = "按现有原记录的日期、用途及收支核对，双方金额一致"
             else:
                 c.evidence.pop("verified_reconciliation", None)
 
@@ -306,19 +361,30 @@ class SkillMatcher(Matcher):
 
     def _commit_selected_candidates(self):
         self.candidates = [c for c in self.candidates if not c.evidence.get("total_only_without_boundary")
-                           and (len(c.bank_idxs) != 1 or len(c.journal_idxs) != 1
-                                or c.date_span_days <= self.config.tolerance_days)]
+                           and c.date_span_days <= self.config.tolerance_days]
         self._prune_locked_candidates()
         self._review_purposes(c for c in self.candidates if self._can_cover(c))
+        self.row_conflicts = defaultdict(set)
+        for c in self.candidates:
+            known = getattr(self, "_purpose_results", {}).get((c.bank_idxs, c.journal_idxs))
+            if known:
+                c.evidence.pop("verified_reconciliation", None)
+                c.evidence["business_conflicts"] = (known,)
+            if has_business_conflict(c):
+                reason = list(c.evidence.get("business_conflicts", ()))
+                if c.text_evidence:
+                    reason.extend(c.text_evidence.conflicting_fields)
+                for side, rows in (("bank", c.bank_idxs), ("journal", c.journal_idxs)):
+                    for row in rows:
+                        self.row_conflicts[side, row].update(reason)
+                c.evidence["selection_ineligible"] = True
         super()._commit_selected_candidates()
-        by_id = {c.candidate_id: c for c in self.candidates}
         for c in self.selected_candidates:
             c.processing_reason = "；".join(part for part in c.processing_reason.split("；")
                                           if not part.startswith(("综合可信度", "金额一致，业务依据不足")))
             alternatives = c.evidence.get("alternative_candidate_ids", []) if c.is_ambiguous else []
             if alternatives and not c.evidence.get("agent_confirmed"):
-                choices = [self._original_rows(item) for item in [c, *(by_id[i] for i in alternatives[:2])]]
-                c.processing_reason = "这几种对应会留下不同原始记录。" + "；".join(choices)
+                c.processing_reason = "程序按原文、收付和日期比较后选定：" + self._original_rows(c)
         months = self._months()
         evidence = getattr(self, "coverage_evidence", {})
         supplied_months = {day.to_period("M") for day in coverage_dates(evidence)}

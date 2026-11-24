@@ -147,8 +147,6 @@ class Reporter:
 
     def calculate_daily_stats(self, bank: pd.DataFrame, journal: pd.DataFrame) -> pd.DataFrame:
         """计算每日统计对比数据。"""
-        if bank.empty and journal.empty:
-            return pd.DataFrame()
         from 核对期间 import coverage_dates
         all_dates = set(bank['date'].unique()) | set(journal['date'].unique())
         all_dates.update(coverage_dates(getattr(self.matcher, "coverage_evidence", {})))
@@ -158,16 +156,17 @@ class Reporter:
         date_range = pd.date_range(start=min(all_dates), end=max(all_dates), freq='D')
 
         def get_stats(df, has_bal):
-            inc = df[df['amount'] > 0]
-            exp = df[df['amount'] < 0]
+            income = df['income'] if 'income' in df else df['amount'].clip(lower=0)
+            expense = df['expense'] if 'expense' in df else -df['amount'].clip(upper=0)
+            inc = income[income > 0].groupby(df['date']).agg(income_count='count', income_amount='sum')
+            exp = expense[expense > 0].groupby(df['date']).agg(expense_count='count', expense_amount='sum')
             stats = pd.merge(
-                inc.groupby('date')['amount'].agg(income_count='count', income_amount='sum'),
-                exp.groupby('date')['amount'].agg(expense_count='count', expense_amount='sum'),
+                inc,
+                exp,
                 on='date', how='outer'
             )
             stats = pd.merge(stats, df.groupby('date')['amount'].agg(net='sum'), on='date', how='outer')
             stats = pd.merge(pd.DataFrame({'date': date_range}), stats, on='date', how='left').fillna(0)
-            stats['expense_amount'] = stats['expense_amount'].abs()
             if has_bal:
                 points = daily_balance_points(df)
                 values, previous = [], None
@@ -177,6 +176,9 @@ class Reporter:
                     values.append(previous)
                 stats['balance'] = pd.Series(values, dtype=object)
                 stats['balance_missing'] = stats['balance'].isna()
+            else:
+                stats['balance'] = None
+                stats['balance_missing'] = True
             return stats
 
         b_stats = get_stats(bank, 'balance' in bank.columns and bank['balance'].notna().any())

@@ -97,8 +97,8 @@ def _像日期格式(代码: str) -> bool:
     return bool(_日期记号.search(代码))
 
 
-def _序号转日期(值: float):
-    基 = datetime(1899, 12, 30)
+def _序号转日期(值: float, 使用1904: bool = False):
+    基 = datetime(1904, 1, 1) if 使用1904 else datetime(1899, 12, 31 if 值 < 60 else 30)
     return 基 + timedelta(days=值)
 
 
@@ -287,12 +287,15 @@ class 簿读:
         self.表名列表 = []
         self.计算设置 = {}
         self.active名 = None
+        self.日期1904 = False
         self.样式库 = None
         with zipfile.ZipFile(self.路径) as z:
             self.样式库 = _样式库(z) if 读样式 else None
             sst = _读共享串(z)
             try:
                 wb = ET.fromstring(z.read("xl/workbook.xml"))
+                workbook_pr = wb.find(_NS + "workbookPr")
+                self.日期1904 = workbook_pr is not None and workbook_pr.get("date1904") in {"1", "true"}
                 calc = wb.find(_NS + "calcPr")
                 if calc is not None:
                     self.计算设置 = dict(calc.attrib)
@@ -361,7 +364,7 @@ class 簿读:
             return v.text
         s = c.get("s")
         if self.样式库 is not None and s is not None and self.样式库.是日期(int(s)):
-            return _序号转日期(数)
+            return _序号转日期(数, self.日期1904)
         return int(数) if 数 == int(数) and "e" not in v.text.lower() and "." not in v.text else 数
 
     def _读表(self, z, 目标, sst) -> 表读:

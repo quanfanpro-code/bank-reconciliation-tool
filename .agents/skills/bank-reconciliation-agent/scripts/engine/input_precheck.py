@@ -18,7 +18,7 @@ import pandas as pd
 from 列识别 import amount_basis_label, field_problem, identity_columns, split_amount_role
 
 from data_structures import OverallControlResult
-from utils import clean_excel_string, parse_date
+from utils import amount_currencies, clean_excel_string, parse_date
 
 
 SUPPORTED_SUFFIXES = {".xlsx", ".xls", ".csv"}
@@ -254,17 +254,19 @@ def _read_csv(path: Path, **kwargs: Any) -> pd.DataFrame:
     raise ValueError(f"CSV 文件无法解码：{path.name}") from last_error
 
 
-def _read_preview(path: Path, max_scan_rows: int) -> tuple[pd.DataFrame, list[tuple[int, int, int, int]]]:
+def _read_preview(path: Path, max_scan_rows: int, sheet=None) -> tuple[pd.DataFrame, list[tuple[int, int, int, int]]]:
     if path.suffix.lower() == ".csv":
         return (
-            _read_csv(path, header=None, nrows=max_scan_rows, dtype=object),
+            _read_csv(path, header=None, nrows=max_scan_rows, dtype=object, skip_blank_lines=False),
             [],
         )
 
     from 直读XML import 读簿, 拆坐标
 
-    簿 = 读簿(path, 数据=True)
-    t = 簿[簿.表名列表[0]]
+    t = sheet
+    if t is None:
+        簿 = 读簿(path, 数据=True)
+        t = 簿[簿.表名列表[0]]
     行数 = min(t.最大行, max_scan_rows)
     preview = pd.DataFrame(list(t.行值(1, 行数)))
     merges: list[tuple[int, int, int, int]] = []
@@ -402,6 +404,8 @@ def _candidate_score(
 def detect_table_structure(
     file_path: str | Path,
     max_scan_rows: int = 40,
+    *,
+    sheet=None,
 ) -> TableStructure:
     """基于多类结构证据识别银行明细表头。"""
     path = Path(file_path)
@@ -412,7 +416,7 @@ def detect_table_structure(
     if path.suffix.lower() == ".xls":
         raise ValueError("不支持 .xls 老格式，请在 Excel 中另存为 .xlsx 后再导入")
 
-    preview, merges = _read_preview(path, max_scan_rows)
+    preview, merges = _read_preview(path, max_scan_rows, sheet)
     preview = preview.dropna(axis=1, how="all")
     if preview.empty or len(preview.columns) == 0:
         raise ValueError(f"文件没有可识别的表格内容：{path.name}")
@@ -567,6 +571,9 @@ def _valid_dates(frame: pd.DataFrame) -> pd.Series:
 def _amount_totals(frame: pd.DataFrame) -> tuple[Decimal, Decimal] | None:
     if frame.empty or "amount" not in frame.columns:
         return None
+    if {"income", "expense"} <= set(frame.columns):
+        return tuple(sum((Decimal(str(value)) for value in frame[key].dropna()), Decimal(0))
+                     for key in ("income", "expense"))
     amounts = [
         Decimal(str(value))
         for value in frame["amount"]
@@ -638,6 +645,7 @@ def _non_transaction_mask(
 ) -> pd.Series:
     if frame.empty:
         return pd.Series(False, index=frame.index)
+    frame = frame.loc[:, [column for column in frame if not str(column).startswith("__")]]
     empty = frame.map(lambda value: not _cell_text(value)).all(axis=1)
     combined = frame.apply(
         lambda row: " ".join(_cell_text(value) for value in row),
@@ -717,7 +725,9 @@ def _scope_values(
     columns = identity_columns(frame, mapping, identity)
     transaction_rows = frame.loc[~_non_transaction_mask(frame, mapping)]
     total_rows = len(transaction_rows)
-    if not columns:
+    amount_columns = [mapping.get(key) for key in ("amount", "debit", "credit")
+                      if mapping.get(key) in frame] if identity == "currency" else []
+    if not columns and not amount_columns:
         return "未提供", set(), total_rows, total_rows
 
     def row_raw_values(row: pd.Series) -> set[str]:
@@ -725,7 +735,7 @@ def _scope_values(
             _cell_text(row[column]).upper()
             for column in columns
             if _cell_text(row[column])
-        }
+        } | set().union(*(amount_currencies(row[column]) for column in amount_columns))
 
     row_values = transaction_rows.apply(row_raw_values, axis=1)
     raw_values = set().union(*row_values) if len(row_values) else set()
@@ -1009,7 +1019,7 @@ def _raw_population_amount(row: pd.Series, mapping: dict[str, Any], source: str)
         return None
     if mode == "single_amount_with_direction":
         sign = direction_sign(row.get(mapping.get("direction")), source)
-        return amount * sign if sign is not None else None
+        return (abs(amount) if mapping.get("direction_uses_absolute") else amount) * sign if sign is not None else None
     return amount
 
 
@@ -1023,11 +1033,8 @@ def _population_detail_rows(
     parse_errors: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """将每个原始数据行唯一归入有效、非交易、解析异常或其他排除。"""
-    valid_rows = {
-        int(value)
-        for value in standardized.get("original_file_row", pd.Series(dtype=object))
-        if pd.notna(value)
-    }
+    def origin(sheet, row):
+        return (str(sheet) if pd.notna(sheet) else "", int(row))
     issues_by_row: dict[int, set[str]] = {}
     for error in parse_errors:
         error_source = error.get("source_type")
@@ -1061,7 +1068,7 @@ def _population_detail_rows(
                 row_number = int(std_row["original_file_row"])
             except (TypeError, ValueError):
                 continue
-            standardized_amounts[row_number] = std_row.get("amount")
+            standardized_amounts[origin(std_row.get("original_sheet", ""), row_number)] = std_row.get("amount")
 
     account_columns = identity_columns(raw, mapping, "account")
     currency_columns = identity_columns(raw, mapping, "currency")
@@ -1071,7 +1078,8 @@ def _population_detail_rows(
             file_row = int(raw_row["__file_row__"])
         else:
             file_row = position + int(structure.skiprows) + int(structure.header_rows) + 1
-        if file_row in valid_rows:
+        row_origin = origin(raw_row.get("__sheet__", ""), file_row)
+        if row_origin in standardized_amounts:
             category = "有效交易"
             reasons = "日期和金额可用，已进入匹配"
         elif bool(non_transaction.loc[index]):
@@ -1100,6 +1108,7 @@ def _population_detail_rows(
         original_net = _raw_population_amount(raw_row, mapping, source_type)
         rows.append({
             "来源": "银行流水" if source_type == "bank" else "银行日记账",
+            "工作表": row_origin[0],
             "原文件行号": file_row,
             "唯一处置类别": category,
             "处置原因": reasons,
@@ -1112,7 +1121,7 @@ def _population_detail_rows(
             "原始可解析净额": original_net,
             "金额去向说明": (f"原行金额归入{category}，未与其他类别重复累计" if original_net is not None
                            else "原金额或方向无法解析或未提供；保留原值，不以零计入金额勾稽"),
-            "标准化净额": standardized_amounts.get(file_row),
+            "标准化净额": standardized_amounts.get(row_origin),
             "进入匹配": category == "有效交易",
             "账户原值": "、".join(account_values),
             "币种原值": "、".join(currency_values),
@@ -1133,6 +1142,7 @@ def build_input_precheck(
     parse_errors: Sequence[dict[str, Any]] = (),
     source_info: Sequence[dict[str, Any]] = (),
     overall_control: OverallControlResult | None = None,
+    verified_periods: dict | None = None,
 ) -> InputPrecheckReport:
     """对已读取和标准化的双方数据执行统一检查。"""
     if overall_control is None:
@@ -1141,12 +1151,15 @@ def build_input_precheck(
         overall_control = build_overall_controls(bank, journal)
     items = []
 
-    file_blocked = raw_bank.empty or raw_journal.empty
+    verified_periods = verified_periods or {}
+    zero_sides = {side: frame.empty and any(kind == "无交易" for _, _, kind, _ in verified_periods.get(side, {}).get("periods", ()))
+                  for side, frame in (("bank", raw_bank), ("journal", raw_journal))}
+    file_blocked = (raw_bank.empty and not zero_sides["bank"]) or (raw_journal.empty and not zero_sides["journal"])
     items.append(
         PrecheckItem(
             "文件读取",
-            f"可读取，{len(raw_bank)}行" if not raw_bank.empty else "没有可核对数据",
-            f"可读取，{len(raw_journal)}行" if not raw_journal.empty else "没有可核对数据",
+            f"可读取，{len(raw_bank)}行" if not raw_bank.empty or zero_sides["bank"] else "没有可核对数据",
+            f"可读取，{len(raw_journal)}行" if not raw_journal.empty or zero_sides["journal"] else "没有可核对数据",
             "双方均已读取" if not file_blocked else "至少一侧没有数据",
             "无法计算" if file_blocked else "通过",
             "文件没有可核对数据，请检查表头和数据区域。" if file_blocked else "文件可正常读取。",
@@ -1194,6 +1207,12 @@ def build_input_precheck(
 
     bank_dates = _valid_dates(bank)
     journal_dates = _valid_dates(journal)
+    if zero_sides["bank"]:
+        bank_dates = pd.Series([date for start, end, kind, _ in verified_periods["bank"]["periods"]
+                                if kind == "无交易" for date in (start, end)])
+    if zero_sides["journal"]:
+        journal_dates = pd.Series([date for start, end, kind, _ in verified_periods["journal"]["periods"]
+                                   if kind == "无交易" for date in (start, end)])
     date_blocked = bank_dates.empty or journal_dates.empty
     bank_date_errors = sum(
         _error_count(parse_errors, "bank", error_type)
@@ -1290,8 +1309,8 @@ def build_input_precheck(
         )
     )
 
-    bank_totals = _amount_totals(bank)
-    journal_totals = _amount_totals(journal)
+    bank_totals = (Decimal(0), Decimal(0)) if zero_sides["bank"] else _amount_totals(bank)
+    journal_totals = (Decimal(0), Decimal(0)) if zero_sides["journal"] else _amount_totals(journal)
     amount_blocked = bank_totals is None or journal_totals is None
     bank_amount_errors = _error_count(parse_errors, "bank", "金额解析失败")
     journal_amount_errors = _error_count(parse_errors, "journal", "金额解析失败")

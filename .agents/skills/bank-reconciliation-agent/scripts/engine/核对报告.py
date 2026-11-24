@@ -11,6 +11,7 @@ from 排版计划 import 格样式, 应用底层主题, 新建簿计划
 from 报告写入 import 渲染簿计划
 from 复核事项 import build_review_items
 from 核对期间 import apply_coverage
+from utils import parse_date
 
 
 def _text(value):
@@ -60,6 +61,14 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
     reporter._prepare_initial_balance()
     daily, monthly = reporter._build_daily_and_monthly_tables()
     items = sorted(build_review_items(reporter.matcher), key=lambda item: (item["首次日期"], item["事项编号"]))
+    automatic = getattr(reporter.matcher, "skill_automatic", False)
+    chosen = {candidate.final_match_id for candidate in reporter.matcher.selected_candidates
+              if candidate.metrics.total_diff_li == 0 and not candidate.evidence.get("selection_ineligible")}
+    duplicates = defaultdict(list)
+    for clue in getattr(reporter.matcher, "business_clues", []):
+        if "强重复" in clue.clue_type:
+            for index in clue.row_idxs:
+                duplicates[clue.source, index].append(clue.reason)
     agent_notes = {
         candidate.final_match_id: candidate.llm_decision.reason
         for candidate in reporter.matcher.selected_candidates
@@ -73,6 +82,43 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         origins[side] = " · ".join(filter(None, (Path(source["文件路径"]).name, source.get("工作表"))))
     daily_notes, monthly_notes = defaultdict(list), defaultdict(list)
     apply_coverage(daily, monthly, reporter.matcher, daily_notes, monthly_notes)
+    scope_conflicts = getattr(reporter.matcher, "scope_conflicts", ())
+    scope_message = "，".join(
+        f"{item.name}：{item.comparison}" + (f"（银行 {item.bank_result}，账上 {item.journal_result}）"
+                                             if item.bank_result and item.journal_result else "")
+        for item in scope_conflicts
+    )
+    if scope_conflicts:
+        prefixes = {"银行-": "银行", "日记账-": "账上"}
+        empty_sides = getattr(reporter.matcher, "empty_unverified_sides", ())
+        for table in (daily, monthly):
+            for column in table.columns:
+                if "差额" in column or any(side in empty_sides and column.startswith(prefix) for prefix, side in prefixes.items()):
+                    table[column] = None
+    unread = [row for row in getattr(reporter.precheck_report, "population_rows", ())
+              if row.get("唯一处置类别") in {"解析异常", "其他排除"}]
+    for row in unread:
+        source = row["来源"]
+        day = parse_date(row.get("原日期值"))
+        note = f"{source}{row.get('工作表', '')}第{row['原文件行号']}行未计入。{row['处置原因']}"
+        if day is not None:
+            daily_notes[day].append(note)
+        for table, frequency, date_column, notes in ((daily, "D", "日期", daily_notes), (monthly, "M", "月份", monthly_notes)):
+            mask = pd.Series(True, index=table.index)
+            if day is not None:
+                mask = pd.to_datetime(table[date_column]).dt.to_period(frequency).eq(day.to_period(frequency))
+            for field in ("收入金额差额", "支出金额差额", "收入笔数差额", "支出笔数差额"):
+                if field in table:
+                    table[field] = table[field].mask(mask)
+            if frequency == "M":
+                for month in table.loc[mask, "月份"]:
+                    notes[str(month)].append(note)
+    for entry in getattr(reporter.matcher.overall_control, "continuity_anomalies", ()):
+        day = pd.Timestamp(entry["日期"]).normalize()
+        note = (f"{entry['来源']} 第{entry['原文件行号']}行按当日收付应余 {entry['预期余额']:,.2f} 元，"
+                f"表列 {entry['实际余额']:,.2f} 元，相差 {entry['差额']:,.2f} 元")
+        daily_notes[day].append(note)
+        monthly_notes[day.strftime("%Y-%m")].append(f"{day:%m-%d} {note}")
     pending, details, review_details, review_groups = [], [], [], []
     for number, item in enumerate(items, 1):
         label = f"{number:03d}"
@@ -80,7 +126,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         journal = list(_records(reporter.matcher.journal, item["日记账索引"]))
         mode = item["核对方式"]
         confirmed = mode == "自动确认"
-        action = {"人工全查": "逐项核对", "人工抽样": "抽查", "范围说明": "范围说明"}.get(mode)
+        action = {"人工全查": "逐项核对", "人工抽样": "抽查", "范围说明": "范围说明", "差异说明": "差异说明"}.get(mode)
         income = item["银行收入"] - item["日记账收入"]
         expense = item["银行支出"] - item["日记账支出"]
         dates = sorted({row["date"].normalize() for row, _, _ in bank + journal})
@@ -107,12 +153,18 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         elif item["程序结论"] in {"账内更正已闭合", "银行冲正已闭合"}:
             explanation = "原交易已冲销，净额为零"
         elif not bank or not journal:
-            explanation = "银行有记录，账上未找到对应" if bank else "账上有记录，银行未找到对应"
+            explanation = scope_message if scope_conflicts else (
+                "银行有记录，账上未找到对应" if bank else "账上有记录，银行未找到对应")
+            if scope_conflicts:
+                income = expense = None
         elif income or expense:
             explanation = "双方记录之间仍有收付金额差额"
+        elif automatic and item["匹配ID"] in chosen:
+            explanation = "已选定对应，银行与账上收付分别一致"
+            action = None
         else:
             explanation = "双方金额相同，交易对应尚未确定"
-        if action and not item.get("明细覆盖不足"):
+        if (action or automatic and not confirmed and item["匹配ID"] in chosen) and not item.get("明细覆盖不足"):
             reasons = [
                 reason for reason in item["判断依据"].split("；")
                 if reason and not reason.startswith("综合可信度") and reason != "本次匹配未建立对应关系"
@@ -127,9 +179,14 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         for side, entries in (("银行", bank), ("账上", journal)):
             origin = origins.get(side) or (Path(paths[side]).name if paths[side] else side)
             for row, party, note in entries:
-                details.append((label, side, row["date"], max(row["amount"], 0), max(-row["amount"], 0),
+                source = "bank" if side == "银行" else "journal"
+                clues = duplicates.get((source, row.name), ())
+                result = "。".join((explanation, *clues))
+                page = row.get("original_sheet")
+                location = f"{Path(paths[side]).name} · {page}" if paths[side] and page else origin
+                details.append((label, side, row["date"], row.get("income", max(row["amount"], 0)), row.get("expense", max(-row["amount"], 0)),
                                 row.get("balance"), party, row.get("summary", ""), note, _text(row.get("voucher_no")),
-                                explanation, f"{origin} · 第{row.get('original_file_row', row.get('original_idx', ''))}行"))
+                                result, f"{location} · 第{row.get('original_file_row', row.get('original_idx', ''))}行"))
         if action:
             first_review_row = len(review_details) + 2
             count = len(bank) + len(journal)
@@ -157,14 +214,29 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
             balance_days = [abs(v) for v in daily["余额差额"] if pd.notna(v) and v]
             if balance_days:
                 message += f"。日末余额有 {len(balance_days)} 天不同，最大差 {max(balance_days):,.2f} 元"
-    filename = Path(bank_path).stem if bank_path else ""
+    filename = Path(bank_path or journal_path).stem if bank_path or journal_path else ""
     identity = filename.rsplit("-", 2)
+    accounts = {str(value) for frame in (reporter.matcher.bank, reporter.matcher.journal)
+                for value in frame.get("account", pd.Series(dtype=object)).dropna() if value}
+    account = next(iter(accounts)) if len(accounts) == 1 else ""
+    company = identity[0] if len(identity) == 3 else ""
+    bank_name = identity[1] if len(identity) == 3 else ""
+    if not account and len(identity) == 3:
+        account = identity[2]
+    errors = reporter.error_collector.get_all_errors() if reporter.error_collector else []
+    missing_amounts = [error for error in errors if error.get("type") in
+                       {"金额解析失败", "日期解析失败", "空日期行", "方向解析失败"}]
+    if missing_amounts:
+        message += f"。汇总覆盖已读取的记录，另有 {len(missing_amounts)} 项原行信息未计入"
+    if scope_conflicts:
+        message = f"{scope_message}。已读到的收付分别列示，跨表差额留空。"
     overview = [
-        ("公司", identity[0] if len(identity) == 3 else ""), ("银行及账号", " · ".join(identity[1:]) if len(identity) == 3 else ""),
+        ("公司", company), ("银行及账号", " · ".join(filter(None, (bank_name, account)))),
         ("银行流水", Path(bank_path).name if bank_path else ""), ("银行日记账", Path(journal_path).name if journal_path else ""),
         ("交易日期", f"{dates[0]:%Y-%m-%d} 至 {dates[-1]:%Y-%m-%d}" if dates else "无交易"),
         ("读入笔数", f"银行 {len(reporter.matcher.bank)} 笔，账上 {len(reporter.matcher.journal)} 笔"),
-        ("月度核对结果", message), ("需要人工核对", sum(row[1] != "范围说明" for row in pending)),
+        ("月度核对结果", message), ("差异及范围说明" if automatic else "需要人工核对",
+                                  len(pending) if automatic else sum(row[1] != "范围说明" for row in pending)),
         ("如何查看明细", "在待核对点「查看全部…笔」。待核对明细按编号分组，浅蓝为范围说明，浅黄为核对事项。"),
         ("明显微小错报临界值", config.clearly_trivial_threshold), ("实际执行重要性水平", config.performance_materiality),
     ]
@@ -181,10 +253,11 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
     review_counts = getattr(reporter.matcher.llm_assistant, "review_counts", None)
     if review_counts is not None:
         overview.append(("Agent复核", "，".join(f"{key} {count} 项" for key, count in review_counts.items())))
-    if reporter.error_collector and reporter.error_collector.has_errors():
-        for error in reporter.error_collector.get_all_errors():
-            overview.append(("未读入的记录", f"{error.get('source_type', '')} 第{error.get('row', '')}行：{error.get('reason', '')}"))
-    pending_frame = pd.DataFrame(pending or [("", "", "本次无需人工核对", "", "", None, None, "", "", "")], columns=[
+    for error in errors:
+        source = {"bank": "银行流水", "journal": "银行日记账"}.get(error.get("source_type"), "")
+        reason = error.get("reason") or f"{error.get('type', '')}，{error.get('column', '')}原值 {error.get('original_value', '')}"
+        overview.append(("原表读取说明", f"{source} 第{error.get('row', '')}行。{reason}"))
+    pending_frame = pd.DataFrame(pending or [("", "", "本次无差异事项" if automatic else "本次无需人工核对", "", "", None, None, "", "", "")], columns=[
         "编号", "处理方式", "要查什么", "银行记录", "账上记录", "收入差额", "支出差额", "核查结论", "备注", "交易明细"])
     detail_columns = ["编号", "来源", "日期", "收入金额", "支出金额", "余额", "对方", "摘要",
                       "银行备注", "凭证号", "核对结果", "原表位置"]

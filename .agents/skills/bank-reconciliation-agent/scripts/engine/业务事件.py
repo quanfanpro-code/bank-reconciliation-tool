@@ -75,12 +75,11 @@ def _refund_business(left: pd.Series, right: pd.Series) -> tuple[bool, str]:
     left_party, right_party = business_identity(left)[1], business_identity(right)[1]
     if left_party and right_party and left_party != right_party:
         return False, ""
-    for names in (("批次号", "批次编号"), ("业务编号",), ("订单号",), ("申请单号",)):
+    for names in (("批次号", "批次编号"), ("业务编号",), ("订单号", "订单编号"), ("申请单号",)):
         left_id, right_id = _field(left, names), _field(right, names)
         if left_id and right_id:
             if left_id != right_id:
                 return False, ""
-            break
     return rows_share_business(left, right)
 
 

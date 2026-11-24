@@ -27,6 +27,7 @@ from input_precheck import (
 from utils import (
     parse_date,
     clean_amount,
+    amount_currencies,
     normalize_amount_text,
     clean_excel_string,
 )
@@ -60,6 +61,12 @@ def direction_sign(value: Any, source_type: str) -> Optional[int]:
     else:
         raise ValueError(f"未知数据来源: {source_type}")
     return signs.get(str(value).strip().upper())
+
+
+def directed_amount(amount, direction, *, absolute=False):
+    if amount is None or pd.isna(amount) or pd.isna(direction):
+        return None
+    return (abs(amount) if absolute else amount) * int(direction)
 
 
 def parse_source_amount(
@@ -406,6 +413,44 @@ class ParseErrorCollector:
                 **dict(self._counts)
             }
 
+    def record_recovery(self, start, side, row, amount, sheet=""):
+        with self._lock:
+            for error in self._errors[start:]:
+                if error["type"] == "金额解析失败" and error["source_type"] == side and error["row"] == row:
+                    self._counts["金额解析失败"] -= 1
+                    error["type"] = "由余额复算金额"
+                    error["reason"] = f"依据相邻交易后余额复算净额 {amount:,.2f} 元"
+                    error["sheet"] = sheet
+
+
+def _amounts_from_balances(data):
+    """只用已验证的原行顺序回答单笔金额空缺。"""
+    choices = []
+    for ordered in (data, data.iloc[::-1]):
+        if not ordered["std_date"].is_monotonic_increasing:
+            continue
+        eligible = ordered["original_file_row"].diff().abs().eq(1)
+        if "__sheet__" in ordered:
+            eligible &= ordered["__sheet__"].eq(ordered["__sheet__"].shift())
+        deltas = {}
+        previous = None
+        checks = []
+        for index, row in ordered.iterrows():
+            balance = row["std_balance"]
+            if eligible.at[index] and pd.notna(previous) and pd.notna(balance):
+                delta = balance - previous
+                if pd.isna(row["std_amount"]):
+                    deltas[index] = delta
+                else:
+                    checks.append(delta == row["std_amount"])
+            previous = balance
+        if checks and all(checks):
+            choices.append(deltas)
+    if not choices:
+        return {}
+    return {index: amount for index, amount in choices[0].items()
+            if all(interpretation.get(index) == amount for interpretation in choices[1:])}
+
 
 # ==========================================
 # 3. 数据加载器 (DataLoader)
@@ -423,6 +468,8 @@ class DataLoader:
         skiprows: int = 0,
         header_rows: int = 1,
         derived_columns: Optional[List[str]] = None,
+        *,
+        sheet=None,
     ) -> pd.DataFrame:
         """
         读取 Excel 或 CSV 文件，返回 DataFrame
@@ -444,11 +491,14 @@ class DataLoader:
         effective_skiprows = skiprows + header_rows if read_without_header else skiprows
 
         if ext == '.xlsx':
-            from 直读XML import 读表数据
-            列数, 行迭代 = 读表数据(file_path, 0, 跳过行=effective_skiprows)
+            if sheet is None:
+                from 直读XML import 读表数据
+                列数, 行迭代 = 读表数据(file_path, 0, 跳过行=effective_skiprows)
+            else:
+                列数, 行迭代 = sheet.最大列, sheet.行值(起=effective_skiprows + 1)
             rows = [[(np.nan if v is None or v == '' else v) for v in row] for row in 行迭代]
             if read_without_header:
-                df = pd.DataFrame(rows)
+                df = pd.DataFrame(rows, columns=range(列数))
             elif rows:
                 df = pd.DataFrame(rows[1:], columns=list(rows[0]))
             else:
@@ -465,6 +515,7 @@ class DataLoader:
                         dtype=object,
                         keep_default_na=False,
                         na_values=[''],
+                        skip_blank_lines=False,
                         skiprows=effective_skiprows,
                         header=None if read_without_header else 0,
                     )
@@ -484,7 +535,10 @@ class DataLoader:
                     f"{len(derived_columns)} != {len(df.columns)}"
                 )
             df.columns = list(derived_columns)
-            
+        if ext == '.csv' or sheet is not None:
+            df["__file_row__"] = df.index + skiprows + header_rows + 1
+        if sheet is not None:
+            df["__sheet__"] = sheet.名称
         return df
 
     def detect_table_structure(self, file_path: str | Path) -> TableStructure:
@@ -611,9 +665,7 @@ class DataLoader:
                     voucher_blank & (debit_has_value | credit_has_value)
                 )
 
-        filled_dates = data[date_col].where(data[date_col].apply(self._is_non_empty_cell), other=pd.NA).ffill()
-        has_previous_date = filled_dates.notna()
-        return blank_date_mask & has_transaction_content & has_previous_date
+        return blank_date_mask & has_transaction_content
     
     # 汇总行关键词（精确匹配，这些行不参与计算）
     # 涵盖：各种账簿软件导出时自动生成的汇总行
@@ -628,11 +680,14 @@ class DataLoader:
         date_format: str = "auto",
         skiprows_offset: int = 0,
         header_rows: int = 1,
+        *,
+        recover_amounts: bool = False,
     ) -> pd.DataFrame:
         """
         将 DataFrame 标准化为统一格式。
         """
         # 保留原始行号，供报表回填凭证号和未匹配明细时使用。
+        start_errors = len(self.error_collector.get_all_errors()) if self.error_collector else 0
         working_df = df.copy()
         original_source_columns = [
             column for column in working_df.columns
@@ -650,6 +705,17 @@ class DataLoader:
                 + int(header_rows)
                 + 1
             )
+        working_df = working_df.loc[working_df[original_source_columns].notna().any(axis=1)].copy()
+        if working_df.empty:
+            return pd.DataFrame({
+                "date": pd.Series(dtype="datetime64[ns]"),
+                **{column: pd.Series(dtype=object) for column in (
+                    "amount", "amount_decimal", "summary", "balance", "voucher_word", "voucher_no",
+                    "voucher_evidence", "aux_text_fields", "aux_text_evidence", "amount_evidence",
+                    "scope_evidence", "date_evidence", "account", "currency", "source",
+                    "original_idx", "original_file_row", "original_sheet",
+                )},
+            })
 
         # 汇总标签可能位于月份等其他列，须在日期补齐前统一排除并留痕。
         summary_rows = summary_row_mask(
@@ -701,7 +767,10 @@ class DataLoader:
                     effective_date_values.apply(self._is_non_empty_cell),
                     other=pd.NA
                 )
-                effective_date_values.loc[date_ffill_mask] = fill_source.ffill().loc[date_ffill_mask]
+                breaks = data["original_file_row"].diff().ne(1)
+                if "__sheet__" in data:
+                    breaks |= data["__sheet__"].ne(data["__sheet__"].shift())
+                effective_date_values.loc[date_ffill_mask] = fill_source.groupby(breaks.cumsum()).ffill().loc[date_ffill_mask]
 
             data['std_date'] = effective_date_values.apply(lambda x: parse_date(x, date_format))
 
@@ -843,8 +912,7 @@ class DataLoader:
                                     )
 
                         data['std_amount'] = [
-                            None if amt is None or pd.isna(sign)
-                            else amt * Decimal(int(sign))
+                            directed_amount(amt, sign, absolute=mapping.get("direction_uses_absolute", False))
                             for amt, sign in zip(data['temp_amt'], direction_signs)
                         ]
                     else:
@@ -909,6 +977,28 @@ class DataLoader:
                     )
         else:
             data['std_balance'] = None
+
+        recovered = {}
+        if recover_amounts and mode != "debit_credit" and data["std_amount"].isna().any():
+            recovered = _amounts_from_balances(data)
+            for index, amount in recovered.items():
+                data.at[index, "std_amount"] = amount
+                if self.error_collector:
+                    self.error_collector.record_recovery(start_errors, source_type, int(data.at[index, "original_file_row"]),
+                                                         amount, data.at[index, "__sheet__"] if "__sheet__" in data else "")
+        income, expense = [], []
+        for position, value in enumerate(data["std_amount"]):
+            if pd.isna(value):
+                income.append(None)
+                expense.append(None)
+            elif mode == "debit_credit":
+                debit, credit = temp_debit_filled.iloc[position], temp_credit_filled.iloc[position]
+                positive, negative = (credit, debit) if source_type == "bank" else (debit, credit)
+                income.append(max(positive, 0) + max(-negative, 0))
+                expense.append(max(negative, 0) + max(-positive, 0))
+            else:
+                income.append(max(value, 0))
+                expense.append(max(-value, 0))
 
         # 6. 解析凭证字与凭证号。凭证字和号码共同构成账内凭证边界。
         voucher_word_col = mapping.get('voucher_word')
@@ -1059,6 +1149,7 @@ class DataLoader:
                 'direction_column': direction_col,
                 'direction_value': original_value(row, direction_col),
                 'amount_basis': amount_basis,
+                'balance_change': recovered.get(row.name),
                 'related_amount_values': {
                     str(column): original_value(row, column)
                     for column in related_amount_columns
@@ -1120,10 +1211,31 @@ class DataLoader:
             for index in data.index
         ]
 
+        for role, canonical in (("counterparty_account", "对方账号"), ("order", "订单号"),
+                                ("transaction_id", "交易流水号")):
+            column = mapping.get(role)
+            if not column or column not in data:
+                continue
+            for index in data.index:
+                if self._is_non_empty_cell(data.at[index, column]):
+                    data.at[index, 'std_aux_text_fields'][canonical] = clean_excel_string(data.at[index, column])
+                    data.at[index, 'std_aux_text_evidence'][canonical] = auxiliary_cell_evidence(data.at[index, column])
+
+        from 列识别 import normalized_identity
+
+        def row_currency(row):
+            declared = clean_excel_string(original_value(row, currency_col))
+            indicated = set().union(*(amount_currencies(original_value(row, col)) for col in selected_amount_columns))
+            if declared:
+                indicated.add(normalized_identity(declared, "currency"))
+            return "/".join(sorted(indicated))
+
         # 7. 构建最终 DataFrame
         result = pd.DataFrame({
             'date': data['std_date'],
             'amount': data['std_amount'],
+            'income': income,
+            'expense': expense,
             'summary': data['std_summary'],
             'balance': data['std_balance'],
             'voucher_word': data['std_voucher_word'],
@@ -1138,13 +1250,11 @@ class DataLoader:
                 lambda row: clean_excel_string(original_value(row, account_col)),
                 axis=1,
             ),
-            'currency': data.apply(
-                lambda row: clean_excel_string(original_value(row, currency_col)),
-                axis=1,
-            ),
+            'currency': data.apply(row_currency, axis=1),
             'source': source_type,
             'original_idx': data['original_idx'],
-            'original_file_row': data['original_file_row']
+            'original_file_row': data['original_file_row'],
+            'original_sheet': data.get('__sheet__', ''),
         })
         
         # 移除无效日期行
@@ -1161,7 +1271,7 @@ class DataLoader:
                 failure_samples.append(f"行{failure['row']}:'{failure['original_value']}'")
             samples_str = ", ".join(failure_samples) if failure_samples else ""
             
-            if failed_ratio > 0.5:
+            if failed_ratio > 0.5 and not recover_amounts:
                 raise ValueError(f"{source_type} 中有 {failed_count} 行 ({failed_ratio:.1%}) 金额解析失败，请检查是否选对了金额列。失败样例: {samples_str}")
             
             if self.logger:
@@ -1205,7 +1315,7 @@ def _downcast_dtypes(df: pd.DataFrame) -> pd.DataFrame:
         # 字符串/object列
         if col_type == 'object':
             unique_ratio = df[col].nunique() / len(df) if len(df) > 0 else 1
-            AMOUNT_COLUMNS = {'date', 'amount', 'amount_decimal', 'std_amount', 
+            AMOUNT_COLUMNS = {'date', 'amount', 'income', 'expense', 'amount_decimal', 'std_amount',
                               '借方', '贷方', '收入', '支出', '余额', 'balance'}
             if unique_ratio < 0.5 and col not in AMOUNT_COLUMNS:
                 try:

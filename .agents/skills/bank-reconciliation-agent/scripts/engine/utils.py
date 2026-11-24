@@ -113,6 +113,12 @@ def parse_date(date_val: Any, date_format: str = "auto") -> Optional[pd.Timestam
         return None
 
 
+def amount_currencies(value: Any) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    return {{"JP¥": "JPY"}.get(code.upper(), code.upper()) for code in _AMOUNT_CURRENCY_CODE_RE.findall(value)}
+
+
 def normalize_amount_text(amount_text: str) -> Optional[str]:
     """
     标准化金额文本。

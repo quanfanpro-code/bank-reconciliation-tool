@@ -15,11 +15,12 @@ FIELD_LABELS = {
     "date": "日期", "amount": "单列金额", "debit": "借方/支出金额", "credit": "贷方/收入金额",
     "direction": "收支方向", "balance": "交易后余额", "account": "本方账号", "currency": "币种",
     "summary": "摘要", "voucher": "凭证号", "voucher_word": "凭证字", "mode": "金额列格式",
+    "counterparty_account": "对方账号", "order": "订单编号", "transaction_id": "交易流水号",
 }
 _AUXILIARY = (
     "摘要", "业务说明", "交易用途", *COUNTERPARTY_FIELD_KEYWORDS, "附言", "备注",
     "业务号", "业务编号", "批次号", "批次编号", "银企批量号", "银企批次号",
-    "订单号", "合同号", "结算号", "交易流水号", "回单号",
+    "订单号", "订单编号", "合同号", "结算号", "流水号", "交易流水号", "回单号",
 )
 _OTHER_PARTY = r"对方|(?:付|收|汇)款(?:人|方|单位|户|账号|帐号|账户|卡号|币种)|counterparty|payer|payee|beneficiary|recipient|remitter"
 _OTHER_AMOUNT = r"手续费|工本费|佣金|汇率|税额|利息金额|可用|冻结|余额|balance|合计|累计|笔数|exchange rate|commission|fee|(?:^| )tax"
@@ -146,8 +147,9 @@ def _rank(role, label, source, basis=""):
 
 def auto_select_auxiliary_columns(columns):
     return [str(column) for column in columns
-            if any(keyword in str(column) for keyword in _AUXILIARY)
-            and not any(keyword in str(column) for keyword in ("账号", "帐号", "卡号", "凭证"))]
+            if ((non_own_account_column(column) and re.search(r"账号|帐号|账户|卡号|account", str(column).lower()))
+                or (any(keyword in str(column) for keyword in _AUXILIARY)
+                    and not any(keyword in str(column) for keyword in ("账号", "帐号", "卡号", "凭证"))))]
 
 
 def _text(value):
@@ -201,7 +203,7 @@ class ColumnRecognitionError(ValueError):
 def recognize_columns(frame, source, *, overrides=None, date_format="auto"):
     """在一张原表上选择字段。可以指定已确认的个别字段。"""
     # 延后导入。读取和输入检查也使用本模块的字段规则。
-    from data_loader import direction_sign, parse_source_amount
+    from data_loader import directed_amount, direction_sign, parse_source_amount
 
     overrides = dict(overrides or {})
     requested = set(overrides)
@@ -209,6 +211,13 @@ def recognize_columns(frame, source, *, overrides=None, date_format="auto"):
     problems = []
     choices = {}
     mapping = {"auxiliary_text_columns": auto_select_auxiliary_columns(frame.columns)}
+    for role in ("counterparty_account", "order", "transaction_id"):
+        if role in overrides:
+            column = overrides.pop(role)
+            if column not in frame or (role == "counterparty_account" and _rank("account", column, source)):
+                problems.append(f"{FIELD_LABELS[role]}列「{column}」与原表不符")
+            else:
+                mapping[role] = column
     series_cache = {}
     active_rows = None
 
@@ -321,8 +330,17 @@ def recognize_columns(frame, source, *, overrides=None, date_format="auto"):
         if mode == "signed_amount":
             return amount
         directions_values, _ = values("direction", layout["direction"])
-        return tuple(abs(value) * sign if value is not None and sign is not None else None
-                     for value, sign in zip(amount, directions_values))
+        return interpret_directions(amount, directions_values, balances)[0]
+
+    def interpret_directions(amount, directions_values, balance_columns):
+        signed = tuple(directed_amount(value, sign) for value, sign in zip(amount, directions_values))
+        absolute = tuple(directed_amount(value, sign, absolute=True) for value, sign in zip(amount, directions_values))
+        use_absolute = signed != absolute and any(
+            _verified_chain(absolute, values("balance", balance)[0])
+            and not _verified_chain(signed, values("balance", balance)[0])
+            for balance in balance_columns
+        )
+        return (absolute if use_absolute else signed), use_absolute
 
     alternatives = list(layouts())
     if not alternatives:
@@ -371,6 +389,12 @@ def recognize_columns(frame, source, *, overrides=None, date_format="auto"):
         set_choice("balance", sorted({balance for _, balance in paired if balance}))
     for role in ("debit", "credit", "amount", "direction", "balance"):
         mapping.setdefault(role, None)
+    if mapping["mode"] == "single_amount_with_direction" and mapping["amount"] and mapping["direction"]:
+        mapping["direction_uses_absolute"] = interpret_directions(
+            values("amount", mapping["amount"])[0],
+            values("direction", mapping["direction"])[0],
+            [mapping["balance"]] if mapping["balance"] else [],
+        )[1]
 
     amount_keys = ("debit", "credit") if mapping["mode"] == "debit_credit" else ("amount",)
     tags = {amount_basis_label(mapping[key]) for key in amount_keys} - {""}

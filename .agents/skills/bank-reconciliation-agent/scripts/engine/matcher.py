@@ -16,7 +16,7 @@ import bisect
 import secrets
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -1559,6 +1559,13 @@ class Matcher:
         journal_tuple = tuple(sorted(int(index) for index in journal_idxs))
         if not bank_tuple or not journal_tuple:
             return None
+        currencies = {
+            code for frame, indices in ((self.bank, bank_tuple), (self.journal, journal_tuple))
+            if "currency" in frame for value in frame.loc[list(indices), "currency"].dropna()
+            for code in str(value).split("/") if code
+        }
+        if len(currencies) > 1:
+            return None
         if self._locked_rows["bank"].intersection(bank_tuple) or self._locked_rows["journal"].intersection(journal_tuple):
             return None
         index_key = self._candidate_id(match_type, bank_tuple, journal_tuple)
@@ -1602,13 +1609,23 @@ class Matcher:
                     )
                     break
 
+        def signed_amounts(frame, indices, original):
+            if not {"income", "expense"} <= set(frame.columns):
+                return original
+            return [PrecisionEngine.to_integer_li(value) * sign
+                    for income, expense in frame.loc[list(indices), ["income", "expense"]].itertuples(index=False, name=None)
+                    for value, sign in ((income, 1), (expense, -1)) if value]
+
         candidate = MatchCandidate(
             candidate_id=candidate_id,
             bank_idxs=bank_tuple,
             journal_idxs=journal_tuple,
             match_type=match_type,
             match_stage=match_stage,
-            metrics=build_group_metrics(bank_amounts, journal_amounts),
+            metrics=build_group_metrics(
+                signed_amounts(self.bank, bank_tuple, bank_amounts),
+                signed_amounts(self.journal, journal_tuple, journal_amounts),
+            ),
             bank_dates=tuple(
                 pd.Timestamp(value)
                 for value in self.bank.loc[list(bank_tuple), "date"].tolist()
@@ -2185,7 +2202,8 @@ class Matcher:
                         and not has_business_conflict(candidate)]
         submitted = {candidate.candidate_id: candidate for candidate in request.candidates}
         if not alternatives or any(
-            candidate.candidate_id not in submitted or relationship_priority(candidate) > relationship_priority(selected)
+            (candidate.candidate_id not in submitted and not getattr(self, "skill_automatic", False))
+            or relationship_priority(candidate) > relationship_priority(selected)
             for candidate in alternatives
         ):
             return None
@@ -4388,6 +4406,13 @@ class Matcher:
                 ),
             )[:evidence_limit]
             valid_pool: List[Dict[str, Any]] = []
+            if getattr(self, "skill_automatic", False) and not self.config.allow_mixed_sign and target_val_int:
+                smallest = min((abs(int(item["amount_decimal"])) for _, item in pooled.values()), default=0)
+                ranked_pool = sorted(pooled.values(), key=lambda e: (
+                    abs(int(e[1]["amount_decimal"])) + smallest > abs(target_val_int),
+                    -e[0], abs(target_val_int - int(e[1]["amount_decimal"])),
+                    abs((pd.Timestamp(e[1]["date"]) - s_date).days), e[1]["stable_key"],
+                ))[:evidence_limit]
             for _, item in ranked_pool:
                 if time.monotonic() >= self._combination_global_deadline:
                     mark_preprocessing_timeout(source_indices[source_position:])
@@ -4410,6 +4435,30 @@ class Matcher:
             if search_truncated:
                 source_sets["truncated"].add(source_key)
                 source_sets["budget_exhausted"].add(source_key)
+                if getattr(self, "skill_automatic", False) and target_val_int and not self.config.allow_mixed_sign:
+                    lower, upper = bucket_bounds(target_sign_buckets[allowed_signs[0]], date_min, date_max)
+                    amounts_in_range = defaultdict(list)
+                    for item in target_sign_buckets[allowed_signs[0]]["items"][lower:upper]:
+                        amounts_in_range[int(item["amount_decimal"])].append(item)
+                    # 通过金额索引补查初次截断遗漏的两笔精确组合。
+                    for amount, rows in amounts_in_range.items():
+                        complement = target_val_int - amount
+                        if amount > complement or complement not in amounts_in_range:
+                            continue
+                        other_rows = amounts_in_range[complement]
+                        for left in rows:
+                            for right in other_rows:
+                                if self.stopping:
+                                    return
+                                if time.monotonic() >= self._combination_global_deadline:
+                                    mark_preprocessing_timeout(source_indices[source_position:])
+                                    return
+                                i, j = int(left["index"]), int(right["index"])
+                                if i == j or amount == complement and i > j:
+                                    continue
+                                indices = [i, j]
+                                bank_rows, journal_rows = ([int(s_idx)], indices) if source_type == "bank" else (indices, [int(s_idx)])
+                                self._add_candidate(bank_rows, journal_rows, "combination_dfs", "组合", combo_count=2)
             self._record_candidate_pool(
                 "generic_combination",
                 source_key,

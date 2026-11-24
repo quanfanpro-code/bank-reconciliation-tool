@@ -77,7 +77,9 @@ def _critical_field_category(label: str) -> str:
         for marker in (*COUNTERPARTY_FIELD_KEYWORDS, "户名")
     ):
         return "对方户名"
-    if "账号" in compact or "帐号" in compact:
+    if ("账号" in compact or "帐号" in compact
+            or "账户" in compact and any(token in compact for token in ("对方", "收款", "付款"))
+            or compact.startswith(("counterpartyaccount", "payeraccount", "payeeaccount"))):
         return "账号"
     if "卡号" in compact:
         return "卡号"

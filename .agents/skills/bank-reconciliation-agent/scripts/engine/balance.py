@@ -412,6 +412,10 @@ def _amount_totals(frame: pd.DataFrame) -> tuple[Decimal, Decimal, Decimal]:
     if frame.empty or 'amount' not in frame.columns:
         zero = Decimal('0')
         return zero, zero, zero
+    if {"income", "expense"} <= set(frame.columns):
+        income, expense = (sum((_decimal_value(value) for value in frame[column].dropna()), Decimal(0))
+                           for column in ("income", "expense"))
+        return income, expense, income - expense
     amounts = [
         amount
         for amount in (_decimal_value(value) for value in frame['amount'])

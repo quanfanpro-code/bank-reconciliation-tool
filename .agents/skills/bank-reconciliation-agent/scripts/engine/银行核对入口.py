@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, replace
 from datetime import datetime
 from decimal import Decimal
+from hashlib import file_digest
 import json
 from pathlib import Path
 import time
@@ -15,12 +16,12 @@ from input_precheck import statement_filename_identity
 from 列识别 import ColumnRecognitionError, FIELD_LABELS
 
 
-def pair_inputs(bank, journal):
+def pair_inputs(bank, journal, *, inspect_files=True):
     if bank.is_file() and journal.is_file():
         if bank.resolve() == journal.resolve():
             raise ValueError("银行流水和日记账不能使用同一个文件")
         left, right = statement_filename_identity(bank), statement_filename_identity(journal)
-        if left and right and left != right:
+        if not inspect_files and left and right and left != right:
             raise ValueError("两个文件名标明的公司、银行或账号不一致")
         return [(bank, journal)], []
     if not (bank.is_dir() and journal.is_dir()):
@@ -36,11 +37,42 @@ def pair_inputs(bank, journal):
                 continue
             if path.name.startswith(("~$", ".")) or any(word in path.stem for word in ("核对报告", "导入模板", "输入问题")):
                 continue
-            identity = statement_filename_identity(path)
+            if inspect_files:
+                from 原表读取 import file_identity
+                identity = file_identity(path, "bank" if label == "银行流水" else "journal")
+            else:
+                identity = statement_filename_identity(path)
             if identity is None:
-                problems.append({"原因": f"{label}文件名未标明公司、银行和账号", "文件": str(path)})
+                problems.append({"原因": f"{label}没有可核实的本方账号", "文件": str(path)})
             else:
                 files[label][identity].append(path)
+
+    if inspect_files:
+        for by_identity in files.values():
+            for identity, entries in by_identity.items():
+                if len(entries) < 2:
+                    continue
+                seen, distinct = set(), []
+                for path in entries:
+                    if path.stat().st_size:
+                        with path.open("rb") as original:
+                            digest = file_digest(original, "sha256").digest()
+                        if digest in seen:
+                            continue
+                        seen.add(digest)
+                    distinct.append(path)
+                by_identity[identity] = distinct
+        # 同一个完整账号可和省略了公司或开户行抬头的原件配成一户。
+        for identity in tuple(files["银行流水"]):
+            left = files["银行流水"][identity]
+            right_by_identity = files["日记账"]
+            compatible = [other for other in right_by_identity if other[2] == identity[2]
+                          and all(not a or not b or a == b for a, b in zip(identity[:2], other[:2]))]
+            if identity in compatible or len(left) != 1 or len(compatible) != 1:
+                continue
+            other, = compatible
+            if sum(key[2] == identity[2] for key in files["银行流水"]) == 1:
+                right_by_identity[identity] = right_by_identity.pop(other)
 
     pairs = []
     for identity in sorted(files["银行流水"].keys() | files["日记账"].keys()):
@@ -62,10 +94,11 @@ def _review_counts():
 class AgentReview:
     """在本次任务目录交接候选和 Agent 答复。"""
 
-    def __init__(self, directory, timeout=120, sources=()):
+    def __init__(self, directory, timeout=120, sources=(), *, retry=False):
         self.directory = directory
         self.timeout = timeout
         self.sources = sources
+        self.retry = retry
         self.review_counts = _review_counts()
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -86,14 +119,23 @@ class AgentReview:
             for key in ("bank_fields", "journal_fields"):
                 summary[key] = {name: value for name, value in summary[key].items() if name in ONLINE_ALLOWED_FIELDS}
             candidates.append(summary)
+        def valid_choice(answer):
+            if answer is None:
+                return False
+            selected, score, reason = (answer.get(key) for key in ("selected_candidate_id", "semantic_score", "reason"))
+            return selected == "" or (selected in ids and type(score) is int and 0 <= score <= 100
+                                      and isinstance(reason, str) and bool(reason.strip()))
+
         answer, error = self.exchange({"candidates": candidates}, token=token)
+        if not valid_choice(answer) and self.retry:
+            answer, error = self.exchange({"candidates": candidates, "retry": True})
         if answer is None:
             verdict.error = error
             return verdict
         selected = answer.get("selected_candidate_id")
         score = answer.get("semantic_score")
         reason = answer.get("reason")
-        if selected in ids and type(score) is int and 0 <= score <= 100 and isinstance(reason, str) and reason.strip():
+        if selected and valid_choice(answer):
             evidence = answer.get("source_evidence")
             fields = ("bank_field", "journal_field", "quote")
             source_evidence = None
@@ -146,7 +188,13 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
     from llm_assistant import LLMConfig
     from 项目记录 import LocalProjectStore
 
-    pairs, problems = pair_inputs(bank, journal)
+    pairs, problems = pair_inputs(bank, journal, inspect_files=matcher_factory is not None)
+    if matcher_factory is not None:
+        partial = [problem for problem in problems if problem["原因"] in {"缺少日记账", "缺少银行流水"}]
+        for problem in partial:
+            left, right = problem["银行流水"], problem["日记账"]
+            pairs.append((Path(left[0]) if left else None, Path(right[0]) if right else None))
+        problems = [problem for problem in problems if problem not in partial]
     if (bank_columns or journal_columns) and not (bank.is_file() and journal.is_file()):
         raise ValueError("指定字段时请提供需要补跑的两份文件")
     output.mkdir(parents=True, exist_ok=True)
@@ -154,28 +202,30 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
     store = LocalProjectStore(session / "项目记录")
     results = []
     totals = _review_counts()
-    for bank_file, journal_file in pairs:
+    for number, (bank_file, journal_file) in enumerate(pairs, 1):
         reviewer = None
         try:
-            target = output / f"{bank_file.stem}_核对报告_{suffix}.xlsx"
-            reviewer = AgentReview(session / "复核", sources=(str(bank_file), str(journal_file)))
+            target = output / f"{(bank_file or journal_file).stem}_核对报告_{suffix}_{number:03d}.xlsx"
+            reviewer = AgentReview(session / "复核", sources=tuple(str(path) for path in (bank_file, journal_file) if path),
+                                   retry=matcher_factory is not None)
 
             def set_reviewer(matcher):
                 matcher.llm_assistant = reviewer
-                matcher.coverage_evidence = {
-                    side: (coverage_evidence or {}).get(side, {}).get(source.name, {})
-                    for side, source in (("bank", bank_file), ("journal", journal_file))
-                }
 
             report = run_reconciliation(
-                str(bank_file), str(journal_file),
+                str(bank_file or ""), str(journal_file or ""),
                 {"_column_auto": True, "_column_overrides": bank_columns},
                 {"_column_auto": True, "_column_overrides": journal_columns},
                 config, llm_config=LLMConfig(enabled=False), logger=log,
                 output_path=target, project_store=store, matcher_ready=set_reviewer,
                 matcher_factory=matcher_factory,
+                input_review=reviewer.exchange if matcher_factory is not None else None,
+                coverage_evidence={
+                    side: (coverage_evidence or {}).get(side, {}).get(source.name, {})
+                    for side, source in (("bank", bank_file), ("journal", journal_file)) if source
+                } if coverage_evidence else None,
             )
-            results.append({"银行流水": str(bank_file), "日记账": str(journal_file), "报告": str(report),
+            results.append({"银行流水": str(bank_file or ""), "日记账": str(journal_file or ""), "报告": str(report),
                             "Agent复核": dict(reviewer.review_counts)})
         except ColumnRecognitionError as exc:
             problems.append({
@@ -232,14 +282,11 @@ def main(*, matcher_factory=None):
     if getattr(args, "source_evidence", None):
         from 核对期间 import parse_coverage_evidence
         try:
-            coverage_evidence = parse_coverage_evidence(json.loads(args.source_evidence.read_text(encoding="utf-8-sig")))
+            coverage_evidence = parse_coverage_evidence(
+                json.loads(args.source_evidence.read_text(encoding="utf-8-sig")), retain_conflicting=True,
+            )
         except (OSError, TypeError, KeyError, ValueError) as exc:
             parser.error(f"来源凭据有误：{exc}")
-        pairs, _ = pair_inputs(args.bank.resolve(), args.journal.resolve())
-        for index, side in enumerate(("bank", "journal")):
-            extra = coverage_evidence.get(side, {}).keys() - {pair[index].name for pair in pairs}
-            if extra:
-                parser.error(f"{side} 来源凭据未找到对应输入：{'、'.join(sorted(extra))}")
     session = args.session.resolve()
     session.mkdir(parents=True, exist_ok=False)
     result = run_accounts(args.bank.resolve(), args.journal.resolve(), args.output.resolve(), config, session,
