@@ -37,15 +37,15 @@ description: 通过问答核对银行流水与银行日记账。用户要求银�
 
 `完整` 用在已读入全部交易的明确范围，`无交易` 用于明确查无发生额的起止日期，`不完整` 用于已知缺口。逐笔或发生额无法确认时保留未知，能用日期凭据对的余额仍逐日和逐月核对。不同方向的差额分别保留。
 
-## 运行同一核对程序
+## 运行核对
 
-从项目根目录调用本目录的 `scripts/运行核对.py`。先检查两份文件或目录可读以及报告位置可写。为每次运行使用一个尚不存在的本地任务目录。用工具启动并继续跟进这个命令，参数由你根据问答填写。
+以当前 `SKILL.md` 所在文件夹作为 Skill 目录，用绝对路径运行其中的 `scripts/运行核对.py`。核对代码随 Skill 放在 `scripts/engine`。选择本机 Python 3.11 或更新版本，先确认能导入 numpy、pandas 和 psutil。缺少依赖时，用所选 Python 按 Skill 目录的 `requirements.txt` 安装，再继续核对。先检查输入可读、报告目录可写，并选一个尚未创建的本地任务目录。
 
 ```powershell
-& $python .\.agents\skills\bank-reconciliation-agent\scripts\运行核对.py --bank $bank --journal $journal --output $output --session $session --trivial $trivial --materiality $materiality --tolerance-days $days
+& $python -I -X utf8 (Join-Path $skillDir "scripts/运行核对.py") --bank $bank --journal $journal --output $output --session $session --trivial $trivial --materiality $materiality --tolerance-days $days
 ```
 
-用本机 Python。文件系统操作保留原始文件和已有报告。批量时以公司、银行、完整账号配对，保留账号前导零。用户处理某个冲突以后，按单户补跑即可。
+在其他 Shell 中使用同样的 Python 参数，并传入脚本绝对路径。文件系统操作保留原始文件和已有报告。批量时以公司、银行、完整账号配对，保留账号前导零。用户处理某个冲突以后，按单户补跑即可。
 
 ## 字段有歧义时只补跑该户
 
@@ -54,14 +54,14 @@ description: 通过问答核对银行流水与银行日记账。用户要求银�
 用户明确选择后，用原来的设置和新的任务目录，只重跑该户的两份文件。通过可重复的 `--bank-column` 或 `--journal-column` 传入 `字段=原列名`。用「侧」选择参数。常用字段有 `date`、`amount`、`debit`、`credit`、`direction`、`balance`、`account`、`currency`。金额格式分别传 `mode=debit_credit`、`mode=signed_amount`、`mode=single_amount_with_direction`。用示例中的写法保留列名里的空格和标点。
 
 ```powershell
-& $python .\.agents\skills\bank-reconciliation-agent\scripts\运行核对.py --bank $bankFile --journal $journalFile --output $output --session $retrySession --trivial $trivial --materiality $materiality --tolerance-days $days --bank-column "amount=交易金额（元）"
+& $python -I -X utf8 (Join-Path $skillDir "scripts/运行核对.py") --bank $bankFile --journal $journalFile --output $output --session $retrySession --trivial $trivial --materiality $materiality --tolerance-days $days --bank-column "amount=交易金额（元）"
 ```
 
 用户已明确给出映射时直接使用。仍需确认的字段留在待处理账户。两份原表的账号或币种确实冲突时，用问题请用户确认文件配对，保留原表内容。
 
 ## 先完成核对，再查看剩余异常
 
-日期容差从逐笔核对开始使用。在容差内同方向同金额且双方各只有一笔、原表没有明确冲突时直接确认。余额链按正常区间继续核对，剩余记录交给原程序双向递归剪枝。几种配法能覆盖同一批原记录且收支各自对平时，整组确认。短摘要、空白流水号和模型未作判断都不产生待查事项。整月一侧没有逐笔时，集中说明该月，其他月份继续核对。
+日期容差从逐笔核对开始使用。在容差内同方向同金额且双方各只有一笔、原表没有明确冲突时直接确认。余额链按正常区间继续核对，剩余记录交给 Skill 自带的核对引擎双向递归剪枝。几种配法能覆盖同一批原记录且收支各自对平时，整组确认。短摘要、空白流水号和模型未作判断都不产生待查事项。整月一侧没有逐笔时，集中说明该月，其他月份继续核对。
 
 用当前 Agent 阅读原文字段，判断看似不同的用途是否真的矛盾。银行渠道、记账动作、代收项目和账上具体用途经常可以同时成立。先看原文和整组记录，再答复。
 

@@ -4,7 +4,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+ENGINE = Path(__file__).resolve().with_name("engine")
+if not (ENGINE / "银行核对入口.py").is_file():
+    raise SystemExit("Skill 文件不完整，缺少 scripts/engine 中的核对程序。")
+sys.path.insert(0, str(ENGINE))
 
 import pandas as pd
 import 银行核对入口 as entry

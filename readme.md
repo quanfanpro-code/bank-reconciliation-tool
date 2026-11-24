@@ -44,7 +44,7 @@ python main.py
 
 ## 在 Codex 中通过问答核对
 
-在项目中调用 `$bank-reconciliation-agent`。Agent 通过提问收集两个文件或两个目录、日期容差、两个重要性设置和报告位置。Skill 入口复用本项目的读表、递归剪枝和六表报告。某一户的原表字段确实有歧义时，确认该字段后单独补跑。
+调用 `$bank-reconciliation-agent`。把 `.agents/skills/bank-reconciliation-agent` 整个文件夹复制到另一台电脑的 Skill 目录即可使用。读表、匹配和报表模块都随文件夹提供。使用说明见 [Skill README](.agents/skills/bank-reconciliation-agent/README.md)。Agent 通过提问收集两个文件或两个目录、日期容差、两个重要性设置和报告位置。Skill 用自带代码读取、核对并生成六张工作表。某一户的原表字段确实有歧义时，确认该字段后单独补跑。
 
 - 从配置的日期容差开始核对。容差内同方向同金额且双方各只有一笔，原表无明确冲突时自动确认。带余额的输入继续核对可闭合的区间。
 - 剩余记录用原程序的双向递归剪枝找合笔。不同配法能覆盖同一批原记录、收入和支出分别相符时，整组确认，保留每笔原行。

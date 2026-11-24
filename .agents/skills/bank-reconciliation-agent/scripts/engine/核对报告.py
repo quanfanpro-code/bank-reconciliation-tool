@@ -1,0 +1,226 @@
+"""将最终核对结果写成可直接使用的工作表。"""
+
+from collections import defaultdict
+from pathlib import Path
+
+import pandas as pd
+
+from Excel验证 import 明细跳转公式
+from 排版共享 import 字母
+from 排版计划 import 格样式, 应用底层主题, 新建簿计划
+from 报告写入 import 渲染簿计划
+from 复核事项 import build_review_items
+from 核对期间 import apply_coverage
+
+
+def _text(value):
+    return str(value).strip() if value is not None and pd.notna(value) else ""
+
+
+def _records(frame, indices):
+    for index in indices:
+        row = frame.loc[index]
+        fields = row.get("aux_text_fields", {})
+        fields = fields if isinstance(fields, dict) else {}
+        party = "、".join(dict.fromkeys(
+            _text(v) for k, v in fields.items() if any(s in k for s in ("对方", "收款人", "付款人")) and _text(v)
+        ))
+        note = "；".join(dict.fromkeys(
+            _text(v) for k, v in fields.items() if any(s in k for s in ("备注", "用途", "附言")) and _text(v)
+        ))
+        yield row, party, note
+
+
+def _brief(rows, first_row, label):
+    values = []
+    for row, party, note in rows[:3]:
+        voucher = _text(row.get("voucher_no"))
+        context = "，".join(filter(None, (party, _text(row.get("summary")), note, f"凭证{voucher}" if voucher else "")))
+        action = "收款" if row["amount"] >= 0 else "付款"
+        values.append(f"{row['date']:%m-%d} {action}{abs(row['amount']):,.2f}元 {context}".strip())
+    if len(rows) > 3:
+        values.append(f"另{len(rows) - 3}笔见待核对明细第{first_row + 3}–{first_row + len(rows) - 1}行（编号{label}）")
+    return "\n".join(values)
+
+
+def _periods(frame, key, ending, notes):
+    original = key
+    frame = frame.rename(columns=lambda col: col.replace("日记账-", "账上").replace("银行-", "银行").replace("期末余额", ending))
+    balance_labels = [f"银行{ending}", f"账上{ending}", "余额差额"]
+    columns = [key, "银行收入金额", "账上收入金额", "收入金额差额", "银行支出金额", "账上支出金额", "支出金额差额",
+               *balance_labels, "收入笔数差额", "支出笔数差额"]
+    result = frame.reindex(columns=columns).copy()
+    if key == "月份":
+        result[key] = result[key].astype(str)
+    result["说明"] = result[original].map(lambda value: "；".join(notes.get(value, ())))
+    return result
+
+
+def write_reconciliation_report(reporter, output_path, config, bank_path, journal_path):
+    reporter._prepare_initial_balance()
+    daily, monthly = reporter._build_daily_and_monthly_tables()
+    items = sorted(build_review_items(reporter.matcher), key=lambda item: (item["首次日期"], item["事项编号"]))
+    agent_notes = {
+        candidate.final_match_id: candidate.llm_decision.reason
+        for candidate in reporter.matcher.selected_candidates
+        if candidate.evidence.get("agent_confirmed") and candidate.llm_decision
+    }
+    skill_groups = {c.final_match_id for c in reporter.matcher.selected_candidates if c.match_type == "skill_closed_cover"}
+    paths = {"银行": bank_path, "账上": journal_path}
+    origins = {}
+    for source in getattr(reporter.precheck_report, "source_info", ()):
+        side = "银行" if source.get("来源") == "银行流水" else "账上"
+        origins[side] = " · ".join(filter(None, (Path(source["文件路径"]).name, source.get("工作表"))))
+    daily_notes, monthly_notes = defaultdict(list), defaultdict(list)
+    apply_coverage(daily, monthly, reporter.matcher, daily_notes, monthly_notes)
+    pending, details, review_details, review_groups = [], [], [], []
+    for number, item in enumerate(items, 1):
+        label = f"{number:03d}"
+        bank = list(_records(reporter.matcher.bank, item["银行索引"]))
+        journal = list(_records(reporter.matcher.journal, item["日记账索引"]))
+        mode = item["核对方式"]
+        confirmed = mode == "自动确认"
+        action = {"人工全查": "逐项核对", "人工抽样": "抽查", "范围说明": "范围说明"}.get(mode)
+        income = item["银行收入"] - item["日记账收入"]
+        expense = item["银行支出"] - item["日记账支出"]
+        dates = sorted({row["date"].normalize() for row, _, _ in bank + journal})
+        months = sorted({day.strftime("%Y-%m") for day in dates})
+        if item.get("明细覆盖不足"):
+            month = dates[0]
+            missing, observed, count = ("银行", "账上", len(journal)) if journal else ("账上", "银行", len(bank))
+            record_name = "流水" if journal else "日记账"
+            explanation = f"{month.year}年{month.month}月{missing}缺这些日期的{record_name}，{observed}有{count}笔。收付差额无法计算。"
+            income = expense = None
+        elif confirmed:
+            explanation = "银行与账上金额一致"
+            if len(bank) != len(journal):
+                explanation = f"银行{len(bank)}笔对应账上{len(journal)}笔，合计金额一致"
+            elif len(bank) > 1 and item["匹配ID"] in skill_groups:
+                explanation = f"银行{len(bank)}笔与账上{len(journal)}笔整组核对，收入和支出分别一致"
+            if len(dates) > 1:
+                explanation += "，记账日期不同"
+                for day in dates:
+                    daily_notes[day].append(f"{label} 已对上，日期不同")
+                if len(months) > 1:
+                    for month in months:
+                        monthly_notes[month].append(f"{label} 已对上，入账月份不同")
+        elif item["程序结论"] in {"账内更正已闭合", "银行冲正已闭合"}:
+            explanation = "原交易已冲销，净额为零"
+        elif not bank or not journal:
+            explanation = "银行有记录，账上未找到对应" if bank else "账上有记录，银行未找到对应"
+        elif income or expense:
+            explanation = "双方记录之间仍有收付金额差额"
+        else:
+            explanation = "双方金额相同，交易对应尚未确定"
+        if action and not item.get("明细覆盖不足"):
+            reasons = [
+                reason for reason in item["判断依据"].split("；")
+                if reason and not reason.startswith("综合可信度") and reason != "本次匹配未建立对应关系"
+            ]
+            if reasons:
+                explanation += "。具体问题：" + "；".join(reasons)
+            if item["入选原因"]:
+                explanation += "。入选原因：" + item["入选原因"]
+        if item["事项编号"] in agent_notes:
+            explanation += "。Agent 判断依据：" + agent_notes[item["事项编号"]]
+        first_detail_row = len(details) + 2
+        for side, entries in (("银行", bank), ("账上", journal)):
+            origin = origins.get(side) or (Path(paths[side]).name if paths[side] else side)
+            for row, party, note in entries:
+                details.append((label, side, row["date"], max(row["amount"], 0), max(-row["amount"], 0),
+                                row.get("balance"), party, row.get("summary", ""), note, _text(row.get("voucher_no")),
+                                explanation, f"{origin} · 第{row.get('original_file_row', row.get('original_idx', ''))}行"))
+        if action:
+            first_review_row = len(review_details) + 2
+            count = len(bank) + len(journal)
+            pending.append((label, action, explanation, _brief(bank, first_review_row, label),
+                            _brief(journal, first_review_row + len(bank), label), income, expense, "", "", ""))
+            review_groups.append((action, first_detail_row, first_review_row, count))
+            review_details.extend(details[first_detail_row - 2:])
+
+    months_with_difference = sum(
+        any(pd.notna(value) and value != 0 for value in values)
+        for values in monthly.reindex(columns=["收入金额差额", "支出金额差额", "余额差额"]).itertuples(index=False, name=None)
+    )
+    dates = sorted(set(reporter.matcher.bank["date"]).union(reporter.matcher.journal["date"]))
+    message = f"{months_with_difference} 个月有收支或余额差额，见月度核对" if months_with_difference else "各月收入及支出金额一致"
+    if not months_with_difference and "余额差额" in monthly and not monthly.empty and monthly["余额差额"].notna().all():
+        message = "各月收入、支出及月末余额一致"
+    if hasattr(reporter.matcher, "uncovered_months"):
+        gaps = monthly[["收入金额差额", "支出金额差额"]].isna().any(axis=1)
+        if gaps.any():
+            compared = monthly.loc[~gaps]
+            unequal = sum(any(pd.notna(v) and v != 0 for v in row)
+                          for row in compared[["收入金额差额", "支出金额差额"]].itertuples(index=False, name=None))
+            message = f"{int(gaps.sum())} 个月收付无法完整核对，已覆盖月份有 {unequal} 个月收付有差额"
+        if "余额差额" in daily:
+            balance_days = [abs(v) for v in daily["余额差额"] if pd.notna(v) and v]
+            if balance_days:
+                message += f"。日末余额有 {len(balance_days)} 天不同，最大差 {max(balance_days):,.2f} 元"
+    filename = Path(bank_path).stem if bank_path else ""
+    identity = filename.rsplit("-", 2)
+    overview = [
+        ("公司", identity[0] if len(identity) == 3 else ""), ("银行及账号", " · ".join(identity[1:]) if len(identity) == 3 else ""),
+        ("银行流水", Path(bank_path).name if bank_path else ""), ("银行日记账", Path(journal_path).name if journal_path else ""),
+        ("交易日期", f"{dates[0]:%Y-%m-%d} 至 {dates[-1]:%Y-%m-%d}" if dates else "无交易"),
+        ("读入笔数", f"银行 {len(reporter.matcher.bank)} 笔，账上 {len(reporter.matcher.journal)} 笔"),
+        ("月度核对结果", message), ("需要人工核对", sum(row[1] != "范围说明" for row in pending)),
+        ("如何查看明细", "在待核对点「查看全部…笔」。待核对明细按编号分组，浅蓝为范围说明，浅黄为核对事项。"),
+        ("明显微小错报临界值", config.clearly_trivial_threshold), ("实际执行重要性水平", config.performance_materiality),
+    ]
+    if reporter.precheck_report:
+        if reporter.matcher.balance_windows_checked and hasattr(reporter.matcher, "uncovered_months"):
+            balance_result = "已使用可验证的余额区间核对交易，断点分别处理"
+        elif reporter.matcher.balance_windows_checked:
+            balance_result = "已核实本户及双方收支、期初期末余额，并逐日核对余额链"
+        elif reporter.matcher.balance_scope_verified:
+            balance_result = "已核实账户及总体余额。逐日余额链未能核实，未用于跨日或合笔确认"
+        else:
+            balance_result = "本次未同时核实账户、双方收支及连续余额，未启用余额配对"
+        overview.append(("余额配对", balance_result))
+    review_counts = getattr(reporter.matcher.llm_assistant, "review_counts", None)
+    if review_counts is not None:
+        overview.append(("Agent复核", "，".join(f"{key} {count} 项" for key, count in review_counts.items())))
+    if reporter.error_collector and reporter.error_collector.has_errors():
+        for error in reporter.error_collector.get_all_errors():
+            overview.append(("未读入的记录", f"{error.get('source_type', '')} 第{error.get('row', '')}行：{error.get('reason', '')}"))
+    pending_frame = pd.DataFrame(pending or [("", "", "本次无需人工核对", "", "", None, None, "", "", "")], columns=[
+        "编号", "处理方式", "要查什么", "银行记录", "账上记录", "收入差额", "支出差额", "核查结论", "备注", "交易明细"])
+    detail_columns = ["编号", "来源", "日期", "收入金额", "支出金额", "余额", "对方", "摘要",
+                      "银行备注", "凭证号", "核对结果", "原表位置"]
+    tables = {
+        "核对总览": pd.DataFrame(overview, columns=["项目", "结果"]),
+        "月度核对": _periods(monthly, "月份", "月末余额", monthly_notes),
+        "日度核对": _periods(daily, "日期", "日末余额", daily_notes),
+        "待核对": pending_frame,
+        "待核对明细": pd.DataFrame(review_details, columns=detail_columns),
+        "交易明细": pd.DataFrame(details, columns=detail_columns),
+    }
+    plan = 新建簿计划({name: reporter._safe_table(table) for name, table in tables.items()})
+    for sheet in plan.表:
+        应用底层主题(sheet, 首列留白=False)
+        sheet.冻结 = "A2"
+        if sheet.名称 != "核对总览" and len(sheet.表):
+            sheet.筛选 = f"A1:{字母(len(sheet.表.columns))}{len(sheet.表) + 1}"
+    todo = plan.取表("待核对")
+    if pending:
+        todo.表["交易明细"] = [
+            "=" + 明细跳转公式(row, "待核对明细", len(review_details) + 1, f"查看全部{count}笔")
+            for row, (_, _, _, count) in enumerate(review_groups, 2)
+        ]
+    targeted = plan.取表("待核对明细")
+    full = plan.取表("交易明细")
+    for action, first_detail_row, first_review_row, count in review_groups:
+        color = "DFEDFC" if action == "范围说明" else "FFEDBC"
+        for sheet, start in ((targeted, first_review_row), (full, first_detail_row)):
+            for index in range(count):
+                for column in range(1, len(detail_columns) + 1):
+                    sheet.盖格(start + index, column, 格样式(
+                        填充色=color, 填充类型="solid", 加粗=True if column == 1 else None,
+                        上框=("medium", "7891AD") if index == 0 else None,
+                    ))
+    for row in range(2, len(pending) + 2):
+        for column in (8, 9):
+            todo.盖格(row, column, 格样式(填充色="FFF2CC", 填充类型="solid"))
+        todo.行计划取(row).高 = 68
+    渲染簿计划(plan, output_path)

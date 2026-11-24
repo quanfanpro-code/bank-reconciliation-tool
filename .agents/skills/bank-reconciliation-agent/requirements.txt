@@ -1,0 +1,4 @@
+numpy>=1.26,<3
+pandas>=2.2,<4
+psutil>=5.9,<8
+pywin32>=311; platform_system == "Windows"
