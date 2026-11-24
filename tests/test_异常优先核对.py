@@ -134,3 +134,28 @@ def test_双方整月无行也需要查询范围():
     journal = frame(("2025-05-31", 12, "收款", {}), ("2025-07-01", 25, "收款", {}))
     matcher = run(bank, journal)
     assert matcher.uncovered_months == {"bank": {pd.Period("2025-06")}, "journal": {pd.Period("2025-06")}}
+
+def test_范围说明的全部明细按编号着色并可直接跳转(tmp_path):
+    from openpyxl import load_workbook
+    from Excel验证 import _验证五表结构
+    from reporter import Reporter
+
+    bank = frame(("2025-05-31", 2800, "收款", {}), ("2025-07-01", 3200, "收款", {}))
+    journal = frame(("2025-05-31", 2800, "收款", {}),
+                    *(("2025-06-14", i, "汇款", {}) for i in (13, 24, 37, 42, 56)),
+                    ("2025-07-01", 3200, "收款", {}))
+    matcher = run(bank, journal)
+    target = tmp_path / "报告.xlsx"
+    Reporter(matcher)._generate_report(str(target))
+    assert _验证五表结构(target)["工作表数"] == 6
+    book = load_workbook(target)
+    review, subset, full = (book[name] for name in ("待核对", "待核对明细", "交易明细"))
+    number = review["A2"].value
+    assert review["C2"].value == "2025年6月银行缺这些日期的流水，账上有5笔。收付差额无法计算。"
+    assert f"第5–6行（编号{number}）" in review["E2"].value
+    assert "待核对明细" in review["J2"].value and "查看全部5笔" in review["J2"].value
+    assert subset.max_row == 6
+    assert {subset.cell(row, 1).value for row in range(2, 7)} == {number}
+    assert {cell.fill.fgColor.rgb[-6:] for row in subset.iter_rows(min_row=2, max_row=6) for cell in row} == {"DFEDFC"}
+    assert [row for row in full.iter_rows(min_row=2, values_only=True) if row[0] == number] == list(subset.values)[1:]
+    book.close()

@@ -1,4 +1,4 @@
 interface:
   display_name: "银行流水核对"
-  short_description: "用问答设置单户或批量核对，生成银行流水与银行日记账五表报告"
+  short_description: "用问答设置单户或批量核对，生成银行流水与银行日记账核对报告"
   default_prompt: "用 $bank-reconciliation-agent 通过问答核对银行流水和日记账。"

@@ -40,7 +40,7 @@ def test_先确认逐笔再核对同段的合并记录(tmp_path):
     output = tmp_path / '核对.xlsx'
     Reporter(matcher)._generate_report(str(output))
     workbook = 读簿(output)
-    assert list(workbook.表) == ['核对总览', '月度核对', '日度核对', '待核对', '交易明细']
+    assert list(workbook.表) == ['核对总览', '月度核对', '日度核对', '待核对', '待核对明细', '交易明细']
     assert 检查人工填写区(output) == 1
 
 
@@ -83,5 +83,5 @@ def test_启动Excel被拒绝时仍可验证五表报告(tmp_path):
     Reporter(matcher)._generate_report(str(output))
     with patch('win32com.client.DispatchEx', side_effect=pywintypes.com_error(-2147024891, '拒绝访问', None, None)):
         result = 验证Excel报告(output)
-    assert result['工作表数'] == 5
+    assert result['工作表数'] == 6
     assert result['验证方式'] == '工作簿结构检查'

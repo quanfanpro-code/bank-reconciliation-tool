@@ -2173,5 +2173,5 @@ class Reporter:
         report_started = time.perf_counter()
         from 核对报告 import write_reconciliation_report
         write_reconciliation_report(self, output_path, config or self.matcher.config, bank_path, journal_path)
-        self._log(f"五张核对工作表已写入，耗时 {time.perf_counter() - report_started:.1f} 秒")
+        self._log(f"核对工作表已写入，耗时 {time.perf_counter() - report_started:.1f} 秒")
 

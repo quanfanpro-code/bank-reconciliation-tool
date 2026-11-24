@@ -90,7 +90,7 @@ def test_字段歧义只拦受影响账户且可按明确字段补跑(tmp_path, 
     )
     assert not retry["待处理"]
     book = load_workbook(retry["完成"][0]["报告"], read_only=True, data_only=True)
-    assert book.sheetnames == ["核对总览", "月度核对", "日度核对", "待核对", "交易明细"]
+    assert book.sheetnames == ["核对总览", "月度核对", "日度核对", "待核对", "待核对明细", "交易明细"]
     amounts = [Decimal(str(row[3])) - Decimal(str(row[4])) for row in list(book["交易明细"].values)[1:]
                if row[1] == "银行"]
     book.close()

@@ -1,4 +1,4 @@
-"""Skill 入口。只在本次进程补充核对步骤，复用原程序的读表、剪枝及五表输出。"""
+"""Skill 入口。只在本次进程补充核对步骤，复用原程序的读表、剪枝及报表输出。"""
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from pathlib import Path
