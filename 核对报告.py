@@ -63,12 +63,27 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         for candidate in reporter.matcher.selected_candidates
         if candidate.evidence.get("agent_confirmed") and candidate.llm_decision
     }
+    skill_groups = {c.final_match_id for c in reporter.matcher.selected_candidates if c.match_type == "skill_closed_cover"}
     paths = {"银行": bank_path, "账上": journal_path}
     origins = {}
     for source in getattr(reporter.precheck_report, "source_info", ()):
         side = "银行" if source.get("来源") == "银行流水" else "账上"
         origins[side] = " · ".join(filter(None, (Path(source["文件路径"]).name, source.get("工作表"))))
     daily_notes, monthly_notes = defaultdict(list), defaultdict(list)
+    for side, months in getattr(reporter.matcher, "uncovered_months", {}).items():
+        label = "银行" if side == "bank" else "账上"
+        prefix = "银行" if side == "bank" else "日记账"
+        balance = f"{prefix}-期末余额"
+        month_balance = f"{prefix}-月末余额"
+        month_keys = {str(month) for month in months}
+        for month in month_keys:
+            monthly_notes[month].append(f"{label}一侧无逐笔记录，差额按当前读入数据列示")
+        if month_balance in monthly and "月份" in monthly:
+            affected = monthly["月份"].astype(str).isin(month_keys)
+            monthly.loc[affected, [month_balance, "余额差额"]] = None
+        if balance in daily and "日期" in daily:
+            affected = pd.to_datetime(daily["日期"]).dt.strftime("%Y-%m").isin(month_keys)
+            daily.loc[affected, [balance, "余额差额"]] = None
     pending, details = [], []
     for number, item in enumerate(items, 1):
         label = f"{number:03d}"
@@ -85,6 +100,8 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
             explanation = "银行与账上金额一致"
             if len(bank) != len(journal):
                 explanation = f"银行{len(bank)}笔对应账上{len(journal)}笔，合计金额一致"
+            elif len(bank) > 1 and item["匹配ID"] in skill_groups:
+                explanation = f"银行{len(bank)}笔与账上{len(journal)}笔整组核对，收入和支出分别一致"
             if len(dates) > 1:
                 explanation += "，记账日期不同"
                 for day in dates:
@@ -139,7 +156,9 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         ("明显微小错报临界值", config.clearly_trivial_threshold), ("实际执行重要性水平", config.performance_materiality),
     ]
     if reporter.precheck_report:
-        if reporter.matcher.balance_windows_checked:
+        if reporter.matcher.balance_windows_checked and hasattr(reporter.matcher, "uncovered_months"):
+            balance_result = "已使用可验证的余额区间核对交易，断点分别处理"
+        elif reporter.matcher.balance_windows_checked:
             balance_result = "已核实本户及双方收支、期初期末余额，并逐日核对余额链"
         elif reporter.matcher.balance_scope_verified:
             balance_result = "已核实账户及总体余额。逐日余额链未能核实，未用于跨日或合笔确认"

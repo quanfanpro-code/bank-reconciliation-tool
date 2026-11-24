@@ -86,29 +86,9 @@ class AgentReview:
             for key in ("bank_fields", "journal_fields"):
                 summary[key] = {name: value for name, value in summary[key].items() if name in ONLINE_ALLOWED_FIELDS}
             candidates.append(summary)
-        request_path = self.directory / f"request-{token}.json"
-        staged = request_path.with_suffix(".new")
-        deadline = time.monotonic() + self.timeout
-        expires_at = time.time() + self.timeout
-        staged.write_text(json.dumps({
-            "id": token, "sources": self.sources, "expires_at": expires_at, "candidates": candidates,
-        }, ensure_ascii=False), encoding="utf-8")
-        staged.replace(request_path)
-        response_path = self.directory / f"answer-{token}.json"
-        while not response_path.is_file() and (remaining := deadline - time.monotonic()) > 0:
-            time.sleep(min(.1, remaining))
-        if not response_path.is_file() or response_path.stat().st_mtime > expires_at:
-            self.review_counts["超时"] += 1
-            verdict.error = "当前 Agent 未在等待时间内返回答复"
-            return verdict
-
-        try:
-            answer = json.loads(response_path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, ValueError):
-            answer = None
-        if not isinstance(answer, dict) or answer.get("id") != token:
-            self.review_counts["未复核"] += 1
-            verdict.error = "Agent 答复无法关联到本次候选"
+        answer, error = self.exchange({"candidates": candidates}, token=token)
+        if answer is None:
+            verdict.error = error
             return verdict
         selected = answer.get("selected_candidate_id")
         score = answer.get("semantic_score")
@@ -133,8 +113,35 @@ class AgentReview:
         return verdict
 
 
+    def exchange(self, payload, *, token=None):
+        """发送一个独立计时的任务并读取同一任务的答复。"""
+        token = token or uuid4().hex
+        request_path = self.directory / f"request-{token}.json"
+        staged = request_path.with_suffix(".new")
+        deadline = time.monotonic() + self.timeout
+        expires_at = time.time() + self.timeout
+        staged.write_text(json.dumps({
+            **payload, "id": token, "sources": self.sources, "expires_at": expires_at,
+        }, ensure_ascii=False), encoding="utf-8")
+        staged.replace(request_path)
+        response_path = self.directory / f"answer-{token}.json"
+        while not response_path.is_file() and (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(.1, remaining))
+        if not response_path.is_file() or response_path.stat().st_mtime > expires_at:
+            self.review_counts["超时"] += 1
+            return None, "当前 Agent 未在等待时间内返回答复"
+        try:
+            answer = json.loads(response_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, ValueError):
+            answer = None
+        if not isinstance(answer, dict) or answer.get("id") != token:
+            self.review_counts["未复核"] += 1
+            return None, "Agent 答复无法关联到本次请求"
+        return answer, ""
+
+
 def run_accounts(bank, journal, output, config, session, *, log=print,
-                 bank_columns=None, journal_columns=None):
+                 bank_columns=None, journal_columns=None, matcher_factory=None):
     from application import run_reconciliation
     from llm_assistant import LLMConfig
     from 项目记录 import LocalProjectStore
@@ -162,6 +169,7 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
                 {"_column_auto": True, "_column_overrides": journal_columns},
                 config, llm_config=LLMConfig(enabled=False), logger=log,
                 output_path=target, project_store=store, matcher_ready=set_reviewer,
+                matcher_factory=matcher_factory,
             )
             results.append({"银行流水": str(bank_file), "日记账": str(journal_file), "报告": str(report),
                             "Agent复核": dict(reviewer.review_counts)})
@@ -188,7 +196,7 @@ def _column_overrides(parser, entries):
     return result
 
 
-def main():
+def main(*, matcher_factory=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bank", required=True, type=Path)
     parser.add_argument("--journal", required=True, type=Path)
@@ -196,20 +204,29 @@ def main():
     parser.add_argument("--session", required=True, type=Path)
     parser.add_argument("--trivial", type=Decimal)
     parser.add_argument("--materiality", type=Decimal)
+    parser.add_argument("--tolerance-days", type=int, help="可跨几天核对，默认使用项目设置")
     parser.add_argument("--bank-column", action="append", default=[], metavar="字段=原列名")
     parser.add_argument("--journal-column", action="append", default=[], metavar="字段=原列名")
     args = parser.parse_args()
+    if args.tolerance_days is not None and args.tolerance_days < 0:
+        parser.error("日期容差必须为非负整数")
     bank_columns = _column_overrides(parser, args.bank_column)
     journal_columns = _column_overrides(parser, args.journal_column)
+    settings = {
+        "clearly_trivial_threshold": args.trivial,
+        "performance_materiality": args.materiality,
+        "tolerance_days": args.tolerance_days,
+        "dfs_date_window": args.tolerance_days,
+    }
     config = replace(MatcherConfig(), **{
-        key: value for key, value in {"clearly_trivial_threshold": args.trivial, "performance_materiality": args.materiality}.items()
+        key: value for key, value in settings.items()
         if value is not None
     })
     session = args.session.resolve()
     session.mkdir(parents=True, exist_ok=False)
     result = run_accounts(args.bank.resolve(), args.journal.resolve(), args.output.resolve(), config, session,
                           log=lambda message: print(message, flush=True),
-                          bank_columns=bank_columns, journal_columns=journal_columns)
+                          bank_columns=bank_columns, journal_columns=journal_columns, matcher_factory=matcher_factory)
     print("核对结果 " + json.dumps(result, ensure_ascii=False), flush=True)
     return 1 if result["待处理"] else 0
 

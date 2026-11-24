@@ -279,6 +279,7 @@ def run_reconciliation(
     output_path: Optional[str | Path] = None,
     progress_callback: Optional[Callable[[float], None]] = None,
     matcher_ready: Optional[Callable[[Matcher], None]] = None,
+    matcher_factory: Optional[type[Matcher]] = None,
     precheck_warning_callback: Optional[
         Callable[[InputPrecheckReport], bool]
     ] = None,
@@ -524,7 +525,7 @@ def run_reconciliation(
         if re.fullmatch(r"[0-9A-Z]+", account):
             verified_account = account
 
-    matcher = Matcher(
+    matcher = (matcher_factory or Matcher)(
         bank,
         journal,
         matcher_config,

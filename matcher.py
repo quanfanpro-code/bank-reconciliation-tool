@@ -4089,6 +4089,9 @@ class Matcher:
             except (BrokenProcessPool, RuntimeError):
                 pass
 
+    def _combination_has_conflict(self, evidence: Dict[str, Any]) -> bool:
+        return bool(evidence["business_conflicts"])
+
     def _dfs_one_to_many(self, source_type: str, target_type: str) -> None:
         if source_type == 'bank':
             sources = self.bank
@@ -4394,7 +4397,7 @@ class Matcher:
                     [source_profile] if source_type == "bank" else [target_profile],
                     [target_profile] if source_type == "bank" else [source_profile],
                 )
-                if not evidence["business_conflicts"]:
+                if not self._combination_has_conflict(evidence):
                     valid_pool.append(item)
             window_view_dict = valid_pool[:candidate_limit]
             retained_count = len(window_view_dict)
