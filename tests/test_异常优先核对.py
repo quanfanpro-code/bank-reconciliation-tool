@@ -87,7 +87,7 @@ def test_某月一侧无明细只集中说明一次():
                    ("2026-02-01", 30000, "收款", {}), ("2026-02-02", -40000, "付款", {}),
                    ("2026-03-01", 10000, "收款", {}))
     items = build_review_items(run(bank, ledger))
-    assert [(i["银行索引"], i["日记账索引"]) for i in items if i["核对方式"] == "人工全查"] == [((), (1, 2))]
+    assert [(i["银行索引"], i["日记账索引"]) for i in items if i["核对方式"] == "范围说明"] == [((), (1, 2))]
     assert sum(i["核对方式"] == "自动确认" for i in items) == 2
 
 def test_语义冲突由Agent读原文决定():
@@ -128,3 +128,9 @@ def test_银行同日等额收付仍保留两个方向的实际差额():
     assert len(actions) == 1
     assert actions[0]["银行索引"] == (0, 1)
     assert actions[0]["银行收入"] == actions[0]["银行支出"] == Decimal("50000")
+
+def test_双方整月无行也需要查询范围():
+    bank = frame(("2025-05-31", 12, "收款", {}), ("2025-07-01", 25, "收款", {}))
+    journal = frame(("2025-05-31", 12, "收款", {}), ("2025-07-01", 25, "收款", {}))
+    matcher = run(bank, journal)
+    assert matcher.uncovered_months == {"bank": {pd.Period("2025-06")}, "journal": {pd.Period("2025-06")}}

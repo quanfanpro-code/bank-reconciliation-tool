@@ -98,8 +98,9 @@ def build_review_items(matcher) -> list[dict]:
                                              and int(row["amount_decimal"]) == int(p["amount_decimal"])
                                              and business_identity(row)[1] == party
                                              for _, row in frame.iterrows()) == 1 for p in pair))
+        coverage_limited = bool(event and event.event_type == "月度明细未覆盖")
         closed = correction or bank_reversal
-        if closed:
+        if closed or coverage_limited:
             impact = 0
         risk = risk_level_for(impact, matcher.config)
         original_rows = sorted(int(frame.loc[index].get("original_file_row", frame.loc[index].get("original_idx", index))) for index in indexes)
@@ -113,6 +114,7 @@ def build_review_items(matcher) -> list[dict]:
         item = make_item(
             identity, indexes if side == "bank" else (), indexes if side == "journal" else (),
             "账内更正已闭合" if correction else "银行冲正已闭合" if bank_reversal else "同侧业务链" if event else f"{side_name}未对应", risk, impact, impact, reason,
+            明细覆盖不足=coverage_limited,
         )
         if event:
             item["同侧业务链ID"] = event.event_id
@@ -121,7 +123,7 @@ def build_review_items(matcher) -> list[dict]:
         for index in indexes:
             row = frame.loc[index]
             amount = int(row["amount_decimal"])
-            if amount and not closed:
+            if amount and not closed and not coverage_limited:
                 direction = "收入" if amount > 0 else "支出"
                 kind = ("银行已记公司未记-" if side == "bank" else "公司已记银行未记-") + direction
                 pool_parts[(pd.Timestamp(row["date"]).strftime("%Y-%m"), kind)].append((item, abs(amount)))
@@ -147,7 +149,9 @@ def build_review_items(matcher) -> list[dict]:
 
     for item in items:
         risk = item["风险等级"]
-        if item["程序结论"] in {"账内更正已闭合", "银行冲正已闭合"} and risk == RiskLevel.NORMAL.value:
+        if item.get("明细覆盖不足"):
+            item["核对方式"] = "范围说明"
+        elif item["程序结论"] in {"账内更正已闭合", "银行冲正已闭合"} and risk == RiskLevel.NORMAL.value:
             item["核对方式"] = "留存备查"
             item["入选原因"] = ("同日同对方唯一付款与明确银行冲正闭合，不另寻账上支付；原始收支差额仍保留"
                                 if item["程序结论"] == "银行冲正已闭合" else

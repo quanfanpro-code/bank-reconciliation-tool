@@ -9,6 +9,7 @@ from 排版共享 import 字母
 from 排版计划 import 格样式, 应用底层主题, 新建簿计划
 from 报告写入 import 渲染簿计划
 from 复核事项 import build_review_items
+from 核对期间 import apply_coverage
 
 
 def _text(value):
@@ -70,20 +71,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         side = "银行" if source.get("来源") == "银行流水" else "账上"
         origins[side] = " · ".join(filter(None, (Path(source["文件路径"]).name, source.get("工作表"))))
     daily_notes, monthly_notes = defaultdict(list), defaultdict(list)
-    for side, months in getattr(reporter.matcher, "uncovered_months", {}).items():
-        label = "银行" if side == "bank" else "账上"
-        prefix = "银行" if side == "bank" else "日记账"
-        balance = f"{prefix}-期末余额"
-        month_balance = f"{prefix}-月末余额"
-        month_keys = {str(month) for month in months}
-        for month in month_keys:
-            monthly_notes[month].append(f"{label}一侧无逐笔记录，差额按当前读入数据列示")
-        if month_balance in monthly and "月份" in monthly:
-            affected = monthly["月份"].astype(str).isin(month_keys)
-            monthly.loc[affected, [month_balance, "余额差额"]] = None
-        if balance in daily and "日期" in daily:
-            affected = pd.to_datetime(daily["日期"]).dt.strftime("%Y-%m").isin(month_keys)
-            daily.loc[affected, [balance, "余额差额"]] = None
+    apply_coverage(daily, monthly, reporter.matcher, daily_notes, monthly_notes)
     pending, details = [], []
     for number, item in enumerate(items, 1):
         label = f"{number:03d}"
@@ -91,12 +79,15 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         journal = list(_records(reporter.matcher.journal, item["日记账索引"]))
         mode = item["核对方式"]
         confirmed = mode == "自动确认"
-        action = {"人工全查": "逐项核对", "人工抽样": "抽查"}.get(mode)
+        action = {"人工全查": "逐项核对", "人工抽样": "抽查", "范围说明": "范围说明"}.get(mode)
         income = item["银行收入"] - item["日记账收入"]
         expense = item["银行支出"] - item["日记账支出"]
         dates = sorted({row["date"].normalize() for row, _, _ in bank + journal})
         months = sorted({day.strftime("%Y-%m") for day in dates})
-        if confirmed:
+        if item.get("明细覆盖不足"):
+            explanation = "逐笔明细未覆盖，无法核对实际收付差额"
+            income = expense = None
+        elif confirmed:
             explanation = "银行与账上金额一致"
             if len(bank) != len(journal):
                 explanation = f"银行{len(bank)}笔对应账上{len(journal)}笔，合计金额一致"
@@ -145,6 +136,17 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
     message = f"{months_with_difference} 个月有收支或余额差额，见月度核对" if months_with_difference else "各月收入及支出金额一致"
     if not months_with_difference and "余额差额" in monthly and not monthly.empty and monthly["余额差额"].notna().all():
         message = "各月收入、支出及月末余额一致"
+    if hasattr(reporter.matcher, "uncovered_months"):
+        gaps = monthly[["收入金额差额", "支出金额差额"]].isna().any(axis=1)
+        if gaps.any():
+            compared = monthly.loc[~gaps]
+            unequal = sum(any(pd.notna(v) and v != 0 for v in row)
+                          for row in compared[["收入金额差额", "支出金额差额"]].itertuples(index=False, name=None))
+            message = f"{int(gaps.sum())} 个月收付无法完整核对，已覆盖月份有 {unequal} 个月收付有差额"
+        if "余额差额" in daily:
+            balance_days = [abs(v) for v in daily["余额差额"] if pd.notna(v) and v]
+            if balance_days:
+                message += f"。日末余额有 {len(balance_days)} 天不同，最大差 {max(balance_days):,.2f} 元"
     filename = Path(bank_path).stem if bank_path else ""
     identity = filename.rsplit("-", 2)
     overview = [
@@ -152,7 +154,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
         ("银行流水", Path(bank_path).name if bank_path else ""), ("银行日记账", Path(journal_path).name if journal_path else ""),
         ("交易日期", f"{dates[0]:%Y-%m-%d} 至 {dates[-1]:%Y-%m-%d}" if dates else "无交易"),
         ("读入笔数", f"银行 {len(reporter.matcher.bank)} 笔，账上 {len(reporter.matcher.journal)} 笔"),
-        ("月度核对结果", message), ("需要人工核对", len(pending)),
+        ("月度核对结果", message), ("需要人工核对", sum(row[1] != "范围说明" for row in pending)),
         ("明显微小错报临界值", config.clearly_trivial_threshold), ("实际执行重要性水平", config.performance_materiality),
     ]
     if reporter.precheck_report:

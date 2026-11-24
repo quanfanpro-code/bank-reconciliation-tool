@@ -10,6 +10,7 @@ import pandas as pd
 import 银行核对入口 as entry
 from balance import _closed_day_balances
 from data_structures import BusinessEvent
+from 核对期间 import coverage_dates, uncovered_dates
 from llm_assistant import ONLINE_ALLOWED_FIELDS
 from matcher import Matcher, select_non_conflicting_candidates
 from 业务分组 import candidate_sort_key, has_business_conflict
@@ -316,21 +317,28 @@ class SkillMatcher(Matcher):
                 choices = [self._original_rows(item) for item in [c, *(by_id[i] for i in alternatives[:2])]]
                 c.processing_reason = "这几种对应会留下不同原始记录。" + "；".join(choices)
         months = self._months()
-        self.uncovered_months = {"bank": months["journal"] - months["bank"],
-                                 "journal": months["bank"] - months["journal"]}
+        evidence = getattr(self, "coverage_evidence", {})
+        supplied_months = {day.to_period("M") for day in coverage_dates(evidence)}
+        calendar = months["bank"] | months["journal"] | supplied_months
+        available = set(pd.period_range(min(calendar), max(calendar), freq="M")) if calendar else set()
+        self.uncovered_months = {side: available - values for side, values in months.items()}
         observed = []
         for side, frame in self._frames().items():
             other = "journal" if side == "bank" else "bank"
-            for month in sorted(months[side] - months[other]):
-                rows = frame.loc[~frame["matched"] & (frame["date"].dt.to_period("M") == month)]
-                if rows.empty:
-                    continue
+            facts = evidence.get(side, {})
+            for start, end, kind, source in facts.get("periods", []):
+                if kind == "无交易" and frame.loc[frame["date"].dt.normalize().between(start, end), "amount_decimal"].ne(0).any():
+                    raise ValueError(f"逐笔记录与原件无交易范围冲突：{source}")
+            opposite_missing = uncovered_dates(frame["date"].dt.normalize(), self.uncovered_months[other],
+                                               evidence.get(other, {}))
+            unverified = frame.loc[~frame["matched"] & opposite_missing]
+            for month, rows in unverified.groupby(unverified["date"].dt.to_period("M")):
                 missing = "账上" if side == "bank" else "银行"
                 observed.append(BusinessEvent(
                     event_id=f"本月无对侧逐笔-{side}-{month}", source=side, event_type="月度明细未覆盖",
                     row_idxs=tuple(rows.index), net_amount_li=int(rows["amount_decimal"].sum()),
-                    relationship_formula=f"{month} {missing}一侧没有逐笔记录",
-                    evidence_basis=f"这 {len(rows)} 笔仅在另一侧列示，收支按原记录分别计算",
+                    relationship_formula=f"{month} {missing}一侧逐笔明细未覆盖对应日期",
+                    evidence_basis=f"另一侧有 {len(rows)} 笔原记录，实际收付差额无法计算",
                 ))
         grouped_rows = {i for event in observed if event.source == "bank" for i in event.row_idxs}
         grouped_rows.update(i for event in self.business_events if event.source == "bank" for i in event.row_idxs)

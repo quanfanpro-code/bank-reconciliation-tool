@@ -141,7 +141,7 @@ class AgentReview:
 
 
 def run_accounts(bank, journal, output, config, session, *, log=print,
-                 bank_columns=None, journal_columns=None, matcher_factory=None):
+                 bank_columns=None, journal_columns=None, matcher_factory=None, coverage_evidence=None):
     from application import run_reconciliation
     from llm_assistant import LLMConfig
     from 项目记录 import LocalProjectStore
@@ -162,6 +162,10 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
 
             def set_reviewer(matcher):
                 matcher.llm_assistant = reviewer
+                matcher.coverage_evidence = {
+                    side: (coverage_evidence or {}).get(side, {}).get(source.name, {})
+                    for side, source in (("bank", bank_file), ("journal", journal_file))
+                }
 
             report = run_reconciliation(
                 str(bank_file), str(journal_file),
@@ -202,6 +206,8 @@ def main(*, matcher_factory=None):
     parser.add_argument("--journal", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--session", required=True, type=Path)
+    if matcher_factory is not None:
+        parser.add_argument("--source-evidence", type=Path, help="从已提供原件摘录的余额及逐笔查询范围")
     parser.add_argument("--trivial", type=Decimal)
     parser.add_argument("--materiality", type=Decimal)
     parser.add_argument("--tolerance-days", type=int, help="可跨几天核对，默认使用项目设置")
@@ -222,11 +228,24 @@ def main(*, matcher_factory=None):
         key: value for key, value in settings.items()
         if value is not None
     })
+    coverage_evidence = None
+    if getattr(args, "source_evidence", None):
+        from 核对期间 import parse_coverage_evidence
+        try:
+            coverage_evidence = parse_coverage_evidence(json.loads(args.source_evidence.read_text(encoding="utf-8-sig")))
+        except (OSError, TypeError, KeyError, ValueError) as exc:
+            parser.error(f"来源凭据有误：{exc}")
+        pairs, _ = pair_inputs(args.bank.resolve(), args.journal.resolve())
+        for index, side in enumerate(("bank", "journal")):
+            extra = coverage_evidence.get(side, {}).keys() - {pair[index].name for pair in pairs}
+            if extra:
+                parser.error(f"{side} 来源凭据未找到对应输入：{'、'.join(sorted(extra))}")
     session = args.session.resolve()
     session.mkdir(parents=True, exist_ok=False)
     result = run_accounts(args.bank.resolve(), args.journal.resolve(), args.output.resolve(), config, session,
                           log=lambda message: print(message, flush=True),
-                          bank_columns=bank_columns, journal_columns=journal_columns, matcher_factory=matcher_factory)
+                          bank_columns=bank_columns, journal_columns=journal_columns, matcher_factory=matcher_factory,
+                          coverage_evidence=coverage_evidence)
     print("核对结果 " + json.dumps(result, ensure_ascii=False), flush=True)
     return 1 if result["待处理"] else 0
 

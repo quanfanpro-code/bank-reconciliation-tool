@@ -149,7 +149,9 @@ class Reporter:
         """计算每日统计对比数据。"""
         if bank.empty and journal.empty:
             return pd.DataFrame()
+        from 核对期间 import coverage_dates
         all_dates = set(bank['date'].unique()) | set(journal['date'].unique())
+        all_dates.update(coverage_dates(getattr(self.matcher, "coverage_evidence", {})))
         if not all_dates:
             return pd.DataFrame()
 
