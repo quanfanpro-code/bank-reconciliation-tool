@@ -76,6 +76,38 @@ def test_Agent原表依据改变最终结果并写入报告(tmp_path, score, con
     assert result["Agent复核"] == {"已完成": 1, "超时": 0, "未复核": 0}
 
 
+@pytest.mark.parametrize("score,status,risk", [(100, "自动确认", "正常"), (20, "疑点事项", "高风险")])
+def test_Agent评分门槛不改变原候选(score, status, risk):
+    from data_loader import DataLoader
+    from data_structures import LLMDecisionRecord
+    from matcher import Matcher
+
+    def read(rows, source):
+        return DataLoader().standardize_data(pd.DataFrame(rows), {
+            "mode": "signed_amount", "date": "日期", "amount": "金额",
+            "summary": "摘要", "auxiliary_text_columns": ["摘要", "附言"],
+        }, source)
+
+    bank = read([{"日期": "2026-02-05", "金额": 1000, "摘要": "转账", "附言": "2026年1月天然气款"}], "bank")
+    journal = read([
+        {"日期": "2026-02-05", "金额": 1000, "摘要": "2026年1月天然气款"},
+        {"日期": "2026-02-05", "金额": 1000, "摘要": "2025年12月天然气款"},
+    ], "journal")
+
+    class Reviewer:
+        def evaluate_candidates(self, request):
+            target = next(c for c in request.candidates if c.journal_fields.get("摘要") == "2026年1月天然气款")
+            return LLMDecisionRecord(request.request_id, selected_candidate_id=target.candidate_id,
+                                     semantic_score=score, reason="同期间同用途", provider="当前 Agent")
+
+    matcher = Matcher(bank, journal, CONFIG, llm_assistant=Reviewer())
+    matcher.run()
+    selected = matcher.selected_candidates[0]
+    assert matcher.journal.loc[selected.journal_idxs[0], "summary"] == "2026年1月天然气款"
+    assert selected.processing_status.value == status
+    assert selected.risk_level.value == risk
+
+
 def test_待核对显示字段冲突和月度入选原因(tmp_path):
     date = "2026-02-05"
     bank, journal = _sources(tmp_path, {

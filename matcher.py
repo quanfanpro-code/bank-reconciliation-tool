@@ -2280,7 +2280,7 @@ class Matcher:
                 if candidate.candidate_id
                 == decision.selected_candidate_id
             )
-            selected.llm_decision = decision
+            selected = replace(selected, llm_decision=decision)
             self._score_existing_candidate(selected)
             verified = self._agent_verified_candidate(selected, eligible, semantic_request)
             if verified is not None:
