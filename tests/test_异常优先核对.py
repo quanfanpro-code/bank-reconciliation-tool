@@ -118,6 +118,40 @@ def test_超过重要性或同月累计超过才进差异说明():
     assert sum(item["影响金额"] for item in flagged) == Decimal("30000")
 
 
+
+def test_同日全部小额加总正好等于另一笔时整组闭合():
+    bank = frame(("2026-03-01", 31, "收款", {}))
+    ledger = frame(*(("2026-03-01", 1, "收款", {}) for _ in range(31)))
+    matcher = skill.SkillMatcher(
+        bank, ledger,
+        MatcherConfig(clearly_trivial_threshold=Decimal("1"), performance_materiality=Decimal("10")),
+        logger=lambda *_: None,
+    )
+    matcher.run()
+    assert len(matcher.selected_candidates) == 1
+    chosen = matcher.selected_candidates[0]
+    assert chosen.bank_idxs == (0,) and len(chosen.journal_idxs) == 31
+    assert sum(item["核对方式"] == "差异说明" for item in build_review_items(matcher)) == 0
+
+
+def test_空目录不能当成核对成功(tmp_path):
+    import subprocess
+    import sys
+    bank, journal, output, session = (tmp_path / name for name in ("流水", "日记账", "报告", "任务"))
+    bank.mkdir()
+    journal.mkdir()
+    entry = SKILL_ENTRY
+    result = subprocess.run(
+        [sys.executable, str(entry), "--bank", str(bank), "--journal", str(journal),
+         "--output", str(output), "--session", str(session),
+         "--trivial", "1", "--materiality", "10", "--tolerance-days", "31"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert result.returncode != 0
+    assert "没有发现可核对的账户或支持的输入文件" in (result.stdout + result.stderr)
+    assert list(output.glob("*.xlsx")) == []
+
+
 def test_手续费净额已说明时不进待办且月度不留未解释差额(tmp_path):
     from openpyxl import load_workbook
     Reporter = skill_module("核对报告") and skill_module("reporter").Reporter
@@ -139,6 +173,11 @@ def test_手续费净额已说明时不进待办且月度不留未解释差额(t
     assert Decimal(str(record["收入金额差额"])) == 0
     assert Decimal(str(record["支出金额差额"])) == 0
     assert "手续费净额已说明" in str(record["说明"])
+    overview = load_workbook(target, data_only=True)["核对总览"]
+    summary = dict(zip([cell.value for cell in overview["A"]], [cell.value for cell in overview["B"]]))
+    overview.parent.close()
+    assert "有收支或余额差额" not in str(summary["月度核对结果"])
+    assert summary["差异及范围说明"] in (0, "0")
 
 
 def test_同额冲突和差额未被掩盖():

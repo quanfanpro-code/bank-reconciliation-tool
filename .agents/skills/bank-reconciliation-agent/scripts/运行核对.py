@@ -184,26 +184,32 @@ class SkillMatcher(Matcher):
                     for index, target in daily[left][day]:
                         options = [(i, value) for i, value in daily[right][day]
                                    if value * target > 0 and abs(value) < abs(target)]
-                        if len(options) < 2 or abs(sum(value for _, value in options)) < abs(target):
+                        total = sum(value for _, value in options)
+                        if len(options) < 2 or abs(total) < abs(target):
                             continue
-                        if len(options) > 18:
-                            # 大组继续用已有预算控制的组合搜索。
+                        # 同方向且都不是零时，全部加总正好等于另一侧这一笔，少任意一笔都会对不上。
+                        full_set_unique = abs(total) == abs(target)
+                        if len(options) > 18 and not full_set_unique:
                             eligible[left].setdefault(index, [])
                             continue
-                        indices, values = zip(*options)
-                        found = _solve_combination(list(values), [day] * len(values), list(indices), target, date_window=0)
+                        if full_set_unique:
+                            found = ([i for i, _ in options], "高")
+                        else:
+                            indices, values = zip(*options)
+                            found = _solve_combination(list(values), [day] * len(values), list(indices), target, date_window=0)
                         if found:
                             rows, _ = found
                             b, j = ([index], rows) if left == "bank" else (rows, [index])
                             combo = self._add_candidate(b, j, "same_day_combination", "同日合计")
                             if combo is not None and self._can_cover(combo):
                                 unique = True
-                                for omitted in rows:
-                                    alternative = [(i, value) for i, value in options if i != omitted]
-                                    ai, av = zip(*alternative)
-                                    if _solve_combination(list(av), [day] * len(av), list(ai), target, date_window=0):
-                                        unique = False
-                                        break
+                                if not full_set_unique:
+                                    for omitted in rows:
+                                        alternative = [(i, value) for i, value in options if i != omitted]
+                                        ai, av = zip(*alternative)
+                                        if _solve_combination(list(av), [day] * len(av), list(ai), target, date_window=0):
+                                            unique = False
+                                            break
                                 eligible[left].setdefault(index, [])
                                 for member in rows:
                                     eligible[right].setdefault(member, [])
@@ -263,6 +269,37 @@ class SkillMatcher(Matcher):
                          and not self._locked_rows["journal"].intersection(c.journal_idxs)]
             for candidate in select_non_conflicting_candidates(available):
                 candidate.evidence["verified_reconciliation"] = reason
+                self._lock(candidate)
+        self._lock_same_day_full_totals()
+
+    def _lock_same_day_full_totals(self):
+        """同日同方向全部加总正好相等时，整组就是唯一组合，不再交给有上限的搜索。"""
+        daily = {side: defaultdict(list) for side in ("bank", "journal")}
+        for side, frame in self._frames().items():
+            for row in frame[["date", "amount_decimal"]].itertuples():
+                if row.amount_decimal and int(row.Index) not in self._locked_rows[side]:
+                    daily[side][pd.Timestamp(row.date).normalize()].append((int(row.Index), int(row.amount_decimal)))
+        proposed = []
+        for day in set(daily["bank"]) & set(daily["journal"]):
+            for left, right in (("bank", "journal"), ("journal", "bank")):
+                for index, target in daily[left][day]:
+                    if index in self._locked_rows[left]:
+                        continue
+                    options = [(i, value) for i, value in daily[right][day]
+                               if i not in self._locked_rows[right] and value * target > 0 and abs(value) < abs(target)]
+                    if len(options) < 2 or abs(sum(value for _, value in options)) != abs(target):
+                        continue
+                    rows = [i for i, _ in options]
+                    bank_idxs, journal_idxs = ([index], rows) if left == "bank" else (rows, [index])
+                    combo = self._add_candidate(bank_idxs, journal_idxs, "same_day_combination", "同日合计")
+                    if combo is not None and self._can_cover(combo):
+                        proposed.append(combo)
+        self._review_purposes(proposed)
+        for candidate in proposed:
+            if (self._can_cover(candidate)
+                    and not self._locked_rows["bank"].intersection(candidate.bank_idxs)
+                    and not self._locked_rows["journal"].intersection(candidate.journal_idxs)):
+                candidate.evidence["verified_reconciliation"] = "同日同方向收付全部加总正好相等，整组是唯一组合"
                 self._lock(candidate)
 
     def _lock_repeated_balances(self, gaps):

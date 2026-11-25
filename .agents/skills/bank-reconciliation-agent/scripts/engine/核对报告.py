@@ -251,6 +251,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
                 if len(months) == 1:
                     monthly_notes[months[0]].append(f"{dates[0]:%m月%d日} {text}")
 
+    _explain_fee_differences(monthly, reporter.matcher, monthly_notes)
     months_with_difference = sum(
         any(pd.notna(value) and value != 0 for value in values)
         for values in monthly.reindex(columns=["收入金额差额", "支出金额差额", "余额差额"]).itertuples(index=False, name=None)
@@ -321,7 +322,6 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
             columns={"处理方式": "结果类型", "要查什么": "核对结果"})
     detail_columns = ["编号", "来源", "日期", "收入金额", "支出金额", "余额", "对方", "摘要",
                       "银行备注", "凭证号", "核对结果", "原表位置"]
-    _explain_fee_differences(monthly, reporter.matcher, monthly_notes)
     tables = {
         "核对总览": pd.DataFrame(overview, columns=["项目", "结果"]),
         "月度核对": _periods(monthly, "月份", "月末余额", monthly_notes),

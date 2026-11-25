@@ -195,6 +195,10 @@ def run_accounts(bank, journal, output, config, session, *, log=print,
             left, right = problem["银行流水"], problem["日记账"]
             pairs.append((Path(left[0]) if left else None, Path(right[0]) if right else None))
         problems = [problem for problem in problems if problem not in partial]
+    if not pairs and not problems:
+        problems.append({"原因": "没有发现可核对的账户或支持的输入文件"})
+    if not pairs:
+        return {"完成": [], "待处理": problems, "Agent复核": dict(_review_counts())}
     if (bank_columns or journal_columns) and not (bank.is_file() and journal.is_file()):
         raise ValueError("指定字段时请提供需要补跑的两份文件")
     output.mkdir(parents=True, exist_ok=True)
