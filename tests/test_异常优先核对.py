@@ -6,12 +6,27 @@ import pandas as pd
 
 from data_structures import MatcherConfig, OverallControlResult, ProcessingStatus
 from precision_engine import PrecisionEngine
-from 复核事项 import build_review_items
 
 SKILL_ENTRY = Path(__file__).resolve().parents[1] / ".agents/skills/bank-reconciliation-agent/scripts/运行核对.py"
 spec = spec_from_file_location("reconciliation_skill", SKILL_ENTRY)
 skill = module_from_spec(spec)
 spec.loader.exec_module(skill)
+review_spec = spec_from_file_location(
+    "skill_review_items",
+    SKILL_ENTRY.parent / "engine" / "复核事项.py",
+)
+review_module = module_from_spec(review_spec)
+review_spec.loader.exec_module(review_module)
+build_review_items = review_module.build_review_items
+
+import sys
+ENGINE_DIR = str(SKILL_ENTRY.parent / "engine")
+
+def skill_module(name):
+    sys.path.insert(0, ENGINE_DIR)
+    sys.modules.pop(name, None)
+    return __import__(name)
+
 
 
 def frame(*rows):
@@ -69,6 +84,61 @@ def test_等额重复整组闭合但不捏造逐笔关系():
     assert [(c.bank_idxs, c.journal_idxs, c.processing_status) for c in matcher.selected_candidates] == [
         ((0, 1), (0, 1), ProcessingStatus.AUTO_CONFIRMED)
     ]
+
+
+def test_未超过重要性的单边差额不进差异说明():
+    bank = frame(("2026-01-08", -1000, "手续费", {}), ("2026-01-09", -10000, "设备款", {}))
+    ledger = frame(("2026-01-08", -1, "无关", {}))
+    modes = {item["影响金额"]: item["核对方式"] for item in build_review_items(run(bank, ledger))}
+    assert modes[Decimal("1000")] == "留存备查"
+    assert modes[Decimal("10000")] == "留存备查"
+    assert "差异说明" not in modes.values()
+
+
+def test_刚好等于重要性不算超过():
+    bank = frame(("2026-01-08", -25000, "设备款", {}))
+    ledger = frame(("2026-01-08", -1, "无关", {}))
+    items = build_review_items(run(bank, ledger))
+    assert items[0]["影响金额"] == Decimal("25000")
+    assert items[0]["核对方式"] == "留存备查"
+
+
+def test_超过重要性或同月累计超过才进差异说明():
+    bank = frame(("2026-01-08", -30000, "设备款", {}))
+    ledger = frame(("2026-01-08", -1, "无关", {}))
+    assert build_review_items(run(bank, ledger))[0]["核对方式"] == "差异说明"
+    pieces = frame(
+        ("2026-02-01", -10000, "材料", {}),
+        ("2026-02-02", -10000, "运费", {}),
+        ("2026-02-03", -10000, "服务费", {}),
+    )
+    other = frame(("2026-02-01", -1, "无关", {}))
+    flagged = [item for item in build_review_items(run(pieces, other)) if item["核对方式"] == "差异说明"]
+    assert flagged
+    assert sum(item["影响金额"] for item in flagged) == Decimal("30000")
+
+
+def test_手续费净额已说明时不进待办且月度不留未解释差额(tmp_path):
+    from openpyxl import load_workbook
+    Reporter = skill_module("核对报告") and skill_module("reporter").Reporter
+
+    bank = frame(("2026-01-10", 970, "货款净额", {"对方户名": "甲公司", "业务编号": "P01"}))
+    ledger = frame(
+        ("2026-01-10", 1000, "货款", {"对方户名": "甲公司", "业务编号": "P01"}),
+        ("2026-01-10", -30, "手续费", {"对方户名": "甲公司", "业务编号": "P01"}),
+    )
+    matcher = run(bank, ledger)
+    assert all(item["核对方式"] != "差异说明" for item in build_review_items(matcher))
+    target = tmp_path / "报告.xlsx"
+    Reporter(matcher)._generate_report(str(target))
+    book = load_workbook(target, data_only=True)
+    headers = [cell.value for cell in book["月度核对"][1]]
+    row = [cell.value for cell in book["月度核对"][2]]
+    record = dict(zip(headers, row))
+    book.close()
+    assert Decimal(str(record["收入金额差额"])) == 0
+    assert Decimal(str(record["支出金额差额"])) == 0
+    assert "手续费净额已说明" in str(record["说明"])
 
 
 def test_同额冲突和差额未被掩盖():
@@ -137,8 +207,8 @@ def test_双方整月无行也需要查询范围():
 
 def test_范围说明的全部明细按编号着色并可直接跳转(tmp_path):
     from openpyxl import load_workbook
-    from Excel验证 import _验证五表结构
-    from reporter import Reporter
+    _验证五表结构 = skill_module("Excel验证")._验证五表结构
+    Reporter = skill_module("reporter").Reporter
 
     bank = frame(("2025-05-31", 2800, "收款", {}), ("2025-07-01", 3200, "收款", {}))
     journal = frame(("2025-05-31", 2800, "收款", {}),

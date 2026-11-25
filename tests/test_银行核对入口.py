@@ -8,6 +8,21 @@ import pytest
 from llm_assistant import CandidateSemanticRequest, SemanticCandidate
 
 
+def test_技能入口必须拿到用户确认的三项设置():
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    entry = Path(__file__).resolve().parents[1] / ".agents/skills/bank-reconciliation-agent/scripts/运行核对.py"
+    result = subprocess.run(
+        [sys.executable, str(entry), "--bank", "流水.xlsx", "--journal", "日记账.xlsx",
+         "--output", "报告", "--session", "任务"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert result.returncode != 0
+    assert "--trivial" in result.stderr and "--materiality" in result.stderr and "--tolerance-days" in result.stderr
+
+
 def test_按完整账号配对并排除核对报告与重复输入(tmp_path):
     pair_inputs = import_module('银行核对入口').pair_inputs
     bank, ledger = tmp_path / '流水', tmp_path / '日记账'

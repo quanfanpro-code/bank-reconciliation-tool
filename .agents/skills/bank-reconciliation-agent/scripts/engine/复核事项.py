@@ -173,9 +173,17 @@ def build_review_items(matcher) -> list[dict]:
         elif item["程序结论"] in {ProcessingStatus.AUTO_CONFIRMED.value, ProcessingStatus.GROUP_RECONCILED.value} and risk == RiskLevel.NORMAL.value:
             item["核对方式"] = "自动确认"
             item["入选原因"] = "程序已确认对应关系"
-        elif automatic:
+        elif automatic and risk in {RiskLevel.HIGH.value, RiskLevel.UNKNOWN.value}:
             item["核对方式"] = "差异说明"
-            item["入选原因"] = item["入选原因"].rstrip("；")
+            item["入选原因"] = item["入选原因"].rstrip("；") or (
+                "核对范围受限，全部核对" if risk == RiskLevel.UNKNOWN.value else "影响金额超过实际执行重要性水平，全部核对")
+        elif automatic:
+            item["核对方式"] = "留存备查"
+            item["入选原因"] = (
+                "影响不超过明显微小错报临界值，留存备查"
+                if risk == RiskLevel.LOW.value
+                else "影响不超过实际执行重要性水平，留存备查"
+            )
         elif risk in {RiskLevel.HIGH.value, RiskLevel.UNKNOWN.value}:
             item["核对方式"] = "人工全查"
             item["入选原因"] = item["入选原因"].rstrip("；") or (
@@ -184,8 +192,6 @@ def build_review_items(matcher) -> list[dict]:
             item["核对方式"] = "留存备查"
             item["入选原因"] = "影响不超过明显微小错报临界值，留存备查"
 
-    if automatic:
-        return items
     mediums = sorted([item for item in items if item["风险等级"] == RiskLevel.MEDIUM.value],
                      key=lambda item: (item["首次日期"], item["事项编号"]))
     high_count = sum(item["风险等级"] == RiskLevel.HIGH.value for item in items)
@@ -193,8 +199,12 @@ def build_review_items(matcher) -> list[dict]:
     picked = {int(index * len(mediums) / sample_size) for index in range(sample_size)} if sample_size else set()
     for index, item in enumerate(mediums):
         selected = index in picked
-        item["核对方式"] = "人工抽样" if selected else "留存备查"
-        item["入选原因"] = (
-            f"中风险按日期等距抽样，{len(mediums)}项抽取{sample_size}项，本项抽中"
-            if selected else "中风险等距抽样未抽中，本次留存备查")
+        handled = "差异说明" if automatic else "人工抽样"
+        item["核对方式"] = handled if selected else "留存备查"
+        if automatic and not sample_size:
+            item["入选原因"] = "没有超过实际执行重要性水平的异常，本次留存备查"
+        else:
+            item["入选原因"] = (
+                f"中风险按日期等距抽样，{len(mediums)}项抽取{sample_size}项，本项抽中"
+                if selected else "中风险等距抽样未抽中，本次留存备查")
     return items

@@ -51,6 +51,47 @@ def _difference_text(income, expense):
     )
 
 
+def _explain_fee_differences(monthly, matcher, notes):
+    """手续费公式已经说清的净额，从月度未解释差额里剔除。"""
+    from decimal import Decimal
+
+    from precision_engine import PrecisionEngine
+
+    if monthly is None or getattr(monthly, "empty", True):
+        return
+    explained = {}
+    for candidate in getattr(matcher, "selected_candidates", []):
+        if getattr(candidate, "match_type", "") != "fee_net":
+            continue
+        if candidate.processing_status.value not in {"自动确认", "整组勾稽一致"}:
+            continue
+        months = {
+            pd.Timestamp(day).strftime("%Y-%m")
+            for day in (*candidate.bank_dates, *candidate.journal_dates)
+        }
+        if len(months) != 1:
+            continue
+        month = months.pop()
+        metrics = candidate.metrics
+        income = PrecisionEngine.from_integer_li(metrics.bank_income_li - metrics.journal_income_li)
+        expense = PrecisionEngine.from_integer_li(metrics.bank_expense_li - metrics.journal_expense_li)
+        fee = PrecisionEngine.from_integer_li(int(candidate.evidence.get("fee_amount_li") or 0))
+        bucket = explained.setdefault(month, [Decimal("0"), Decimal("0"), Decimal("0")])
+        bucket[0] += income
+        bucket[1] += expense
+        bucket[2] += fee
+    for month, (income, expense, fee) in explained.items():
+        mask = monthly["月份"].astype(str) == month
+        if not bool(mask.any()):
+            continue
+        for column, delta in (("收入金额差额", income), ("支出金额差额", expense)):
+            monthly.loc[mask, column] = [
+                float(Decimal(str(value)) - delta) if pd.notna(value) else value
+                for value in monthly.loc[mask, column]
+            ]
+        notes[month].append(f"手续费净额已说明 {fee:,.2f} 元，这项差额不再作为未解释的收付差额")
+
+
 def _periods(frame, key, ending, notes):
     original = key
     frame = frame.rename(columns=lambda col: col.replace("日记账-", "账上").replace("银行-", "银行").replace("期末余额", ending))
@@ -280,6 +321,7 @@ def write_reconciliation_report(reporter, output_path, config, bank_path, journa
             columns={"处理方式": "结果类型", "要查什么": "核对结果"})
     detail_columns = ["编号", "来源", "日期", "收入金额", "支出金额", "余额", "对方", "摘要",
                       "银行备注", "凭证号", "核对结果", "原表位置"]
+    _explain_fee_differences(monthly, reporter.matcher, monthly_notes)
     tables = {
         "核对总览": pd.DataFrame(overview, columns=["项目", "结果"]),
         "月度核对": _periods(monthly, "月份", "月末余额", monthly_notes),

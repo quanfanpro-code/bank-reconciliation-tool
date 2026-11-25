@@ -258,9 +258,9 @@ def main(*, matcher_factory=None):
     parser.add_argument("--session", required=True, type=Path)
     if matcher_factory is not None:
         parser.add_argument("--source-evidence", type=Path, help="从已提供原件摘录的余额及逐笔查询范围")
-    parser.add_argument("--trivial", type=Decimal)
-    parser.add_argument("--materiality", type=Decimal)
-    parser.add_argument("--tolerance-days", type=int, help="可跨几天核对，默认使用项目设置")
+    parser.add_argument("--trivial", required=True, type=Decimal, help="用户确认的明显微小错报临界值")
+    parser.add_argument("--materiality", required=True, type=Decimal, help="用户确认的实际执行重要性水平")
+    parser.add_argument("--tolerance-days", required=True, type=int, help="用户确认的日期容差天数，不改时为 31")
     parser.add_argument("--bank-column", action="append", default=[], metavar="字段=原列名")
     parser.add_argument("--journal-column", action="append", default=[], metavar="字段=原列名")
     args = parser.parse_args()
